@@ -224,6 +224,9 @@ std::string Session::describe(uint64_t addr) {
     snprintf(off, sizeof(off), "+0x%llx", (unsigned long long)(addr - sym->addr));
     s += "  " + symbols_.displayName(*sym) + off;
   }
+  // そのアドレスにユーザのメモがあれば添える（条件3 で付けた自由記述）。
+  if (const Annot* a = annots_.atExact(*img, addr))
+    if (!a->memo.empty()) s += "  ; " + a->memo;
   return s;
 }
 

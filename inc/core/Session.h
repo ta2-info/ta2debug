@@ -18,6 +18,7 @@
 #include "core/ExceptionServer.h"
 #include "core/ImageList.h"
 #include "core/Symbols.h"
+#include "core/Annotations.h"
 #include "core/DwarfLines.h"
 #include "app/EventQueue.h"
 #include <unordered_map>
@@ -27,7 +28,9 @@ namespace ta2 {
 class Session {
 public:
   explicit Session(EventQueue& queue)
-    : queue_(queue), bps_(target_), images_(target_), symbols_(target_) {}
+    : queue_(queue), bps_(target_), images_(target_), symbols_(target_) {
+    symbols_.setAnnotations(&annots_); // ユーザ注釈をシンボル解決に重ねる
+  }
   ~Session();
 
   bool attach(pid_t pid, std::string& err);
@@ -74,6 +77,12 @@ public:
   Arch& arch() { return target_.arch(); }
   ImageList& images() { return images_; }
   Symbols& symbols() { return symbols_; }
+  Annotations& annotations() { return annots_; }
+
+  // ユーザ注釈ファイル（UUID 別）を、更新されていれば読み直す（条件2）。
+  // 重い探索を別スレッドで走らせる前と、停止時などメインスレッドの境界で呼ぶ。
+  // 読み込み済み全イメージを対象に安価に stat するだけ（変化が無ければ何もしない）。
+  void refreshAnnotations() { for (const auto& im : images_.images()) annots_.refresh(im); }
 
   // 式でライブラリ名を省略したときに最初に探す既定ライブラリ（uselib）。
   void setDefaultLib(const std::string& name) { defaultLib_ = name; }
@@ -119,6 +128,7 @@ private:
   ExceptionServer es_;
   ImageList images_;
   Symbols symbols_;
+  Annotations annots_; // ユーザ注釈（名前／メモ）。symbols_ に重ねる
   std::string defaultLib_; // uselib で設定する既定ライブラリ名（空＝主実行ファイル）
   // dSYM の DWARF 行情報（イメージ UUID でキャッシュ、遅延ロード）。
   std::unordered_map<std::string, DwarfLines> lineCache_;

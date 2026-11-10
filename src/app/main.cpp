@@ -940,6 +940,9 @@ void runCommand(const std::string& line) {
   if (g_jobRunning.load()) { g_message = "処理中です（ESC で中止してください）"; return; }
   g_message.clear();
   g_outputTop = 0; // 新しいコマンド出力は先頭から表示
+  // ユーザ注釈ファイルが外部で編集されていれば読み直す（条件2）。重い探索を別スレッドへ
+  // 投げる前のこの境界で行うので、ワーカが読む注釈データは一貫している。
+  if (g_session.isAttached()) g_session.refreshAnnotations();
   std::string cmd = line, arg;
   size_t sp = line.find(' ');
   if (sp != std::string::npos) { cmd = line.substr(0, sp); arg = line.substr(sp + 1); }
@@ -1218,6 +1221,73 @@ void runCommand(const std::string& line) {
       g_session.setDefaultLib(a);
       g_message = "既定ライブラリ: " + im->name + "（式のシンボル名はここを優先して探す）";
     }
+  } else if (cmd == "ann") {
+    // 自作バイナリにユーザ自身が名前（＋任意でメモ）を付ける。UUID 別のテキストに保存し、
+    // 以降 :b <名前> / :sym / 式 で引けて、describe/バックトレースにも出る（条件3）。
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    auto parts = splitComma(arg, 3); // <式>,<名前>[,<メモ>]
+    if (parts.size() < 2) { g_message = "使い方: ann <式>,<名前>[,<メモ>]（名前を付ける。メモだけなら :memo）"; return; }
+    std::string name = trimStr(parts[1]);
+    std::string memo = parts.size() >= 3 ? trimStr(parts[2]) : std::string();
+    if (name.empty()) { g_message = "名前が空です（メモだけ付けるなら :memo <式>,<メモ>）"; return; }
+    evalAsync(trimStr(parts[0]), [name, memo](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) { g_message = "式エラー: " + eerr; return; }
+      const Image* im = g_session.images().byAddress(addr);
+      if (!im) { g_message = "そのアドレスはどのイメージにも入っていません"; return; }
+      std::string err;
+      bool r = g_session.annotations().setName(*im, addr, name, err);
+      if (r && !memo.empty()) r = g_session.annotations().setMemo(*im, addr, memo, err);
+      if (!r) { g_message = "注釈を保存できません: " + err; return; }
+      char buf[96]; snprintf(buf, sizeof(buf), "注釈: 0x%llx = %s", (unsigned long long)addr, name.c_str());
+      g_message = std::string(buf) + (memo.empty() ? "" : ("  ; " + memo)) + "  → " + Annotations::pathFor(*im);
+    });
+  } else if (cmd == "memo") {
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    auto parts = splitComma(arg, 2); // <式>,<メモ>
+    if (parts.size() < 2) { g_message = "使い方: memo <式>,<メモ>（そのアドレスにメモを付ける／空メモで消す）"; return; }
+    std::string memo = trimStr(parts[1]);
+    evalAsync(trimStr(parts[0]), [memo](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) { g_message = "式エラー: " + eerr; return; }
+      const Image* im = g_session.images().byAddress(addr);
+      if (!im) { g_message = "そのアドレスはどのイメージにも入っていません"; return; }
+      std::string err;
+      if (!g_session.annotations().setMemo(*im, addr, memo, err)) { g_message = "メモを保存できません: " + err; return; }
+      char buf[96]; snprintf(buf, sizeof(buf), "メモ: 0x%llx", (unsigned long long)addr);
+      g_message = std::string(buf) + (memo.empty() ? " を削除" : ("  ; " + memo)) + "  → " + Annotations::pathFor(*im);
+    });
+  } else if (cmd == "unann") {
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    if (trimStr(arg).empty()) { g_message = "使い方: unann <式>（そのアドレスの注釈を削除）"; return; }
+    evalAsync(trimStr(arg), [](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) { g_message = "式エラー: " + eerr; return; }
+      const Image* im = g_session.images().byAddress(addr);
+      if (!im) { g_message = "そのアドレスはどのイメージにも入っていません"; return; }
+      std::string err;
+      if (!g_session.annotations().remove(*im, addr, err)) { g_message = err; return; }
+      char buf[80]; snprintf(buf, sizeof(buf), "注釈を削除: 0x%llx", (unsigned long long)addr);
+      g_message = buf;
+    });
+  } else if (cmd == "anns") {
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    g_session.refreshImages();
+    const Image* im = trimStr(arg).empty() ? g_session.images().mainExecutable()
+                                           : g_session.images().byName(trimStr(arg));
+    if (!im) { g_message = trimStr(arg).empty() ? "主実行ファイルが見つからない" : ("イメージが見つからない: " + trimStr(arg)); return; }
+    g_session.annotations().refresh(*im);
+    auto anns = g_session.annotations().list(*im);
+    g_output.clear();
+    std::string p = Annotations::pathFor(*im);
+    g_outputTitle = im->name + " の注釈 " + std::to_string(anns.size()) + " 個" + (p.empty() ? "（UUID 無し＝保存不可）" : ("  [" + p + "]"));
+    for (const auto& a : anns) {
+      uint64_t rt = a.unslid + im->slide;
+      char b[512];
+      snprintf(b, sizeof(b), "0x%012llx  (unslid 0x%llx)  %s%s%s",
+               (unsigned long long)rt, (unsigned long long)a.unslid,
+               a.name.empty() ? "(名前なし)" : a.name.c_str(),
+               a.memo.empty() ? "" : "   ; ", a.memo.c_str());
+      g_output.push_back(b);
+    }
+    if (g_output.empty()) g_output.push_back("(注釈なし)  :ann <式>,<名前>[,<メモ>] で追加、またはファイルを直接編集");
   } else if (cmd == "seg") {
     if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
     const Image* im = arg.empty() ? g_session.images().mainExecutable() : g_session.images().byName(arg);
@@ -1357,6 +1427,12 @@ void runCommand(const std::string& line) {
       "  :sym <式>                  アドレスのシンボル    :img / :libs  読込イメージ（ライブラリ）一覧    :seg [名前]  セグメント一覧",
       "  :syms <ライブラリ> [絞込]   そのライブラリのシンボル一覧（省略で既定ライブラリ・絞込は部分一致）",
       "  :uselib [<名前>|-]          式でライブラリ名省略時に先に探す既定ライブラリを 表示 / 設定 / 解除",
+      "\x1b[36m― 注釈（自分で付ける名前・メモ） ―\x1b[0m",
+      "  :ann <式>,<名前>[,<メモ>]   そのアドレスに名前を付ける（以降 :b <名前> / 式で引ける・表示にも出る）",
+      "  :memo <式>,<メモ>           そのアドレスにメモを付ける（空メモで削除）    :unann <式>  注釈を削除",
+      "  :anns [<ライブラリ>]        注釈一覧（省略で主実行ファイル）。保存先ファイルのパスも表示",
+      "  注釈は UUID 別のテキストに保存（~/Library/Application Support/ta2debug/annotations/<UUID>.t2a）。",
+      "  手編集でき（TAB 区切り）、起動中に外部で更新されても自動で読み直します。stripped な自作バイナリに有効。",
       "\x1b[36m― 書き換え ―\x1b[0m",
       "  :reg <名前>=<式>           レジスタへ書込（al/ah/ax/eax/r8w 等の部分レジスタも可）",
       "  :setmem1/2/4/8 <式>,<値>   N バイトの値を書込      :setmem <式>,<HEX列>  バイト列（例 $rsp,9090CC）",
@@ -1385,7 +1461,7 @@ void runCommand(const std::string& line) {
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
   static const char* CMDS[] = {"attach", "detach", "run", "launch", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "bd", "bt",
-                               "w", "reg", "x", "img", "seg", "help"};
+                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
     if (std::string(c).rfind(g_cmdline, 0) == 0) cands.push_back(c); // 接頭辞一致
@@ -1535,6 +1611,7 @@ void onKey(int c) {
 // 返り値: true=停止確定（呼び出し側が描画／出力する）, false=auto で自動継続した（まだ Running、次の停止を待つ）。
 bool onStoppedEvent() {
   g_session.refreshImages();
+  g_session.refreshAnnotations(); // ユーザ注釈を（外部編集を含め）読み直し、停止表示・BT に反映（条件2）
   g_session.warmSymbols(); // 初回停止でイメージが揃ったら裏でシンボルを先読み（idempotent）
   if (g_autoMask) {
     uint64_t pc = g_session.stopPc();

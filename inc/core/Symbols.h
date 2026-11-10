@@ -14,6 +14,8 @@
 
 namespace ta2 {
 
+class Annotations; // ユーザ注釈（名前／メモ）。シンボル表に重ね合わせる（byName/byAddress）。
+
 struct Symbol {
   uint64_t addr = 0;              // 実行時アドレス（slide 適用済み）
   std::string mangled;           // 先頭 '_' を除いたもの
@@ -40,6 +42,10 @@ public:
   // ディスクキャッシュの保存先（~/Library/Caches/ta2debug/syms）。無ければ作成。
   static std::string cacheDir();
 
+  // ユーザ注釈（名前／メモ）を重ね合わせる。設定すると byAddress/byName がシンボル表に
+  // 加えて注釈も見る（注釈は完全一致アドレスでシンボルより優先し、名前でも引ける）。nullptr 可。
+  void setAnnotations(Annotations* a) { annots_ = a; }
+
 private:
   std::string keyFor(const Image& img);
   void load(const Image& img, std::vector<Symbol>& out);
@@ -52,6 +58,7 @@ private:
   void saveToDisk(const Image& img, const std::vector<Symbol>& syms);
 
   Target& target_;
+  Annotations* annots_ = nullptr; // ユーザ注釈の重ね合わせ（所有しない。Session が持つ）
   std::mutex mu_; // cache_ とディスク I/O を保護（バックグラウンド warming と共用するため）
   std::unordered_map<std::string, std::vector<Symbol>> cache_;
 };

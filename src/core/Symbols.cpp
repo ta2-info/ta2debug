@@ -1,5 +1,7 @@
 #include "core/Symbols.h"
 
+#include "core/Annotations.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -363,13 +365,20 @@ const std::vector<Symbol>& Symbols::forImage(const Image& img) {
 
 const Symbol* Symbols::byAddress(const Image& img, uint64_t addr) {
   const auto& v = forImage(img);
-  if (v.empty()) return nullptr;
-  // addr 以下で最も近い
-  auto it = std::upper_bound(v.begin(), v.end(), addr,
-                             [](uint64_t a, const Symbol& s) { return a < s.addr; });
-  if (it == v.begin()) return nullptr;
-  --it;
-  return &*it;
+  // addr 以下で最も近いシンボル（無ければ nullptr）
+  const Symbol* best = nullptr;
+  if (!v.empty()) {
+    auto it = std::upper_bound(v.begin(), v.end(), addr,
+                               [](uint64_t a, const Symbol& s) { return a < s.addr; });
+    if (it != v.begin()) { --it; best = &*it; }
+  }
+  // ユーザ注釈を重ねる。より近い（アドレスが大きい）方を採用し、同アドレスは注釈を優先
+  // （ユーザが付け直した名前を尊重）。stripped バイナリでも自分で付けた関数名が出る。
+  if (annots_) {
+    const Symbol* a = annots_->nearestSym(img, addr);
+    if (a && (!best || a->addr >= best->addr)) best = a;
+  }
+  return best;
 }
 
 const std::string& Symbols::displayName(const Symbol& s) {
@@ -441,6 +450,12 @@ std::vector<const Symbol*> Symbols::byName(const Image& img, const std::string& 
       const std::string& tail = (cc == std::string::npos) ? base : base.substr(cc + 2);
       if (tail == name) hits.push_back(&s);
     }
+  }
+  // ユーザ注釈の名前も引けるようにする（完全一致）。自分で付けた名前で b/sym/式が使える。
+  // シンボル表のヒットに追記する（同名が別アドレスにあれば parseName が曖昧として明示指定を促す）。
+  if (annots_) {
+    auto an = annots_->byName(img, name);
+    hits.insert(hits.end(), an.begin(), an.end());
   }
   return hits;
 }

@@ -42,6 +42,7 @@ set(CORE_SOURCES
   src/core/ImageList.cpp
   src/core/Unwind.cpp
   src/core/Symbols.cpp
+  src/core/Annotations.cpp
   src/core/DwarfLines.cpp
   src/core/ProcessList.cpp
   src/core/Session.cpp
