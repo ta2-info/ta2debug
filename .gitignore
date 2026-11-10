@@ -1,0 +1,15 @@
+# ビルド成果物
+/build/
+
+# CMake がソース直下に吐く実行ファイル
+/ta2debug
+/arch_selftest
+/break_selftest
+/symbols_selftest
+/target_selftest
+
+# その他
+*.dSYM/
+*.o
+*.ta2debug.log
+.DS_Store
