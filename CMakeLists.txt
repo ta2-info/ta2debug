@@ -20,6 +20,8 @@ option(USE_ASAN "Build with AddressSanitizer" ON)
 # md5/sha1 は OpenSSL をやめ CommonCrypto（システム）を使う。JSON は同梱 picojson。
 find_path(CAPSTONE_INCLUDE_DIR capstone/capstone.h HINTS /usr/local/include /opt/homebrew/include)
 find_library(CAPSTONE_LIBRARY capstone HINTS /usr/local/lib /opt/homebrew/lib)
+# Carbon: 起動時に IME を半角へ切り替える TIS 入力ソース API 用（システムフレームワーク）。
+find_library(CARBON_LIBRARY Carbon)
 if(NOT CAPSTONE_INCLUDE_DIR OR NOT CAPSTONE_LIBRARY)
   message(FATAL_ERROR "capstone が見つからない (brew install capstone)")
 endif()
@@ -67,7 +69,7 @@ add_executable(ta2debug
   ${UI_SOURCES}
   ${APP_SOURCES}
 )
-target_link_libraries(ta2debug PRIVATE ta2opts ${CAPSTONE_LIBRARY})
+target_link_libraries(ta2debug PRIVATE ta2opts ${CAPSTONE_LIBRARY} ${CARBON_LIBRARY})
 
 # いまはセルフテストを作る（UI/コントローラは今後追加）。
 add_executable(arch_selftest

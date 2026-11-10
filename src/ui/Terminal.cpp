@@ -4,7 +4,24 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 
+#include <Carbon/Carbon.h> // TIS 入力ソース（システムフレームワーク。依存は増やさない）
+
 namespace ta2 {
+
+namespace {
+// TUI 起動時に一度だけ IME を半角（ASCII 可能なキーボードレイアウト）へ切り替える。
+// 日本語入力モードのまま起動してもコマンドが全角になって弾かれないようにするため。
+// あくまで「起動時に一度」だけで、以後は固定しない（ユーザが全角へ自由に戻せる＝メモ入力等で
+// 全角を使える）。best-effort で、失敗しても無視する（端末のみ・GUI セッションが無ければ何も起きない）。
+// TISCopyCurrentASCIICapableKeyboardInputSource は日本語 IME ではなく ASCII 可能な
+// 「キーボードレイアウト」を返すので、選択すると確実に半角英数になる。
+void switchToAsciiInputSourceOnce() {
+  TISInputSourceRef ascii = TISCopyCurrentASCIICapableKeyboardInputSource();
+  if (!ascii) return;
+  TISSelectInputSource(ascii);
+  CFRelease(ascii);
+}
+} // namespace
 
 Terminal::~Terminal() { leave(); }
 
@@ -18,6 +35,7 @@ void Terminal::querySize() {
 
 void Terminal::enter() {
   if (active_) return;
+  switchToAsciiInputSourceOnce(); // 起動時だけ IME を半角へ（固定はしない）
   tcgetattr(STDIN_FILENO, &saved_);
   struct termios raw = saved_;
   raw.c_lflag &= ~(ICANON | ECHO | ISIG);
