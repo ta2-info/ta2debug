@@ -1,5 +1,26 @@
 cmake_minimum_required(VERSION 3.20)
 
+# macOS SDK（-isysroot）。別の Xcode / コマンドラインツール環境では SDK を自動発見できず
+# ビルドが通らないことがあるので、未指定なら xcrun で SDK パスを解決して CMAKE_OSX_SYSROOT に
+# 入れる（CMake がこれを -isysroot として全コンパイル・リンクに渡す）。
+# 明示指定（-DCMAKE_OSX_SYSROOT=... や CMAKE_OSX_SYSROOT 環境変数）があればそれを尊重する。
+# project() より前に設定する必要がある（コンパイラ判定で使われるため）。
+if(APPLE AND NOT CMAKE_OSX_SYSROOT AND NOT DEFINED ENV{CMAKE_OSX_SYSROOT})
+  find_program(XCRUN_EXECUTABLE xcrun)
+  if(XCRUN_EXECUTABLE)
+    execute_process(
+      COMMAND ${XCRUN_EXECUTABLE} --sdk macosx --show-sdk-path
+      OUTPUT_VARIABLE _ta2_sdk_path
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+      RESULT_VARIABLE _ta2_sdk_res)
+    if(_ta2_sdk_res EQUAL 0 AND _ta2_sdk_path AND IS_DIRECTORY "${_ta2_sdk_path}")
+      set(CMAKE_OSX_SYSROOT "${_ta2_sdk_path}" CACHE PATH "macOS SDK path passed as -isysroot")
+      message(STATUS "macOS SDK (isysroot): ${CMAKE_OSX_SYSROOT}")
+    endif()
+  endif()
+endif()
+
 # ta2debug（macOS TUI デバッガ）。設計書は DESIGN.md。
 #   cmake -S . -B build -G Ninja
 #   ninja -C build

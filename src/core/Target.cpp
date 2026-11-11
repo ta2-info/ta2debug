@@ -120,15 +120,21 @@ bool Target::writeMemory(uint64_t addr, const void* buf, size_t size) {
   //（mach_vm_region だとサブマップ全体の値が返り、戻すと実行権限が消えて対象が落ちる）。
   vm_prot_t prot = VM_PROT_NONE;
   {
-    mach_vm_address_t a = addr;
     mach_vm_size_t sz = 0;
     natural_t depth = 0;
     for (;;) {
+      // 必ず「対象アドレス」で問い合わせる。recurse は見つけた領域の先頭に a を書き換えるので、
+      // submap を 1 段降りるたびに a を addr へ戻さないと、次の問い合わせが submap の先頭から
+      // 始まり「addr を含まない別の leaf」の保護値を拾ってしまう。すると復元時にその誤った保護を
+      // 適用して対象ページの実行権限を剥奪し、関数実行で EXC_BAD_ACCESS になる（printf 等で発生）。
+      mach_vm_address_t a = addr;
       vm_region_submap_info_data_64_t info = {};
       mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
       kern_return_t kr = mach_vm_region_recurse(task_, &a, &sz, &depth,
                                                 (vm_region_recurse_info_t)&info, &cnt);
-      if (kr != KERN_SUCCESS || a > addr) return false;
+      // addr を含む領域（base <= addr < base+size）であることを上限まで厳密に確認する。
+      // 上限チェックが無いと、base <= addr だが addr より手前で終わる領域を誤採用してしまう。
+      if (kr != KERN_SUCCESS || a > addr || addr >= a + sz) return false;
       if (info.is_submap) { depth++; continue; }
       prot = info.protection;
       break;

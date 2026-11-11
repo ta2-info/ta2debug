@@ -940,9 +940,13 @@ void runCommand(const std::string& line) {
   if (g_jobRunning.load()) { g_message = "処理中です（ESC で中止してください）"; return; }
   g_message.clear();
   g_outputTop = 0; // 新しいコマンド出力は先頭から表示
-  // ユーザ注釈ファイルが外部で編集されていれば読み直す（条件2）。重い探索を別スレッドへ
-  // 投げる前のこの境界で行うので、ワーカが読む注釈データは一貫している。
-  if (g_session.isAttached()) g_session.refreshAnnotations();
+  // コマンド実行前のこの境界で、イメージ一覧とユーザ注釈を最新化する。
+  //  - refreshImages: dlopen で後から読み込まれたライブラリにも :b / :sym が効くように
+  //    （dyld の変更タイムスタンプを見て、変化時だけ再読込するので走行中でも安価）。
+  //    停止時は onStoppedEvent でも更新するが、非停止で走行中のまま打たれた場合をここで拾う。
+  //  - refreshAnnotations: 外部編集された注釈ファイルを読み直す（条件2）。重い探索を別スレッドへ
+  //    投げる前のこの境界で行うので、ワーカが読むイメージ／注釈データは一貫している。
+  if (g_session.isAttached()) { g_session.refreshImages(); g_session.refreshAnnotations(); }
   std::string cmd = line, arg;
   size_t sp = line.find(' ');
   if (sp != std::string::npos) { cmd = line.substr(0, sp); arg = line.substr(sp + 1); }
