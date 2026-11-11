@@ -198,9 +198,14 @@ dSYM に **DWARF 行情報（`.debug_line`）があれば、ソース行を表�
 ### システムコール監視（libdtrace・止めずに観測）
 | コマンド | 説明 |
 |----------|------|
-| `:scwatch <名前\|all>` | syscall を**カーネル計測（libdtrace）で監視開始**（例 `:scwatch write` / `:scwatch all`） |
-| `:scwatch` | 監視状況（syscall 名ごとの回数・総計）を表示 |
+| `:scwatch <名前\|all>` | **BSD syscall** を**カーネル計測（libdtrace）で監視開始**（例 `:scwatch write` / `:scwatch all`） |
+| `:scwatch mach[:<名前>]` | **Mach トラップ**を監視（例 `:scwatch mach` / `:scwatch mach:mach_msg_trap`）。集計表示は `mach:` を前置 |
+| `:scwatch` | 監視状況（名前ごとの回数・総計）を表示 |
 | `:scwatch off` | 監視停止 |
+
+BSD システムコール（`syscall` プロバイダ）と Mach トラップ（`mach_trap` プロバイダ）は別物なので、
+`mach` 系で明示的に切り替える。Mach トラップは `mach:mach_msg_trap` のように `mach:` 付きで集計表示され、BSD と区別できる。
+（`EXC_BAD_ACCESS` 等の **Mach 例外**は syscall でもトラップでもなく、ta2debug 自身の例外検知で停止・表示する別経路。）
 
 ユーザ空間のブレイク／単一ステップではなく、**カーネルのシステムコール・ディスパッチ表計測**に相乗りするので、
 **全 syscall を単一ステップ無しで低コストに捕捉**できる（`:auto syscall` の単一ステップ方式とは別物）。

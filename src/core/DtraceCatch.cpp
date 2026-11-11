@@ -18,7 +18,7 @@ namespace {
 int s_probe(const dtrace_probedata_t* d, void* arg) {
   auto* self = static_cast<DtraceCatch*>(arg);
   const dtrace_probedesc_t* pd = d->dtpda_pdesc;
-  self->cbBegin(pd ? pd->dtpd_func : "", pd ? pd->dtpd_name : "");
+  self->cbBegin(pd ? pd->dtpd_provider : "", pd ? pd->dtpd_func : "", pd ? pd->dtpd_name : "");
   return DTRACE_CONSUME_THIS;
 }
 int s_rec(const dtrace_probedata_t* d, const dtrace_recdesc_t* rec, void* arg) {
@@ -30,9 +30,11 @@ int s_rec(const dtrace_probedata_t* d, const dtrace_recdesc_t* rec, void* arg) {
 }
 } // namespace
 
-void DtraceCatch::cbBegin(const char* func, const char* name) {
+void DtraceCatch::cbBegin(const char* provider, const char* func, const char* name) {
   pending_ = SyscallHit{};
-  pending_.name = func ? func : "";
+  // Mach トラップは BSD syscall と区別できるよう "mach:" を前置する。
+  bool mach = (provider && std::strcmp(provider, "mach_trap") == 0);
+  pending_.name = (mach ? std::string("mach:") : std::string()) + (func ? func : "");
   pending_.isReturn = (name && std::strcmp(name, "return") == 0);
 }
 void DtraceCatch::cbEnd() {
@@ -45,11 +47,18 @@ bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, s
   handler_ = std::move(handler);
   stopReq_ = false;
 
-  // D プログラムを生成。filter 空/"all" で全 syscall、特定名ならその syscall のみ。
-  // /pid==対象/ でそのプロセスだけに絞る。
-  std::string spec = (filter.empty() || filter == "all") ? "" : filter;
+  // filter を provider と名前に分解する。
+  //   ""/"all" → syscall 全件 / "<名前>" → syscall::<名前>
+  //   "mach"/"mach:" → mach_trap 全件 / "mach:<名前>" → mach_trap::<名前>
+  std::string provider = "syscall", name = filter;
+  if (filter == "mach" || filter.rfind("mach:", 0) == 0) {
+    provider = "mach_trap";
+    name = (filter.size() > 5) ? filter.substr(5) : "";
+  }
+  if (name == "all") name = "";
   // trace(0) は「発火を consumer に届かせる」ための最小レコード（値は読まない）。
-  std::string prog = "syscall::" + spec + ":entry /pid == " + std::to_string((long long)pid) +
+  // /pid==対象/ でそのプロセスだけに絞る。
+  std::string prog = provider + "::" + name + ":entry /pid == " + std::to_string((long long)pid) +
                      "/ { trace(0); }";
 
   int derr = 0;

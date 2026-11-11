@@ -28,14 +28,19 @@ public:
   using Handler = std::function<void(const SyscallHit&)>;
   ~DtraceCatch();
 
-  // pid の syscall を監視開始。filter が空 or "all" で全件、"write" 等で特定 syscall。
+  // pid の syscall/Mach トラップを監視開始。filter の書式:
+  //   ""/"all"      → 全 BSD syscall（syscall:::entry）
+  //   "<名前>"       → その BSD syscall（syscall::<名前>:entry）
+  //   "mach"         → 全 Mach トラップ（mach_trap:::entry）
+  //   "mach:<名前>"  → その Mach トラップ（mach_trap::<名前>:entry）
+  // Mach トラップの通知名は "mach:" を前置して BSD と区別する。
   // 発火ごとに handler（バックグラウンドスレッドから呼ばれる）。成功で true、失敗は err に理由。
   bool start(pid_t pid, const std::string& filter, Handler handler, std::string& err);
   void stop();                 // 停止・解放（冪等）。
   bool active() const { return active_.load(); }
 
   // --- 内部: libdtrace の consume コールバックから呼ぶ（worker スレッド専用） ---
-  void cbBegin(const char* func, const char* name);
+  void cbBegin(const char* provider, const char* func, const char* name);
   void cbEnd();
 
 private:
