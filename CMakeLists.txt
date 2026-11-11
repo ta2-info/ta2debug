@@ -49,6 +49,9 @@ endif()
 
 add_library(ta2opts INTERFACE)
 target_compile_options(ta2opts INTERFACE -g -Wall)
+# libdtrace（システムライブラリ。実体は dyld 共有キャッシュ、SDK の .tbd でリンク）。
+# syscall をカーネルのディスパッチ表計測で検知する DtraceCatch 用。全ターゲットへ伝播。
+target_link_libraries(ta2opts INTERFACE dtrace)
 target_include_directories(ta2opts INTERFACE ${CMAKE_SOURCE_DIR}/inc ${CAPSTONE_INCLUDE_DIR})
 if(USE_ASAN)
   target_compile_options(ta2opts INTERFACE -fsanitize=address -fno-omit-frame-pointer)
@@ -66,6 +69,7 @@ set(CORE_SOURCES
   src/core/Unwind.cpp
   src/core/Symbols.cpp
   src/core/Annotations.cpp
+  src/core/DtraceCatch.cpp
   src/core/DwarfLines.cpp
   src/core/ProcessList.cpp
   src/core/Session.cpp
@@ -119,6 +123,13 @@ add_executable(symbols_selftest
   ${CORE_SOURCES}
 )
 target_link_libraries(symbols_selftest PRIVATE ta2opts ${CAPSTONE_LIBRARY})
+
+# DtraceCatch（libdtrace 相乗りの syscall 検知）のセルフテスト（root が要る）
+add_executable(dtrace_selftest
+  src/selftest/dtrace_selftest.cpp
+  ${CORE_SOURCES}
+)
+target_link_libraries(dtrace_selftest PRIVATE ta2opts ${CAPSTONE_LIBRARY})
 
 # arm64 クロスコンパイル確認。実機は無いが、arm64 実装が SDK ヘッダに対して
 # 壊れていないことを毎ビルドで検証する（コンパイルのみ、リンクはしない）。
