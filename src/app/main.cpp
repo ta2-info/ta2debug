@@ -1292,6 +1292,33 @@ void runCommand(const std::string& line) {
       g_output.push_back(b);
     }
     if (g_output.empty()) g_output.push_back("(注釈なし)  :ann <式>,<名前>[,<メモ>] で追加、またはファイルを直接編集");
+  } else if (cmd == "scwatch") {
+    // syscall 観測（libdtrace 相乗り）。止めずに名前別の回数を集計する（strace 的）。
+    // 開始は attach が要るが、状況表示・停止は対象終了後でも使える（集計は残る）。
+    std::string a = trimStr(arg);
+    if (a == "off") {
+      if (!g_session.syscallWatchActive()) { g_message = "syscall 監視は動いていません"; return; }
+      g_session.stopSyscallWatch();
+      g_message = "syscall 監視を停止しました";
+    } else if (a.empty()) {
+      bool on = g_session.syscallWatchActive();
+      uint64_t total = g_session.syscallWatchTotal();
+      if (!on && total == 0) { g_message = "syscall 監視: 停止中（:scwatch <名前|all> で開始）"; return; }
+      auto counts = g_session.syscallWatchCounts();
+      std::sort(counts.begin(), counts.end(),
+                [](const std::pair<std::string, uint64_t>& x, const std::pair<std::string, uint64_t>& y) { return x.second > y.second; });
+      g_output.clear();
+      g_outputTitle = std::string("syscall 監視 ") + (on ? "[稼働中 " : "[停止 ") + g_session.syscallWatchFilter() +
+                      "]  総計 " + std::to_string(total) + " 回" + (on ? "（:scwatch off で停止）" : "");
+      for (const auto& c : counts) { char b[288]; snprintf(b, sizeof(b), "%-28s %llu", c.first.c_str(), (unsigned long long)c.second); g_output.push_back(b); }
+      if (g_output.empty()) g_output.push_back("(まだ発火なし)");
+    } else {
+      if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+      std::string err;
+      std::string filter = (a == "all") ? std::string() : a; // "" = 全件
+      if (!g_session.startSyscallWatch(filter, err)) { g_message = "syscall 監視の開始に失敗: " + err; return; }
+      g_message = "syscall 監視を開始 [" + (a == "all" ? std::string("all") : a) + "]（:scwatch で状況 / :scwatch off で停止）";
+    }
   } else if (cmd == "seg") {
     if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
     const Image* im = arg.empty() ? g_session.images().mainExecutable() : g_session.images().byName(arg);
@@ -1435,6 +1462,9 @@ void runCommand(const std::string& line) {
       "  :ann <式>,<名前>[,<メモ>]   そのアドレスに名前を付ける（以降 :b <名前> / 式で引ける・表示にも出る）",
       "  :memo <式>,<メモ>           そのアドレスにメモを付ける（空メモで削除）    :unann <式>  注釈を削除",
       "  :anns [<ライブラリ>]        注釈一覧（省略で主実行ファイル）。保存先ファイルのパスも表示",
+      "\x1b[36m― システムコール監視（libdtrace・止めずに観測） ―\x1b[0m",
+      "  :scwatch <名前|all>        syscall をカーネル計測で監視開始（例 :scwatch write / :scwatch all）",
+      "  :scwatch                   監視状況（syscall 名ごとの回数）を表示    :scwatch off  監視停止",
       "  注釈は UUID 別のテキストに保存（~/Library/Application Support/ta2debug/annotations/<UUID>.t2a）。",
       "  手編集でき（TAB 区切り）、起動中に外部で更新されても自動で読み直します。stripped な自作バイナリに有効。",
       "\x1b[36m― 書き換え ―\x1b[0m",
@@ -1465,7 +1495,7 @@ void runCommand(const std::string& line) {
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
   static const char* CMDS[] = {"attach", "detach", "run", "launch", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "bd", "bt",
-                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns"};
+                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
     if (std::string(c).rfind(g_cmdline, 0) == 0) cands.push_back(c); // 接頭辞一致

@@ -19,7 +19,9 @@
 #include "core/ImageList.h"
 #include "core/Symbols.h"
 #include "core/Annotations.h"
+#include "core/DtraceCatch.h"
 #include "core/DwarfLines.h"
+#include <unordered_map>
 #include "app/EventQueue.h"
 #include <unordered_map>
 
@@ -102,6 +104,17 @@ public:
   // 実行時アドレスのソース位置（dSYM の DWARF 行情報）。見つかれば true（out.text にソース行も）。
   bool sourceLineFor(uint64_t addr, SourceLoc& out);
 
+  // ---- syscall 監視（libdtrace 相乗り。観測モード） ----
+  // filter 空/"all" で全 syscall、"write" 等で特定。カーネル計測なので単一ステップ不要。
+  // 発火ごとに名前別カウントを貯める（高頻度でも UI を溢れさせない集計方式）。要 attach。
+  bool startSyscallWatch(const std::string& filter, std::string& err);
+  void stopSyscallWatch();
+  bool syscallWatchActive() const { return dtrace_.active(); }
+  std::string syscallWatchFilter();
+  uint64_t syscallWatchTotal() const { return scTotal_.load(); }
+  // 名前→回数（表示用コピー）。回数の多い順に使うのは呼び出し側。
+  std::vector<std::pair<std::string, uint64_t>> syscallWatchCounts();
+
   // ロード済み全イメージのシンボルをバックグラウンドで先読み・キャッシュする（一度だけ起動）。
   // UUID キャッシュ（Symbols）へ保存されるので次回以降は速い。detach 時に安全に停止する。
   void warmSymbols();
@@ -129,6 +142,11 @@ private:
   ImageList images_;
   Symbols symbols_;
   Annotations annots_; // ユーザ注釈（名前／メモ）。symbols_ に重ねる
+  DtraceCatch dtrace_; // syscall 監視（libdtrace 相乗り。observe）
+  std::mutex scMu_;    // scCounts_/scFilter_ を保護（consumer スレッドと共用）
+  std::unordered_map<std::string, uint64_t> scCounts_; // syscall 名→回数
+  std::atomic<uint64_t> scTotal_{0};                   // 総発火数
+  std::string scFilter_;                               // 監視対象（表示用）
   std::string defaultLib_; // uselib で設定する既定ライブラリ名（空＝主実行ファイル）
   // dSYM の DWARF 行情報（イメージ UUID でキャッシュ、遅延ロード）。
   std::unordered_map<std::string, DwarfLines> lineCache_;

@@ -207,6 +207,32 @@ void Session::stopSymbolWarming() {
   warmStarted_ = false; // 再アタッチ時にまた先読みできるように
 }
 
+bool Session::startSyscallWatch(const std::string& filter, std::string& err) {
+  if (!target_.isAttached()) { err = "attach していません"; return false; }
+  stopSyscallWatch(); // 二重起動を避ける（再開扱い）
+  { std::lock_guard<std::mutex> lk(scMu_); scCounts_.clear(); scFilter_ = filter; }
+  scTotal_.store(0);
+  // handler は consumer スレッドから高頻度で呼ばれ得る。名前別カウントを貯めるだけに留め、
+  // UI へはイベントを流さない（全 syscall だと秒間数千になり得るため）。
+  return dtrace_.start(target_.pid(), filter, [this](const SyscallHit& h) {
+    scTotal_.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(scMu_);
+    scCounts_[h.name]++;
+  }, err);
+}
+
+void Session::stopSyscallWatch() { dtrace_.stop(); }
+
+std::string Session::syscallWatchFilter() {
+  std::lock_guard<std::mutex> lk(scMu_);
+  return scFilter_.empty() ? std::string("all") : scFilter_;
+}
+
+std::vector<std::pair<std::string, uint64_t>> Session::syscallWatchCounts() {
+  std::lock_guard<std::mutex> lk(scMu_);
+  return std::vector<std::pair<std::string, uint64_t>>(scCounts_.begin(), scCounts_.end());
+}
+
 std::string Session::describe(uint64_t addr) {
   const Image* img = images_.byAddress(addr);
   if (!img) return std::string();
@@ -679,6 +705,7 @@ std::string Session::syscallAtStop() {
 }
 
 void Session::detach() {
+  stopSyscallWatch();  // consumer スレッドを target 破棄前に必ず止める
   stopSymbolWarming(); // target 破棄前に warming スレッドを必ず止める
   if (!target_.isAttached()) return;
   stopExitMonitor();
