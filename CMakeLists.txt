@@ -133,9 +133,16 @@ target_link_libraries(dtrace_selftest PRIVATE ta2opts ${CAPSTONE_LIBRARY})
 
 # arm64 クロスコンパイル確認。実機は無いが、arm64 実装が SDK ヘッダに対して
 # 壊れていないことを毎ビルドで検証する（コンパイルのみ、リンクはしない）。
+# この custom_command はコンパイラを直接起動するため、本体ターゲットと違い CMake が
+# -isysroot を自動では付けてくれない。SDK を自動発見できない環境（別 Xcode 等）では
+# ここだけヘッダ not found で落ちるので、解決済みの CMAKE_OSX_SYSROOT を明示的に渡す。
+set(_ta2_arm64_isysroot "")
+if(CMAKE_OSX_SYSROOT)
+  set(_ta2_arm64_isysroot -isysroot ${CMAKE_OSX_SYSROOT})
+endif()
 add_custom_command(
   OUTPUT ${CMAKE_BINARY_DIR}/ArchArm64.arm64.o
-  COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -arch arm64 -g -Wall
+  COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -arch arm64 ${_ta2_arm64_isysroot} -g -Wall
           -I${CMAKE_SOURCE_DIR}/inc -I${CAPSTONE_INCLUDE_DIR}
           -c ${CMAKE_SOURCE_DIR}/src/core/arch/ArchArm64.cpp
           -o ${CMAKE_BINARY_DIR}/ArchArm64.arm64.o
