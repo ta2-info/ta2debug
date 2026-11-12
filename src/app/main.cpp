@@ -1296,11 +1296,16 @@ void runCommand(const std::string& line) {
     // syscall 観測（libdtrace 相乗り）。止めずに名前別の回数を集計する（strace 的）。
     // 開始は attach が要るが、状況表示・停止は対象終了後でも使える（集計は残る）。
     std::string a = trimStr(arg);
+    // いま稼働中の dtrace ハンドルが :scstop（停止キャッチポイント）なら、:scwatch からは触らない
+    // （観測と停止は同じハンドルを共用するため、状態問い合わせ・停止をモードで対称に切り分ける）。
+    bool stopActive = g_session.syscallWatchActive() && g_session.syscallStopMode();
     if (a == "off") {
+      if (stopActive) { g_message = "いま稼働中なのは :scstop の停止キャッチポイントです（解除は :scstop off）"; return; }
       if (!g_session.syscallWatchActive()) { g_message = "syscall 監視は動いていません"; return; }
       g_session.stopSyscallWatch();
       g_message = "syscall 監視を停止しました";
     } else if (a.empty()) {
+      if (stopActive) { g_message = "syscall 監視は稼働していません（稼働中なのは :scstop の停止キャッチポイント。状況は :scstop）"; return; }
       bool on = g_session.syscallWatchActive();
       uint64_t total = g_session.syscallWatchTotal();
       if (!on && total == 0) { g_message = "syscall 監視: 停止中（:scwatch <名前|all> で開始）"; return; }
