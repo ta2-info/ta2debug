@@ -35,7 +35,13 @@ public:
   //   "mach:<名前>"  → その Mach トラップ（mach_trap::<名前>:entry）
   // Mach トラップの通知名は "mach:" を前置して BSD と区別する。
   // 発火ごとに handler（バックグラウンドスレッドから呼ばれる）。成功で true、失敗は err に理由。
-  bool start(pid_t pid, const std::string& filter, Handler handler, std::string& err);
+  //
+  // stopOnHit=true（Phase 2 の停止キャッチポイント）のときは D プログラムに破壊的アクション
+  // stop() を加える（`#pragma D option destructive`）。発火した瞬間にカーネルが対象タスクを
+  // suspend する（task レベル。再開は呼び出し側が task_resume で行う）。handler は従来どおり
+  // 1 発ごとに呼ばれるが、stop 中はタスクが凍結するので次の再開まで追加の発火は無い。
+  bool start(pid_t pid, const std::string& filter, Handler handler, std::string& err,
+             bool stopOnHit = false);
   void stop();                 // 停止・解放（冪等）。
   bool active() const { return active_.load(); }
 

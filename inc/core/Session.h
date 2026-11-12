@@ -115,6 +115,15 @@ public:
   // 名前→回数（表示用コピー）。回数の多い順に使うのは呼び出し側。
   std::vector<std::pair<std::string, uint64_t>> syscallWatchCounts();
 
+  // ---- syscall 停止キャッチポイント（Phase 2。libdtrace の stop() アクション） ----
+  // filter は観測版と同じ書式（""/"all"/"<名前>"/"mach"/"mach:<名前>"）。マッチした
+  // syscall/Mach トラップが発火した瞬間にカーネルが対象タスクを凍結し、デバッガは通常の
+  // 停止として扱う（レジスタ/バックトレース/メモリを検査でき、cont で次の発火まで走る）。
+  // 観測版と同じ dtrace ハンドルを使うので両者は排他（arm すると観測は解除、逆も同様）。要 attach。
+  bool startSyscallStop(const std::string& filter, std::string& err);
+  // 現在の dtrace 稼働が停止キャッチポイントか（観測モードなら false）。
+  bool syscallStopMode() const { return scStop_.load(); }
+
   // ロード済み全イメージのシンボルをバックグラウンドで先読み・キャッシュする（一度だけ起動）。
   // UUID キャッシュ（Symbols）へ保存されるので次回以降は速い。detach 時に安全に停止する。
   void warmSymbols();
@@ -129,6 +138,10 @@ private:
   // 例外スレッドから呼ばれる
   kern_return_t onException(thread_act_t thread, exception_type_t exc,
                             const int64_t* codes, int codeCount);
+
+  // dtrace の consumer スレッドから呼ばれる（停止キャッチポイント発火時）。
+  // 既に kernel が対象を suspend 済みなので、それを計上に取り込んで通常停止へ合流させる。
+  void onSyscallStopHit(const SyscallHit& h);
 
   // resume 決定をセットして例外スレッドを起こす
   enum class Resume { None, Cont, Step, StepOver, Detach };
@@ -147,6 +160,7 @@ private:
   std::unordered_map<std::string, uint64_t> scCounts_; // syscall 名→回数
   std::atomic<uint64_t> scTotal_{0};                   // 総発火数
   std::string scFilter_;                               // 監視対象（表示用）
+  std::atomic<bool> scStop_{false};                    // 現在の dtrace 稼働が停止キャッチポイントか
   std::string defaultLib_; // uselib で設定する既定ライブラリ名（空＝主実行ファイル）
   // dSYM の DWARF 行情報（イメージ UUID でキャッシュ、遅延ロード）。
   std::unordered_map<std::string, DwarfLines> lineCache_;
@@ -177,6 +191,8 @@ private:
   exception_type_t stopExc_ = 0;// 直近の停止が例外由来ならその種別（0=通常のブレイク/ステップ停止）
   int64_t stopCode0_ = 0;       // 例外 code[0]（BAD_ACCESS なら kern_return の種別）
   int64_t stopCode1_ = 0;       // 例外 code[1]（BAD_ACCESS ならフォルトしたアドレス）
+  bool stopIsSyscallCatch_ = false; // 直近の停止が syscall 停止キャッチポイント由来か（表示用）
+  std::string scStopCaught_;        // そのとき発火した syscall/トラップ名（stopReason 用）
 
   // 全スレッドのデバッグレジスタへ HW ブレイク集合を書き込む（呼び出し側がタスク停止を保証する）
   void writeHwToThreads();

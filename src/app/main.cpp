@@ -1319,6 +1319,27 @@ void runCommand(const std::string& line) {
       if (!g_session.startSyscallWatch(filter, err)) { g_message = "syscall 監視の開始に失敗: " + err; return; }
       g_message = "syscall 監視を開始 [" + (a == "all" ? std::string("all") : a) + "]（:scwatch で状況 / :scwatch off で停止）";
     }
+  } else if (cmd == "scstop") {
+    // syscall 停止キャッチポイント（Phase 2）。マッチした syscall/Mach トラップが発火した瞬間に
+    // カーネル（dtrace の stop()）が対象を凍結し、通常のブレイクと同じく検査できる。cont で次の
+    // 発火まで走る。dtrace ハンドルは観測版（:scwatch）と共用なので両者は排他。filter 書式も同じ。
+    std::string a = trimStr(arg);
+    if (a == "off") {
+      if (!(g_session.syscallWatchActive() && g_session.syscallStopMode())) { g_message = "停止キャッチポイントは設定されていません"; return; }
+      g_session.stopSyscallWatch();
+      g_message = "syscall 停止キャッチポイントを解除しました";
+    } else if (a.empty()) {
+      bool on = g_session.syscallWatchActive() && g_session.syscallStopMode();
+      if (!on) { g_message = "syscall 停止キャッチポイント: 未設定（:scstop <名前|all|mach[:<名前>]> で設定）"; return; }
+      g_message = std::string("syscall 停止キャッチポイント: 稼働中 [") + g_session.syscallWatchFilter() +
+                  "]  命中 " + std::to_string(g_session.syscallWatchTotal()) + " 回（:scstop off で解除）";
+    } else {
+      if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+      std::string err;
+      std::string filter = (a == "all") ? std::string() : a; // "" = 全件
+      if (!g_session.startSyscallStop(filter, err)) { g_message = "停止キャッチポイントの設定に失敗: " + err; return; }
+      g_message = "syscall 停止キャッチポイントを設定 [" + a + "]（発火で停止。:scstop off で解除）";
+    }
   } else if (cmd == "seg") {
     if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
     const Image* im = arg.empty() ? g_session.images().mainExecutable() : g_session.images().byName(arg);
@@ -1466,6 +1487,8 @@ void runCommand(const std::string& line) {
       "  :scwatch <名前|all>        BSD syscall を監視（例 :scwatch write / :scwatch all）",
       "  :scwatch mach[:<名前>]     Mach トラップを監視（例 :scwatch mach / :scwatch mach:mach_msg_trap）。表示は mach: 付き",
       "  :scwatch                   監視状況（名前ごとの回数）を表示    :scwatch off  監視停止",
+      "  :scstop <名前|all|mach[:<名前>]>  その syscall/トラップ発火で対象を停止（ブレイク相当。c で次の発火まで走る）",
+      "  :scstop                    停止キャッチポイントの状況    :scstop off  解除（:scwatch と排他）",
       "  注釈は UUID 別のテキストに保存（~/Library/Application Support/ta2debug/annotations/<UUID>.t2a）。",
       "  手編集でき（TAB 区切り）、起動中に外部で更新されても自動で読み直します。stripped な自作バイナリに有効。",
       "\x1b[36m― 書き換え ―\x1b[0m",
@@ -1496,7 +1519,7 @@ void runCommand(const std::string& line) {
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
   static const char* CMDS[] = {"attach", "detach", "run", "launch", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "bd", "bt",
-                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch"};
+                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch", "scstop"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
     if (std::string(c).rfind(g_cmdline, 0) == 0) cands.push_back(c); // 接頭辞一致
@@ -1671,8 +1694,13 @@ bool onStoppedEvent() {
   g_state = UiState::Stopped;
   if (g_session.stopException() != 0) // クラッシュ停止
     g_message = "⚠ " + g_session.stopReason() + "  — c で対象を通常終了（シグナルを本来のハンドラへ通す）";
-  else { std::string sc = g_session.syscallAtStop(); // syscall 直前なら呼び出し内容
-    if (!sc.empty()) g_message = "→ syscall: " + sc; }
+  else {
+    std::string reason = g_session.stopReason(); // syscall 停止キャッチポイントならその理由（他は空）
+    std::string sc = g_session.syscallAtStop();   // syscall 直前なら呼び出し内容
+    if (!reason.empty() && !sc.empty()) g_message = reason + "  → " + sc;
+    else if (!reason.empty())           g_message = reason;
+    else if (!sc.empty())               g_message = "→ syscall: " + sc;
+  }
   return true;
 }
 

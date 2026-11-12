@@ -42,7 +42,8 @@ void DtraceCatch::cbEnd() {
   if (handler_) handler_(pending_);
 }
 
-bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, std::string& err) {
+bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, std::string& err,
+                        bool stopOnHit) {
   if (hdl_) { err = "既に監視中"; return false; }
   handler_ = std::move(handler);
   stopReq_ = false;
@@ -58,8 +59,14 @@ bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, s
   if (name == "all") name = "";
   // trace(0) は「発火を consumer に届かせる」ための最小レコード（値は読まない）。
   // /pid==対象/ でそのプロセスだけに絞る。
-  std::string prog = provider + "::" + name + ":entry /pid == " + std::to_string((long long)pid) +
-                     "/ { trace(0); }";
+  // stopOnHit のときは破壊的アクション stop() を足す。カーネルが発火時に対象タスクを
+  // suspend する（精密＝syscall 境界で止まる）。destructive は pragma で有効化する
+  // （dtrace(1) の -w 相当。これが無いと stop() はコンパイルを通らない）。
+  std::string prog;
+  if (stopOnHit) prog += "#pragma D option destructive\n";
+  prog += provider + "::" + name + ":entry /pid == " + std::to_string((long long)pid) + "/ { trace(0);";
+  if (stopOnHit) prog += " stop();";
+  prog += " }";
 
   int derr = 0;
   dtrace_hdl_t* h = dtrace_open(DTRACE_VERSION, 0, &derr);

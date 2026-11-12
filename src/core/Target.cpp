@@ -105,6 +105,20 @@ bool Target::resume() {
   return true;
 }
 
+void Target::adoptExternalSuspend() {
+  if (task_ == 0) return;
+  // task は既に外部（dtrace の stop() アクション）で suspend 済み。task_suspend は呼ばず、
+  // 計上だけ合わせる。以後の resume()（continue）1 回で kernel の suspend_count が 0 に戻る。
+  suspendCount_++;
+}
+
+void Target::cancelExternalSuspend() {
+  if (task_ == 0) return;
+  // 既に自分が停止中に外部サスペンドが 1 段乗った場合に、その 1 段だけ解除する。
+  // 取り込んでいない（suspendCount_ に数えていない）ので計上はいじらない。
+  task_resume(task_);
+}
+
 bool Target::readMemory(uint64_t addr, void* buf, size_t size, size_t* outRead) {
   if (task_ == 0) return false;
   mach_vm_size_t got = 0;

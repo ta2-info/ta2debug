@@ -212,6 +212,7 @@ bool Session::startSyscallWatch(const std::string& filter, std::string& err) {
   stopSyscallWatch(); // 二重起動を避ける（再開扱い）
   { std::lock_guard<std::mutex> lk(scMu_); scCounts_.clear(); scFilter_ = filter; }
   scTotal_.store(0);
+  scStop_.store(false); // 観測モード
   // handler は consumer スレッドから高頻度で呼ばれ得る。名前別カウントを貯めるだけに留め、
   // UI へはイベントを流さない（全 syscall だと秒間数千になり得るため）。
   return dtrace_.start(target_.pid(), filter, [this](const SyscallHit& h) {
@@ -221,7 +222,47 @@ bool Session::startSyscallWatch(const std::string& filter, std::string& err) {
   }, err);
 }
 
-void Session::stopSyscallWatch() { dtrace_.stop(); }
+bool Session::startSyscallStop(const std::string& filter, std::string& err) {
+  if (!target_.isAttached()) { err = "attach していません"; return false; }
+  stopSyscallWatch(); // 観測/別の停止キャッチポイントが動いていれば解除（dtrace ハンドルは 1 つ）
+  { std::lock_guard<std::mutex> lk(scMu_); scCounts_.clear(); scFilter_ = filter; }
+  scTotal_.store(0);
+  scStop_.store(true); // 停止キャッチポイントモード
+  // stopOnHit=true: D プログラムに stop() が入り、発火でカーネルが対象を凍結する。
+  // handler（consumer スレッド）で通常停止へ合流させる。発火は 1 回/再開なので高頻度化しない。
+  return dtrace_.start(target_.pid(), filter, [this](const SyscallHit& h) {
+    scTotal_.fetch_add(1, std::memory_order_relaxed);
+    onSyscallStopHit(h);
+  }, err, /*stopOnHit=*/true);
+}
+
+// dtrace の stop() で既にカーネルが対象タスクを suspend 済みの状態で呼ばれる（consumer スレッド）。
+void Session::onSyscallStopHit(const SyscallHit& h) {
+  std::lock_guard<std::mutex> lk(m_);
+  if (!target_.isAttached()) { target_.cancelExternalSuspend(); return; }
+  if (stopped_.load()) {
+    // 既に別理由で停止中（タスクは自分が凍結済み）。dtrace が乗せた 1 段だけ相殺して無視する。
+    target_.cancelExternalSuspend();
+    return;
+  }
+  // dtrace が掛けた suspend を自分の計上に取り込む（continue 時の resume() 1 回で解ける）。
+  target_.adoptExternalSuspend();
+  auto threads = target_.threads();
+  if (threads.empty()) { target_.resume(); return; } // 取り込んだ 1 段を戻して諦める
+  thread_act_t t = threads[0]; // 注: 複数スレッド対象では発火スレッドと一致しない場合がある
+  target_.getThreadState(t, stopState_.data());
+  stopPc_ = target_.arch().pc(stopState_.data());
+  stopThread_ = t;
+  manualStop_ = true;          // 再開は Ctrl+C 停止と同じ経路（resumeManual→applyResume）
+  lastWatchId_ = -1;
+  stopExc_ = 0;
+  stopIsSyscallCatch_ = true;
+  scStopCaught_ = h.name;
+  stopped_ = true;
+  queue_.push({Event::Stopped, 0});
+}
+
+void Session::stopSyscallWatch() { dtrace_.stop(); scStop_.store(false); }
 
 std::string Session::syscallWatchFilter() {
   std::lock_guard<std::mutex> lk(scMu_);
@@ -257,6 +298,7 @@ std::string Session::describe(uint64_t addr) {
 }
 
 std::string Session::stopReason() const {
+  if (stopIsSyscallCatch_) return std::string("syscall キャッチ: ") + scStopCaught_;
   if (stopExc_ == 0) return std::string(); // 通常のブレイク/ステップ停止
   const char* name;
   switch (stopExc_) {
@@ -799,6 +841,7 @@ void Session::interrupt() {
   manualStop_ = true;
   lastWatchId_ = -1;
   stopExc_ = 0;
+  stopIsSyscallCatch_ = false;
   stopped_ = true;
   queue_.push({Event::Stopped, 0});
 }
@@ -842,6 +885,7 @@ kern_return_t Session::onException(thread_act_t thread, exception_type_t exc,
                                    const int64_t* codes, int n) {
   Arch& a = target_.arch();
   target_.suspend(); // 判断・停止中はタスク全体を凍結
+  stopIsSyscallCatch_ = false; // 例外由来の停止（syscall キャッチではない）
 
   std::vector<uint8_t> ts(a.threadStateCount() * sizeof(natural_t), 0);
   target_.getThreadState(thread, ts.data());

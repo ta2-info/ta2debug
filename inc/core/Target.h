@@ -3,6 +3,7 @@
 // デバッグ対象プロセス。task_for_pid でタスクポートを取り、メモリ R/W・スレッド列挙・
 // レジスタ取得/設定を提供する。対象は停止させない（アタッチ後も動き続ける）。
 // アーキ依存は Arch に委ねる（スレッド状態 flavor、レジスタ配置など）。
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -41,6 +42,13 @@ public:
   bool suspend();
   bool resume();
 
+  // dtrace の stop() など「外部」が掛けた task サスペンドを自分の計上に取り込む。
+  // task_suspend は呼ばない（既に外部が suspend 済み）。以後 resume() 1 回で解除される。
+  void adoptExternalSuspend();
+  // 既に自分が停止中に外部サスペンドが 1 段乗ったとき、その 1 段だけを相殺する
+  // （計上は変えない＝取り込まない）。既存の停止/再開収支に影響させないために使う。
+  void cancelExternalSuspend();
+
   // メモリ R/W。write はコードページでも書ける（CoW + 保護復元。設計書 §7）。
   bool readMemory(uint64_t addr, void* buf, size_t size, size_t* outRead = nullptr);
   bool writeMemory(uint64_t addr, const void* buf, size_t size);
@@ -60,7 +68,7 @@ private:
   pid_t pid_ = 0;
   task_t task_ = 0;
   std::unique_ptr<Arch> arch_;
-  int suspendCount_ = 0;
+  std::atomic<int> suspendCount_{0}; // consumer スレッドからも触る（dtrace stop 取り込み）ため atomic
   bool launched_ = false; // 自分で起動した子（detach 時に終了させる）
 };
 
