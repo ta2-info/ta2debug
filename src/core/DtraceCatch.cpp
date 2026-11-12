@@ -42,22 +42,38 @@ void DtraceCatch::cbEnd() {
   if (g_dtDbg) fprintf(stderr, "[dt] hit %s%s\n", pending_.name.c_str(), pending_.isReturn ? " (return)" : "");
   if (handler_) handler_(pending_);
 }
+void DtraceCatch::cbBuffered(const char* text) {
+  // 整形出力は断片で届き得るので改行で 1 行に組み立てて onLine_ に渡す。
+  lineAccum_ += text;
+  size_t nl;
+  while ((nl = lineAccum_.find('\n')) != std::string::npos) {
+    std::string line = lineAccum_.substr(0, nl);
+    lineAccum_.erase(0, nl + 1);
+    if (!line.empty() && onLine_) onLine_(line);
+  }
+}
 
-bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, std::string& err,
-                        bool stopOnHit) {
-  if (hdl_) { err = "既に監視中"; return false; }
-  handler_ = std::move(handler);
-  stopReq_ = false;
-
-  // filter を provider と名前に分解する。
-  //   ""/"all" → syscall 全件 / "<名前>" → syscall::<名前>
-  //   "mach"/"mach:" → mach_trap 全件 / "mach:<名前>" → mach_trap::<名前>
-  std::string provider = "syscall", name = filter;
+void DtraceCatch::parseFilter(const std::string& filter, std::string& provider, std::string& name) {
+  // ""/"all" → syscall 全件 / "<名前>" → syscall::<名前>
+  // "mach"/"mach:" → mach_trap 全件 / "mach:<名前>" → mach_trap::<名前>
+  provider = "syscall";
+  name = filter;
   if (filter == "mach" || filter.rfind("mach:", 0) == 0) {
     provider = "mach_trap";
     name = (filter.size() > 5) ? filter.substr(5) : "";
   }
   if (name == "all") name = "";
+}
+
+bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, std::string& err,
+                        bool stopOnHit) {
+  if (hdl_) { err = "既に監視中"; return false; }
+  handler_ = std::move(handler);
+  onLine_ = nullptr;
+  stopReq_ = false;
+
+  std::string provider, name;
+  parseFilter(filter, provider, name);
   // trace(0) は「発火を consumer に届かせる」ための最小レコード（値は読まない）。
   // /pid==対象/ でそのプロセスだけに絞る。
   // stopOnHit のときは破壊的アクション stop() を足す。カーネルが発火時に対象タスクを
@@ -103,20 +119,89 @@ bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, s
   return true;
 }
 
+bool DtraceCatch::startTrace(pid_t pid, const std::string& filter, LineHandler onLine,
+                             std::string& err) {
+  if (hdl_) { err = "既に監視中"; return false; }
+
+  std::string provider, name;
+  parseFilter(filter, provider, name);
+  if (name.empty()) { err = "引数つき観測には syscall 名が必要（all は集計のみ）"; return false; }
+
+  handler_ = nullptr;
+  onLine_ = std::move(onLine);
+  lineAccum_.clear();
+  stopReq_ = false;
+
+  // entry で引数を thread-local に退避 → return で引数・戻り値・errno を printf 整形。
+  // quiet で既定ヘッダを消し、printf だけを dtrace_handle_buffered 経由で受け取る。
+  std::string P = std::to_string((long long)pid);
+  std::string pr = provider + "::" + name;
+  std::string prog =
+      "#pragma D option quiet\n" +
+      pr + ":entry /pid == " + P + "/ { self->t = 1; self->a0 = arg0; self->a1 = arg1; "
+           "self->a2 = arg2; self->a3 = arg3; }\n" +
+      pr + ":return /pid == " + P + " && self->t/ { "
+           "printf(\"%s(0x%x, 0x%x, 0x%x, 0x%x) = %d errno=%d\\n\", probefunc, "
+           "self->a0, self->a1, self->a2, self->a3, (int)arg1, errno); self->t = 0; }";
+
+  int derr = 0;
+  dtrace_hdl_t* h = dtrace_open(DTRACE_VERSION, 0, &derr);
+  if (!h) { err = std::string("dtrace_open 失敗: ") + dtrace_errmsg(nullptr, derr); return false; }
+  dtrace_setopt(h, "bufsize", "4m");
+  dtrace_setopt(h, "switchrate", "10hz");
+  // printf の整形出力は dtrace_work に渡す FILE* に書かれる（buffered ハンドラは集計 printa 用で
+  // plain printf では発火しない）。loop() が trace モードでは open_memstream を fp に使って拾う。
+  dtrace_prog_t* p = dtrace_program_strcompile(h, prog.c_str(), DTRACE_PROBESPEC_NAME,
+                                               DTRACE_C_ZDEFS, 0, nullptr);
+  if (!p) {
+    err = std::string("D コンパイル失敗: ") + dtrace_errmsg(h, dtrace_errno(h));
+    dtrace_close(h);
+    return false;
+  }
+  dtrace_proginfo_t info;
+  if (dtrace_program_exec(h, p, &info) == -1) {
+    err = std::string("program_exec 失敗: ") + dtrace_errmsg(h, dtrace_errno(h));
+    dtrace_close(h);
+    return false;
+  }
+  if (dtrace_go(h) == -1) {
+    err = std::string("dtrace_go 失敗: ") + dtrace_errmsg(h, dtrace_errno(h));
+    dtrace_close(h);
+    return false;
+  }
+  hdl_ = h;
+  active_ = true;
+  if (g_dtDbg) fprintf(stderr, "[dt] trace go ok. prog=%s\n", prog.c_str());
+  worker_ = std::thread([this] { loop(); });
+  return true;
+}
+
 void DtraceCatch::loop() {
   auto* h = static_cast<dtrace_hdl_t*>(hdl_);
-  // dtrace_work の既定整形出力の捨て先（レコードは callback で消費するので通常使われない。
-  // ただし fp=NULL だと内部でエラーになるため有効な FILE* を渡す）。
-  FILE* devnull = fopen("/dev/null", "w");
+  const bool trace = (bool)onLine_; // startTrace で起動したか（引数つきトレース）
+  // trace モードは printf 出力を拾うため open_memstream を fp に使う。それ以外は捨て先の devnull
+  // （fp=NULL は内部でエラーになるため有効な FILE* が要る）。
+  char* mbuf = nullptr; size_t msize = 0; size_t consumed = 0;
+  FILE* fp = trace ? open_memstream(&mbuf, &msize) : fopen("/dev/null", "w");
   while (!stopReq_.load()) {
     dtrace_sleep(h); // switchrate 間隔で起きる（stop 要求に ~100ms で反応）
-    dtrace_workstatus_t st = dtrace_work(h, devnull, s_probe, s_rec, this);
+    dtrace_workstatus_t st = dtrace_work(h, fp, s_probe, s_rec, this);
+    if (trace && fp) {
+      fflush(fp); // dtrace_work が書いた printf 出力を確定
+      if (msize > consumed) { cbBuffered(mbuf + consumed); consumed = msize; } // 末尾は null 終端
+      // 全部消費し未完行も無ければ、肥大したストリームは作り直して捨てる（巻き戻しの size 挙動を避ける）
+      if (consumed == msize && lineAccum_.empty() && msize > (1u << 20)) {
+        fclose(fp); free(mbuf); mbuf = nullptr; msize = 0; consumed = 0;
+        fp = open_memstream(&mbuf, &msize);
+      }
+    }
     if (g_dtDbg && st != DTRACE_WORKSTATUS_OKAY)
       fprintf(stderr, "[dt] work status=%d err=%s\n", (int)st,
               st == DTRACE_WORKSTATUS_ERROR ? dtrace_errmsg(h, dtrace_errno(h)) : "");
     if (st == DTRACE_WORKSTATUS_DONE || st == DTRACE_WORKSTATUS_ERROR) break;
   }
-  if (devnull) fclose(devnull);
+  if (fp) fclose(fp);
+  free(mbuf);
   active_ = false;
 }
 

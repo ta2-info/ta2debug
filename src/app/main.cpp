@@ -1304,20 +1304,32 @@ void runCommand(const std::string& line) {
       bool on = g_session.syscallWatchActive();
       uint64_t total = g_session.syscallWatchTotal();
       if (!on && total == 0) { g_message = "syscall 監視: 停止中（:scwatch <名前|all> で開始）"; return; }
-      auto counts = g_session.syscallWatchCounts();
-      std::sort(counts.begin(), counts.end(),
-                [](const std::pair<std::string, uint64_t>& x, const std::pair<std::string, uint64_t>& y) { return x.second > y.second; });
       g_output.clear();
-      g_outputTitle = std::string("syscall 監視 ") + (on ? "[稼働中 " : "[停止 ") + g_session.syscallWatchFilter() +
-                      "]  総計 " + std::to_string(total) + " 回" + (on ? "（:scwatch off で停止）" : "");
-      for (const auto& c : counts) { char b[288]; snprintf(b, sizeof(b), "%-28s %llu", c.first.c_str(), (unsigned long long)c.second); g_output.push_back(b); }
-      if (g_output.empty()) g_output.push_back("(まだ発火なし)");
+      if (g_session.syscallWatchTraceMode()) {
+        // 引数・戻り値つきトレース（名指し監視）。新しい順に直近の呼び出しを出す。
+        auto lines = g_session.syscallWatchTrace();
+        g_outputTitle = std::string("syscall トレース ") + (on ? "[稼働中 " : "[停止 ") + g_session.syscallWatchFilter() +
+                        "]  総計 " + std::to_string(total) + " 回" + (on ? "（:scwatch off で停止）" : "");
+        for (auto it = lines.rbegin(); it != lines.rend(); ++it) g_output.push_back(*it);
+        if (g_output.empty()) g_output.push_back("(まだ発火なし)");
+      } else {
+        // 全件は名前別カウント（多い順）。
+        auto counts = g_session.syscallWatchCounts();
+        std::sort(counts.begin(), counts.end(),
+                  [](const std::pair<std::string, uint64_t>& x, const std::pair<std::string, uint64_t>& y) { return x.second > y.second; });
+        g_outputTitle = std::string("syscall 監視 ") + (on ? "[稼働中 " : "[停止 ") + g_session.syscallWatchFilter() +
+                        "]  総計 " + std::to_string(total) + " 回" + (on ? "（:scwatch off で停止）" : "");
+        for (const auto& c : counts) { char b[288]; snprintf(b, sizeof(b), "%-28s %llu", c.first.c_str(), (unsigned long long)c.second); g_output.push_back(b); }
+        if (g_output.empty()) g_output.push_back("(まだ発火なし)");
+      }
     } else {
       if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
       std::string err;
       std::string filter = (a == "all") ? std::string() : a; // "" = 全件
       if (!g_session.startSyscallWatch(filter, err)) { g_message = "syscall 監視の開始に失敗: " + err; return; }
-      g_message = "syscall 監視を開始 [" + (a == "all" ? std::string("all") : a) + "]（:scwatch で状況 / :scwatch off で停止）";
+      bool tr = g_session.syscallWatchTraceMode();
+      g_message = std::string(tr ? "syscall トレースを開始 [" : "syscall 監視を開始 [") + (a == "all" ? std::string("all") : a) +
+                  (tr ? "]（引数・戻り値つき。:scwatch で一覧 / :scwatch off で停止）" : "]（:scwatch で状況 / :scwatch off で停止）");
     }
   } else if (cmd == "scstop") {
     // syscall 停止キャッチポイント（Phase 2）。マッチした syscall/Mach トラップが発火した瞬間に
@@ -1484,9 +1496,10 @@ void runCommand(const std::string& line) {
       "  :memo <式>,<メモ>           そのアドレスにメモを付ける（空メモで削除）    :unann <式>  注釈を削除",
       "  :anns [<ライブラリ>]        注釈一覧（省略で主実行ファイル）。保存先ファイルのパスも表示",
       "\x1b[36m― システムコール監視（libdtrace・止めずに観測） ―\x1b[0m",
-      "  :scwatch <名前|all>        BSD syscall を監視（例 :scwatch write / :scwatch all）",
-      "  :scwatch mach[:<名前>]     Mach トラップを監視（例 :scwatch mach / :scwatch mach:mach_msg_trap）。表示は mach: 付き",
-      "  :scwatch                   監視状況（名前ごとの回数）を表示    :scwatch off  監視停止",
+      "  :scwatch <名前>            その BSD syscall を引数・戻り値つきでトレース（例 :scwatch write）",
+      "  :scwatch all               全 BSD syscall を名前別の回数で集計（引数なし）",
+      "  :scwatch mach[:<名前>]     Mach トラップ。mach:<名前> は引数つきトレース / mach は全件集計",
+      "  :scwatch                   監視状況（トレース行 or 回数）を表示    :scwatch off  監視停止",
       "  :scstop <名前|all|mach[:<名前>]>  その syscall/トラップ発火で対象を停止（ブレイク相当。c で次の発火まで走る）",
       "  :scstop                    停止キャッチポイントの状況    :scstop off  解除（:scwatch と排他）",
       "  注釈は UUID 別のテキストに保存（~/Library/Application Support/ta2debug/annotations/<UUID>.t2a）。",

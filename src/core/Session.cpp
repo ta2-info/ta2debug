@@ -207,19 +207,40 @@ void Session::stopSymbolWarming() {
   warmStarted_ = false; // 再アタッチ時にまた先読みできるように
 }
 
+static const size_t kScTraceMax = 200; // トレース行のリングバッファ上限
+
 bool Session::startSyscallWatch(const std::string& filter, std::string& err) {
   if (!target_.isAttached()) { err = "attach していません"; return false; }
   stopSyscallWatch(); // 二重起動を避ける（再開扱い）
-  { std::lock_guard<std::mutex> lk(scMu_); scCounts_.clear(); scFilter_ = filter; }
+  { std::lock_guard<std::mutex> lk(scMu_); scCounts_.clear(); scTrace_.clear(); scFilter_ = filter; }
   scTotal_.store(0);
   scStop_.store(false); // 観測モード
-  // handler は consumer スレッドから高頻度で呼ばれ得る。名前別カウントを貯めるだけに留め、
-  // UI へはイベントを流さない（全 syscall だと秒間数千になり得るため）。
+
+  std::string prov, name;
+  DtraceCatch::parseFilter(filter, prov, name);
+  if (!name.empty()) {
+    // 特定の syscall/Mach トラップ: 引数・戻り値つきでトレースし、最近の呼び出しを保持する。
+    // handler（consumer スレッド）は整形済み 1 行を受け取りリングバッファへ積むだけ。
+    scTraceMode_.store(true);
+    return dtrace_.startTrace(target_.pid(), filter, [this](const std::string& line) {
+      scTotal_.fetch_add(1, std::memory_order_relaxed);
+      std::lock_guard<std::mutex> lk(scMu_);
+      scTrace_.push_back(line);
+      if (scTrace_.size() > kScTraceMax) scTrace_.pop_front();
+    }, err);
+  }
+  // 全件（all / mach 全件）: 名前別カウントのみ（全 syscall を引数つきで出すと洪水になるため）。
+  scTraceMode_.store(false);
   return dtrace_.start(target_.pid(), filter, [this](const SyscallHit& h) {
     scTotal_.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(scMu_);
     scCounts_[h.name]++;
   }, err);
+}
+
+std::vector<std::string> Session::syscallWatchTrace() {
+  std::lock_guard<std::mutex> lk(scMu_);
+  return std::vector<std::string>(scTrace_.begin(), scTrace_.end());
 }
 
 bool Session::startSyscallStop(const std::string& filter, std::string& err) {

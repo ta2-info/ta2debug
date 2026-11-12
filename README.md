@@ -198,19 +198,31 @@ dSYM に **DWARF 行情報（`.debug_line`）があれば、ソース行を表�
 ### システムコール監視（libdtrace・止めずに観測）
 | コマンド | 説明 |
 |----------|------|
-| `:scwatch <名前\|all>` | **BSD syscall** を**カーネル計測（libdtrace）で監視開始**（例 `:scwatch write` / `:scwatch all`） |
-| `:scwatch mach[:<名前>]` | **Mach トラップ**を監視（例 `:scwatch mach` / `:scwatch mach:mach_msg_trap`）。集計表示は `mach:` を前置 |
-| `:scwatch` | 監視状況（名前ごとの回数・総計）を表示 |
+| `:scwatch <名前>` | その **BSD syscall** を**引数・戻り値つきでトレース**（例 `:scwatch write`）。直近の呼び出しを保持 |
+| `:scwatch all` | **全 BSD syscall** を名前別の**回数で集計**（引数は付けない。全件だと洪水になるため） |
+| `:scwatch mach[:<名前>]` | **Mach トラップ**を監視。`mach:<名前>` は引数つきトレース、`mach`（全件）は集計 |
+| `:scwatch` | 監視状況を表示（名指し＝トレース行を新しい順、全件＝名前別の回数） |
 | `:scwatch off` | 監視停止 |
 
+名前を指定すると、その syscall/トラップを**引数・戻り値・errno つきでトレース**する:
+
+```
+:scwatch write
+write(0x1, 0x100003faf, 0x2, 0x0) = 2 errno=0      ← fd, buf, len, (arg3) = 戻り値 errno
+write(0x3e7, 0x100003fab, 0x1, 0x0) = -1 errno=9   ← 失敗（EBADF）も分かる
+```
+
+entry で引数を thread-local に退避し、return で引数・戻り値・errno を dtrace の `printf` で整形、その
+整形出力（`dtrace_work` に渡した `FILE*`＝`open_memstream`）を 1 行ずつ拾う方式。**dtrace のレコード
+生データ（ABI 依存・内部バッファ）は一切読まない**ので堅牢（生読みは ASan で領域外を踏むため不採用）。
+
 BSD システムコール（`syscall` プロバイダ）と Mach トラップ（`mach_trap` プロバイダ）は別物なので、
-`mach` 系で明示的に切り替える。Mach トラップは `mach:mach_msg_trap` のように `mach:` 付きで集計表示され、BSD と区別できる。
+`mach` 系で明示的に切り替える。Mach トラップは `mach:mach_msg_trap` のように `mach:` 付きで表示され、BSD と区別できる。
 （`EXC_BAD_ACCESS` 等の **Mach 例外**は syscall でもトラップでもなく、ta2debug 自身の例外検知で停止・表示する別経路。）
 
 ユーザ空間のブレイク／単一ステップではなく、**カーネルのシステムコール・ディスパッチ表計測**に相乗りするので、
 **全 syscall を単一ステップ無しで低コストに捕捉**できる（`:auto syscall` の単一ステップ方式とは別物）。
-対象は**止めずに**観測し、syscall 名ごとの回数を集計表示する（全件だと秒間数千になり得るため逐次表示ではなく集計）。
-`libdtrace`（システムライブラリ）を使うため SIP 無効＋root が必要（ta2debug の前提と同じ）。
+対象は**止めずに**観測する。`libdtrace`（システムライブラリ）を使うため SIP 無効＋root が必要（ta2debug の前提と同じ）。
 
 ### システムコール停止キャッチポイント（libdtrace・発火で止める）
 | コマンド | 説明 |

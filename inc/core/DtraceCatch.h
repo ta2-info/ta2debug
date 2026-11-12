@@ -27,7 +27,15 @@ struct SyscallHit {
 class DtraceCatch {
 public:
   using Handler = std::function<void(const SyscallHit&)>;
+  using LineHandler = std::function<void(const std::string&)>; // 整形済みトレース 1 行
   ~DtraceCatch();
+
+  // filter（start と同じ書式。ただし全件 "" / "all" / "mach" は不可＝名前必須）の syscall/
+  // トラップを「引数・戻り値つき」で観測する。entry で引数を thread-local に退避し、return で
+  // `名前(0x.., 0x.., ..) = 戻り値 errno=N` を dtrace の printf で整形、dtrace_handle_buffered
+  // で整形済みテキストを受け取って 1 行ごとに onLine を呼ぶ（生レコードは読まない＝ABI 非依存）。
+  // 全件モードが無いのは、全 syscall を引数つきで出すと洪水になるため（全件は start の集計を使う）。
+  bool startTrace(pid_t pid, const std::string& filter, LineHandler onLine, std::string& err);
 
   // pid の syscall/Mach トラップを監視開始。filter の書式:
   //   ""/"all"      → 全 BSD syscall（syscall:::entry）
@@ -49,6 +57,11 @@ public:
   // --- 内部: libdtrace の consume コールバックから呼ぶ（worker スレッド専用） ---
   void cbBegin(const char* provider, const char* func, const char* name);
   void cbEnd();
+  // dtrace_handle_buffered から呼ぶ。整形済みの断片を貯め、改行ごとに onLine_ を呼ぶ。
+  void cbBuffered(const char* text);
+
+  // filter を provider と名前に分解（start/startTrace で共用）。
+  static void parseFilter(const std::string& filter, std::string& provider, std::string& name);
 
 private:
   void loop();
@@ -59,6 +72,8 @@ private:
   std::atomic<bool> stopReq_{false};
   Handler handler_;
   SyscallHit pending_;         // 組み立て中の 1 件（worker スレッド専用）
+  LineHandler onLine_;         // トレース行の受け手（startTrace のとき）
+  std::string lineAccum_;      // 整形出力の未完行バッファ（worker スレッド専用）
 };
 
 } // namespace ta2

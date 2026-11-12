@@ -23,7 +23,7 @@
 #include "core/DwarfLines.h"
 #include <unordered_map>
 #include "app/EventQueue.h"
-#include <unordered_map>
+#include <deque>
 
 namespace ta2 {
 
@@ -114,6 +114,10 @@ public:
   uint64_t syscallWatchTotal() const { return scTotal_.load(); }
   // 名前→回数（表示用コピー）。回数の多い順に使うのは呼び出し側。
   std::vector<std::pair<std::string, uint64_t>> syscallWatchCounts();
+  // 特定 syscall/トラップを名指し監視したときは引数・戻り値つきでトレースする（全件は集計のみ）。
+  bool syscallWatchTraceMode() const { return scTraceMode_.load(); }
+  // 直近のトレース行（"write(0x.., 3, 3) = 3 errno=0" など）を古い順でコピー。新しい順は呼び出し側で。
+  std::vector<std::string> syscallWatchTrace();
 
   // ---- syscall 停止キャッチポイント（Phase 2。libdtrace の stop() アクション） ----
   // filter は観測版と同じ書式（""/"all"/"<名前>"/"mach"/"mach:<名前>"）。マッチした
@@ -164,10 +168,12 @@ private:
   Annotations annots_; // ユーザ注釈（名前／メモ）。symbols_ に重ねる
   DtraceCatch dtrace_; // syscall 監視（libdtrace 相乗り。observe）
   std::mutex scMu_;    // scCounts_/scFilter_ を保護（consumer スレッドと共用）
-  std::unordered_map<std::string, uint64_t> scCounts_; // syscall 名→回数
+  std::unordered_map<std::string, uint64_t> scCounts_; // syscall 名→回数（全件集計モード）
+  std::deque<std::string> scTrace_;                    // 直近のトレース行（名指しトレースモード。scMu_ で保護）
   std::atomic<uint64_t> scTotal_{0};                   // 総発火数
   std::string scFilter_;                               // 監視対象（表示用）
   std::atomic<bool> scStop_{false};                    // 現在の dtrace 稼働が停止キャッチポイントか
+  std::atomic<bool> scTraceMode_{false};               // 観測が引数つきトレースモードか（全件は集計）
   std::string defaultLib_; // uselib で設定する既定ライブラリ名（空＝主実行ファイル）
   // dSYM の DWARF 行情報（イメージ UUID でキャッシュ、遅延ロード）。
   std::unordered_map<std::string, DwarfLines> lineCache_;
