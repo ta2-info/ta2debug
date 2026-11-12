@@ -21,6 +21,7 @@ struct SyscallHit {
   bool isReturn = false;   // entry/return
   // 引数は dtrace のレコード生データ（ABI 依存）には触れず、停止時に対象レジスタから
   // 取る方針（Session::syscallAtStop が既に解析済み）。ここでは名前と entry/return のみ。
+  // 停止キャッチポイントの発火スレッドは停止後に PC シンボルで特定する（Session 側）。
 };
 
 class DtraceCatch {

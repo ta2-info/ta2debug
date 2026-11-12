@@ -123,6 +123,10 @@ public:
   bool startSyscallStop(const std::string& filter, std::string& err);
   // 現在の dtrace 稼働が停止キャッチポイントか（観測モードなら false）。
   bool syscallStopMode() const { return scStop_.load(); }
+  // 停止キャッチポイント停止後にメインスレッドから呼ぶ。捕捉した syscall/トラップ名と各スレッドの
+  // PC シンボルを突き合わせ、発火スレッドへ stopThread_ を確定する（複数スレッド対象で正しい BT）。
+  // シンボル解決を伴うため consumer スレッドではなくここ（メイン）で行う。停止中のみ有効。
+  void refineSyscallStopThread();
 
   // ロード済み全イメージのシンボルをバックグラウンドで先読み・キャッシュする（一度だけ起動）。
   // UUID キャッシュ（Symbols）へ保存されるので次回以降は速い。detach 時に安全に停止する。
@@ -142,6 +146,9 @@ private:
   // dtrace の consumer スレッドから呼ばれる（停止キャッチポイント発火時）。
   // 既に kernel が対象を suspend 済みなので、それを計上に取り込んで通常停止へ合流させる。
   void onSyscallStopHit(const SyscallHit& h);
+  // 捕捉名（"write" / "mach:<名前>"）に対し、その syscall/トラップを呼んでいるスレッドを
+  // PC シンボルで探す（無ければ 0）。停止中・タスク凍結済みで呼ぶ。
+  thread_act_t firingThreadFor(const std::string& caught);
 
   // resume 決定をセットして例外スレッドを起こす
   enum class Resume { None, Cont, Step, StepOver, Detach };

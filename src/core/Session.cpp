@@ -247,9 +247,12 @@ void Session::onSyscallStopHit(const SyscallHit& h) {
   }
   // dtrace が掛けた suspend を自分の計上に取り込む（continue 時の resume() 1 回で解ける）。
   target_.adoptExternalSuspend();
+  // ここでは暫定で先頭スレッドを採る。発火スレッドの確定（PC シンボルと捕捉名の突き合わせ）は
+  // シンボル解決を伴うので、warming スレッドとの競合を避けてメインスレッド側（refineSyscallStopThread）
+  // で行う。task は suspend 済みで全スレッドが凍結しているため、後から選び直しても状態は一貫する。
   auto threads = target_.threads();
   if (threads.empty()) { target_.resume(); return; } // 取り込んだ 1 段を戻して諦める
-  thread_act_t t = threads[0]; // 注: 複数スレッド対象では発火スレッドと一致しない場合がある
+  thread_act_t t = threads[0];
   target_.getThreadState(t, stopState_.data());
   stopPc_ = target_.arch().pc(stopState_.data());
   stopThread_ = t;
@@ -260,6 +263,30 @@ void Session::onSyscallStopHit(const SyscallHit& h) {
   scStopCaught_ = h.name;
   stopped_ = true;
   queue_.push({Event::Stopped, 0});
+}
+
+thread_act_t Session::firingThreadFor(const std::string& caught) {
+  std::string want = caught;
+  if (want.rfind("mach:", 0) == 0) want = want.substr(5); // "mach:" 前置を外す
+  std::vector<uint8_t> ts(arch().threadStateCount() * sizeof(natural_t), 0);
+  for (auto th : target_.threads()) {
+    if (!target_.getThreadState(th, ts.data())) continue;
+    uint64_t pc = arch().pc(ts.data());
+    std::string fn = symbolName(pc); // 例 "write+0xa" / "_kernelrpc_mach_port_allocate_trap+0xa"
+    size_t plus = fn.find('+');
+    std::string base = (plus == std::string::npos) ? fn : fn.substr(0, plus);
+    if (base == want) return th;
+  }
+  return 0;
+}
+
+void Session::refineSyscallStopThread() {
+  if (!stopIsSyscallCatch_ || !stopped_.load() || !target_.isAttached()) return;
+  thread_act_t t = firingThreadFor(scStopCaught_);
+  if (t == 0 || t == stopThread_) return; // 見つからない／既に正しいなら暫定のまま
+  stopThread_ = t;
+  target_.getThreadState(t, stopState_.data());
+  stopPc_ = target_.arch().pc(stopState_.data());
 }
 
 void Session::stopSyscallWatch() { dtrace_.stop(); scStop_.store(false); }

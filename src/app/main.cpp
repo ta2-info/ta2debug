@@ -1670,6 +1670,7 @@ void onKey(int c) {
 bool onStoppedEvent() {
   g_session.refreshImages();
   g_session.refreshAnnotations(); // ユーザ注釈を（外部編集を含め）読み直し、停止表示・BT に反映（条件2）
+  g_session.refineSyscallStopThread(); // syscall 停止キャッチポイントなら発火スレッドを確定（複数スレッド対応）
   g_session.warmSymbols(); // 初回停止でイメージが揃ったら裏でシンボルを先読み（idempotent）
   if (g_autoMask) {
     uint64_t pc = g_session.stopPc();

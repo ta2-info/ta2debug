@@ -26,6 +26,7 @@ int s_rec(const dtrace_probedata_t* d, const dtrace_recdesc_t* rec, void* arg) {
   auto* self = static_cast<DtraceCatch*>(arg);
   if (rec == nullptr) { self->cbEnd(); return DTRACE_CONSUME_NEXT; } // この probe のレコード終端
   // レコードの生データ（libdtrace 内部バッファ・ABI 依存）には触れない。名前は probe 記述から得る。
+  // 発火スレッドの特定は停止後に対象スレッドの PC シンボルで行う（Session 側）。
   return DTRACE_CONSUME_THIS;
 }
 } // namespace
