@@ -1,9 +1,12 @@
 #include "core/DtraceCatch.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <dtrace.h>
 
@@ -63,6 +66,63 @@ void DtraceCatch::parseFilter(const std::string& filter, std::string& provider, 
     name = (filter.size() > 5) ? filter.substr(5) : "";
   }
   if (name == "all") name = "";
+}
+
+namespace {
+std::string toLower(const std::string& s) {
+  std::string r = s;
+  for (char& c : r) c = (char)std::tolower((unsigned char)c);
+  return r;
+}
+// dtrace_probe_iter のコールバック。arg は {小文字の部分一致キー, 出力先}。
+struct ProbeCollect {
+  std::string sub;                  // "" なら全件
+  std::vector<std::string>* out;
+};
+int collectProbe(dtrace_hdl_t* h, const dtrace_probedesc_t* pd, void* arg) {
+  (void)h;
+  auto* c = static_cast<ProbeCollect*>(arg);
+  // entry/return の両方が来るので entry だけ採る（func 名は同一）。
+  if (std::strcmp(pd->dtpd_name, "entry") != 0) return 0;
+  const char* f = pd->dtpd_func;
+  if (!f || !*f || f[0] == '#') return 0;    // "#<番号>" は未実装スロット。除外。
+  if (!c->sub.empty() && toLower(f).find(c->sub) == std::string::npos) return 0;
+  c->out->push_back(f);
+  return 0;
+}
+// 1 プロバイダ分を列挙して out に昇順・重複なしで詰める。
+void iterProvider(dtrace_hdl_t* h, const char* spec, const std::string& sub,
+                  std::vector<std::string>& out) {
+  dtrace_probedesc_t pd;
+  if (dtrace_str2desc(h, DTRACE_PROBESPEC_NAME, spec, &pd) != 0) return;
+  ProbeCollect c{sub, &out};
+  dtrace_probe_iter(h, &pd, collectProbe, &c);
+  std::sort(out.begin(), out.end());
+  out.erase(std::unique(out.begin(), out.end()), out.end());
+}
+} // namespace
+
+bool DtraceCatch::listNames(const std::string& filter, std::vector<std::string>& bsd,
+                            std::vector<std::string>& mach, std::string& err) {
+  bsd.clear();
+  mach.clear();
+  // parseFilter と同じ入力規約で BSD / Mach のどちらを引くか、部分一致キーは何かを決める。
+  bool wantBsd = true, wantMach = true;
+  std::string sub = filter;
+  if (filter == "mach" || filter.rfind("mach:", 0) == 0) {
+    wantBsd = false;
+    sub = (filter.size() > 5) ? filter.substr(5) : "";
+  }
+  if (sub == "all") sub = "";
+  sub = toLower(sub);
+
+  int derr = 0;
+  dtrace_hdl_t* h = dtrace_open(DTRACE_VERSION, 0, &derr);
+  if (!h) { err = std::string("dtrace_open 失敗: ") + dtrace_errmsg(nullptr, derr); return false; }
+  if (wantBsd) iterProvider(h, "syscall:::entry", sub, bsd);
+  if (wantMach) iterProvider(h, "mach_trap:::entry", sub, mach);
+  dtrace_close(h);
+  return true;
 }
 
 bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, std::string& err,

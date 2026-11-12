@@ -903,6 +903,40 @@ std::string trimStr(const std::string& s) {
   size_t a = s.find_first_not_of(" \t"); if (a == std::string::npos) return "";
   size_t b = s.find_last_not_of(" \t"); return s.substr(a, b - a + 1);
 }
+// 有効な syscall / Mach トラップ名を列挙して出力ペインへ（:scwatch list / :scstop list の実体）。
+// filter の書式は scwatch/scstop の名前指定と同じ（""/"<語>"/"mach"/"mach:<語>"）で、ここでは
+// 部分一致検索として使える。別ドキュメントを見ずにツール内で有効名を確認するための機能。
+void showSyscallNames(const std::string& filter) {
+  std::vector<std::string> bsd, mach;
+  std::string err;
+  if (!Session::syscallNames(filter, bsd, mach, err)) { g_message = "名前一覧の取得に失敗: " + err; return; }
+  int cols = g_term.cols(); if (cols < 40) cols = 80; // バッチ等で未取得なら 80 と見なす
+  g_output.clear();
+  // 1 グループを、最長名に合わせた等幅カラムで端末幅に収めて出す。
+  auto emit = [&](const std::string& head, const std::vector<std::string>& v, const std::string& prefix) {
+    g_output.push_back(head);
+    if (v.empty()) { g_output.push_back("  (該当なし)"); return; }
+    size_t maxw = 0; for (const auto& s : v) maxw = std::max(maxw, prefix.size() + s.size());
+    int colw = (int)maxw + 2;
+    int ncol = std::max(1, (cols - 2) / colw); // 先頭 2 字インデント
+    for (size_t i = 0; i < v.size(); i += ncol) {
+      std::string line = "  ";
+      for (size_t j = i; j < i + (size_t)ncol && j < v.size(); ++j) {
+        char b[160]; snprintf(b, sizeof(b), "%-*s", colw, (prefix + v[j]).c_str()); line += b;
+      }
+      while (!line.empty() && line.back() == ' ') line.pop_back();
+      g_output.push_back(line);
+    }
+  };
+  // filter が mach 指定なら Mach のみ、それ以外は両方（語指定は両プロバイダを横断検索）。
+  bool machOnly = (filter == "mach" || filter.rfind("mach:", 0) == 0);
+  std::string shown = (filter.empty() || filter == "all") ? "" : (" 「" + filter + "」");
+  g_outputTitle = "利用可能な syscall / Mach トラップ名" + shown +
+                  "  （:scwatch <名前> / :scstop <名前> で使用）";
+  if (!machOnly) emit("BSD syscall (" + std::to_string(bsd.size()) + "):", bsd, "");
+  emit("Mach トラップ (" + std::to_string(mach.size()) + "):", mach, "mach:");
+}
+
 // HEX 文字列（空白無視）→ バイト列。空・奇数長・不正文字で false。
 bool parseHexBytes(const std::string& in, std::vector<uint8_t>& out) {
   std::string h; for (char c : in) if (!std::isspace((unsigned char)c)) h += c;
@@ -1321,6 +1355,12 @@ void runCommand(const std::string& line) {
     // syscall 観測（libdtrace 相乗り）。止めずに名前別の回数を集計する（strace 的）。
     // 開始は attach が要るが、状況表示・停止は対象終了後でも使える（集計は残る）。
     std::string a = trimStr(arg);
+    // "list [語|mach[:語]]" は有効名の一覧（監視の有無に関係なく使える）。
+    if (a == "list" || a.rfind("list ", 0) == 0 || a.rfind("list\t", 0) == 0) {
+      size_t sp = a.find_first_of(" \t");
+      showSyscallNames(sp == std::string::npos ? std::string() : trimStr(a.substr(sp)));
+      return;
+    }
     // いま稼働中の dtrace ハンドルが :scstop（停止キャッチポイント）なら、:scwatch からは触らない
     // （観測と停止は同じハンドルを共用するため、状態問い合わせ・停止をモードで対称に切り分ける）。
     bool stopActive = g_session.syscallWatchActive() && g_session.syscallStopMode();
@@ -1366,6 +1406,12 @@ void runCommand(const std::string& line) {
     // カーネル（dtrace の stop()）が対象を凍結し、通常のブレイクと同じく検査できる。cont で次の
     // 発火まで走る。dtrace ハンドルは観測版（:scwatch）と共用なので両者は排他。filter 書式も同じ。
     std::string a = trimStr(arg);
+    // "list [語|mach[:語]]" は有効名の一覧（:scwatch list と同じ。attach 前でも確認できる）。
+    if (a == "list" || a.rfind("list ", 0) == 0 || a.rfind("list\t", 0) == 0) {
+      size_t sp = a.find_first_of(" \t");
+      showSyscallNames(sp == std::string::npos ? std::string() : trimStr(a.substr(sp)));
+      return;
+    }
     if (a == "off") {
       if (!(g_session.syscallWatchActive() && g_session.syscallStopMode())) { g_message = "停止キャッチポイントは設定されていません"; return; }
       g_session.stopSyscallWatch();
@@ -1529,8 +1575,10 @@ void runCommand(const std::string& line) {
       "  :scwatch <名前>            その BSD syscall を引数・戻り値つきでトレース（例 :scwatch write）",
       "  :scwatch all               全 BSD syscall を名前別の回数で集計（引数なし）",
       "  :scwatch mach[:<名前>]     Mach トラップ。mach:<名前> は引数つきトレース / mach は全件集計",
+      "  :scwatch list [語]         使える syscall/Mach トラップ名の一覧（語で絞り込み。例 :scwatch list port）",
       "  :scwatch                   監視状況（トレース行 or 回数）を表示    :scwatch off  監視停止",
       "  :scstop <名前|all|mach[:<名前>]>  その syscall/トラップ発火で対象を停止（ブレイク相当。c で次の発火まで走る）",
+      "  :scstop list [語]          使える名前の一覧（:scwatch list と同じ）",
       "  :scstop                    停止キャッチポイントの状況    :scstop off  解除（:scwatch と排他）",
       "  注釈は UUID 別のテキストに保存（~/Library/Application Support/ta2debug/annotations/<UUID>.t2a）。",
       "  手編集でき（TAB 区切り）、起動中に外部で更新されても自動で読み直します。stripped な自作バイナリに有効。",

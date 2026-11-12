@@ -118,6 +118,11 @@ public:
   bool syscallWatchTraceMode() const { return scTraceMode_.load(); }
   // 直近のトレース行（"write(0x.., 3, 3) = 3 errno=0" など）を古い順でコピー。新しい順は呼び出し側で。
   std::vector<std::string> syscallWatchTrace();
+  // 監視に使える syscall / Mach トラップ名の一覧（attach 不要・監視中でも可）。DtraceCatch へ委譲。
+  static bool syscallNames(const std::string& filter, std::vector<std::string>& bsd,
+                           std::vector<std::string>& mach, std::string& err) {
+    return DtraceCatch::listNames(filter, bsd, mach, err);
+  }
 
   // ---- syscall 停止キャッチポイント（Phase 2。libdtrace の stop() アクション） ----
   // filter は観測版と同じ書式（""/"all"/"<名前>"/"mach"/"mach:<名前>"）。マッチした

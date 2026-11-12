@@ -13,6 +13,7 @@
 #include <string>
 #include <sys/types.h>
 #include <thread>
+#include <vector>
 
 namespace ta2 {
 
@@ -62,6 +63,18 @@ public:
 
   // filter を provider と名前に分解（start/startTrace で共用）。
   static void parseFilter(const std::string& filter, std::string& provider, std::string& name);
+
+  // 監視に使える syscall / Mach トラップ名を列挙する（別ドキュメントを見ずに有効名を確認するため）。
+  // カーネルの probe 表を引くだけなので対象 attach は不要・監視中でも可（独立した一時ハンドルを開く）。
+  // filter の書式:
+  //   ""/"all"       → 両プロバイダ全件
+  //   "<語>"          → BSD syscall と Mach トラップの名前に <語> を含むもの（大小無視の部分一致）
+  //   "mach"/"mach:"  → Mach トラップ全件
+  //   "mach:<語>"     → Mach トラップで <語> を含むもの
+  // 未実装スロット（dtrace が "#<番号>" と名付ける欠番）は除外する。見つかった名前を
+  // bsd / mach（いずれも名前昇順・重複なし）に返す。成否は戻り値、失敗理由は err。
+  static bool listNames(const std::string& filter, std::vector<std::string>& bsd,
+                        std::vector<std::string>& mach, std::string& err);
 
 private:
   void loop();
