@@ -106,6 +106,13 @@ bool DtraceCatch::start(pid_t pid, const std::string& filter, Handler handler, s
     dtrace_close(h);
     return false;
   }
+  // 1 つも probe にマッチしないなら名前の誤りと見なして弾く（ZDEFS で許容すると黙って発火
+  // しない監視が張られてしまうため）。syscall/mach_trap の probe は固定なので 0 件＝名前違い。
+  if (info.dpi_matches == 0) {
+    err = "該当する probe がありません（syscall/トラップ名を確認。例: write / mach:mach_msg_trap）";
+    dtrace_close(h);
+    return false;
+  }
   if (dtrace_go(h) == -1) {
     err = std::string("dtrace_go 失敗: ") + dtrace_errmsg(h, dtrace_errno(h));
     dtrace_close(h);
@@ -161,6 +168,13 @@ bool DtraceCatch::startTrace(pid_t pid, const std::string& filter, LineHandler o
   dtrace_proginfo_t info;
   if (dtrace_program_exec(h, p, &info) == -1) {
     err = std::string("program_exec 失敗: ") + dtrace_errmsg(h, dtrace_errno(h));
+    dtrace_close(h);
+    return false;
+  }
+  // 1 つも probe にマッチしないなら名前の誤りと見なして弾く（ZDEFS で許容すると黙って発火
+  // しない監視が張られてしまうため）。syscall/mach_trap の probe は固定なので 0 件＝名前違い。
+  if (info.dpi_matches == 0) {
+    err = "該当する probe がありません（syscall/トラップ名を確認。例: write / mach:mach_msg_trap）";
     dtrace_close(h);
     return false;
   }
