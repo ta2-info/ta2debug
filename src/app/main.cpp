@@ -601,7 +601,18 @@ void drawPicker(int rows, int cols) {
 void render() {
   g_term.querySize();
   int rows = g_term.rows(), cols = g_term.cols();
-  g_term.clear();
+  // 画面の「かたち」が前回と同じなら全消去（\x1b[2J）せず原点復帰だけにして上書き描画する。
+  // 各ペインは矩形の全行を全幅で埋める作りなので残渣は出ず、全消去の一瞬のブランク（＝チラつき）
+  // を避けられる。かたちが変わる時（状態/レイアウト/オーバレイ/サイズ切替）だけ一度だけ全消去する。
+  {
+    static std::string prevShape;
+    char sh[128];
+    snprintf(sh, sizeof(sh), "%d/%d/%d/%d/%d%d%d/%dx%d",
+             (int)g_state, g_layout, g_pickerMode ? 1 : 0, g_output.empty() ? 0 : 1,
+             g_showReg, g_showBt, g_showTh, cols, rows);
+    if (prevShape != sh) { g_term.clear(); prevShape = sh; }
+    else g_term.home();
+  }
 
   if (g_pickerMode) {
     drawPicker(rows, cols);
@@ -646,7 +657,7 @@ void render() {
     hline += w;
   }
   hline += " \x1b[0m";
-  g_term.putAt(0, 0, hline);
+  g_term.putAt(0, 0, hline + "\x1b[K"); // 全幅ではないので行末まで消す（上書き時の残渣防止）
 
   // 参照コマンドの出力オーバレイ（ページャ: ↑↓/Space/b でスクロール、ESC・q で閉じる）
   if (!g_output.empty()) {
@@ -657,7 +668,7 @@ void render() {
     if (g_outputTop < 0) g_outputTop = 0;
     std::string hint = g_xActive ? "Enter 続き / " : "";
     hint += "↑↓ Space/b ページ  g/G 先頭/末尾  ESC・q 閉じる";
-    g_term.putAt(0, 1, "\x1b[33m" + g_outputTitle + "\x1b[0m \x1b[2m（" + hint + "）\x1b[0m");
+    g_term.putAt(0, 1, "\x1b[33m" + g_outputTitle + "\x1b[0m \x1b[2m（" + hint + "）\x1b[0m\x1b[K");
     for (int y = 0; y < avail; y++) {
       int idx = g_outputTop + y;
       std::string t = (idx < total) ? g_output[idx] : "";
@@ -679,9 +690,9 @@ void render() {
     drawBacktrace(L.backtrace);
     drawThreads(L.threads);
   } else if (g_state == UiState::Running) {
-    g_term.putAt(0, 2, "(実行中。ブレイクに当たると停止します。Ctrl+C で割り込み停止)");
+    g_term.putAt(0, 2, "(実行中。ブレイクに当たると停止します。Ctrl+C で割り込み停止)\x1b[K");
   } else {
-    g_term.putAt(0, 2, ":attach <pid> / :run <パス> で開始    :help でコマンド一覧    :q で終了");
+    g_term.putAt(0, 2, ":attach <pid> / :run <パス> で開始    :help でコマンド一覧    :q で終了\x1b[K");
   }
 
   // 最下行: コマンド入力 or メッセージ
@@ -692,6 +703,20 @@ void render() {
     g_term.putAt(0, rows - 1, line);
   }
   else if (!g_message.empty()) g_term.putAt(0, rows - 1, g_message);
+  g_term.flush();
+}
+
+// 最下行（コマンド入力行）だけを再描画する軽量版。コマンド入力中の打鍵・BS・補完では
+// 画面全体の render() を呼ばず、これで最下行のみ更新する（無関係なペインを触らずチラつきを無くす）。
+void renderCmdline() {
+  g_term.querySize();
+  int rows = g_term.rows();
+  g_term.clearLine(rows - 1);
+  if (g_cmdMode) {
+    std::string line = ":" + g_cmdline;
+    if (!g_message.empty()) line += "    \x1b[2m" + g_message + "\x1b[0m"; // 補完候補など
+    g_term.putAt(0, rows - 1, line);
+  } else if (!g_message.empty()) g_term.putAt(0, rows - 1, g_message);
   g_term.flush();
 }
 
@@ -1639,12 +1664,14 @@ void onKey(int c) {
     return;                                                                            // その他は無視（閉じない）
   }
   if (g_cmdMode) {
-    if (c == '\r' || c == '\n') { g_cmdMode = false; runCommand(g_cmdline); g_cmdline.clear(); }
-    else if (c == 27) { g_cmdMode = false; g_cmdline.clear(); g_message.clear(); } // ESC
-    else if (c == '\t') { completeCommand(); }                         // TAB 補完
-    else if (c == 127 || c == 8) { if (!g_cmdline.empty()) g_cmdline.pop_back(); g_message.clear(); } // BS
-    else if (c >= 0x20 && c < 0x7f) { g_cmdline.push_back((char)c); g_message.clear(); }
-    render();
+    // Enter/ESC はモードを抜けて状態が変わり得るので全描画。打鍵・BS・補完は最下行だけ更新して
+    // 無関係なペインを触らない（＝入力中のチラつきを無くす）。
+    if (c == '\r' || c == '\n') { g_cmdMode = false; runCommand(g_cmdline); g_cmdline.clear(); render(); return; }
+    if (c == 27) { g_cmdMode = false; g_cmdline.clear(); g_message.clear(); render(); return; } // ESC
+    if (c == '\t') { completeCommand(); renderCmdline(); return; }                         // TAB 補完
+    if (c == 127 || c == 8) { if (!g_cmdline.empty()) g_cmdline.pop_back(); g_message.clear(); renderCmdline(); return; } // BS
+    if (c >= 0x20 && c < 0x7f) { g_cmdline.push_back((char)c); g_message.clear(); renderCmdline(); return; }
+    renderCmdline();
     return;
   }
 

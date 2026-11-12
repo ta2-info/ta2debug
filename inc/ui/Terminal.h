@@ -20,7 +20,8 @@ public:
   int cols() const { return cols_; }
   void querySize();
 
-  void clear();
+  void clear();         // 画面全消去＋原点（\x1b[2J\x1b[H）。残渣は消えるが一瞬ブランクになる
+  void home();          // 原点復帰のみ（\x1b[H）。消さずに上書き描画してチラつきを避ける
   void clearLine(int row);
   void moveTo(int col, int row);        // 0 始まり
   void put(const std::string& s);

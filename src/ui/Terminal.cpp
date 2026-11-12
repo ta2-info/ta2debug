@@ -61,6 +61,7 @@ void Terminal::leave() {
 }
 
 void Terminal::clear() { put("\x1b[2J\x1b[H"); }
+void Terminal::home() { put("\x1b[H"); }
 
 void Terminal::clearLine(int row) {
   moveTo(0, row);
