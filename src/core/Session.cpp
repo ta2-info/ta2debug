@@ -979,6 +979,11 @@ kern_return_t Session::onException(thread_act_t thread, exception_type_t exc,
   bool wasStepping = singleStepping_;
   lastWatchId_ = -1; // 既定。ウォッチ命中時のみ下で設定
 
+  // SS/TF は HW ブレイクの書き戻しより先に落とす。arm64 では SS が立ったままの debug state を
+  // writeHwToThreads で書き戻すと、カーネルが次の 1 命令ぶんのステップを再予約し、
+  // cont でまたいだ直後に余計なステップ例外で止まる（HW 実行ブレイクの c で +4 停止）。
+  if (wasStepping) { singleStepping_ = false; setStep(thread, false); }
+
   // 直前に外したソフトブレイクを張り直す（1 命令進んだ後）
   if (rearmValid_) { bps_.addSoft(rearmAddr_); rearmValid_ = false; }
   // またぎステップ中だけ外していた HW ブレイク/ウォッチを戻す（タスクは suspend 済み）
@@ -989,8 +994,6 @@ kern_return_t Session::onException(thread_act_t thread, exception_type_t exc,
   }
 
   if (wasStepping) {
-    singleStepping_ = false;
-    setStep(thread, false); // TF/SS を落とす
     if (!stopAfterStep_) {
       // cont で bp をまたいだだけ → ユーザ停止せず走行継続
       target_.resume();
@@ -1115,6 +1118,7 @@ void Session::applyResume(Resume d, thread_act_t thread) {
       uint8_t code[16] = {};
       size_t got = 0;
       target_.readMemory(stopPc_, code, sizeof(code), &got);
+      bps_.maskInto(stopPc_, code, got); // bp 上の call は BRK/INT3 に化けているので元命令で判定
       Disassembler dis(a);
       auto insns = dis.disasm(code, got, stopPc_, 1);
       if (!insns.empty() && insns[0].kind == InsnKind::Call) {
