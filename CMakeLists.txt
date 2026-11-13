@@ -151,3 +151,14 @@ add_custom_command(
   VERBATIM
 )
 add_custom_target(arch_arm64_check ALL DEPENDS ${CMAKE_BINARY_DIR}/ArchArm64.arm64.o)
+
+# arm64 実機（ネイティブ、またはクロスで arm64 を狙うビルド）では、アーキ依存コードが
+# x86_64 で未実行なことを忘れないよう、実機テスト手順への案内を出す。手順は ARM64_TESTING.md。
+# configure 時（STATUS）とビルド時（echo）の両方で見えるようにする（build dir 再利用でも気づける）。
+if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64" OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+  message(STATUS "arm64 ビルド: アーキ依存は実機確認を。手順 → ARM64_TESTING.md")
+  add_custom_target(arm64_test_reminder ALL
+    COMMAND ${CMAKE_COMMAND} -E echo
+      "== arm64 ビルド完了。アーキ依存は実機テストを（手順: ${CMAKE_SOURCE_DIR}/ARM64_TESTING.md）=="
+    VERBATIM)
+endif()
