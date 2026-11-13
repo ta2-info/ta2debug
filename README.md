@@ -11,11 +11,14 @@ Mach 例外ポートを差し替えて例外を受け取る。**対象プロセ�
 
 ## 大前提（他のすべてに優先する 2 点）
 
-- **A. アーキテクチャ移植性**: 現在 x86_64 のみだが、いずれ Apple シリコン（arm64）に対応する。
+- **A. アーキテクチャ移植性**: x86_64 と Apple シリコン（arm64）の両方に対応する。
   アーキ依存はすべて `Arch` 抽象の裏に隔離してある（レジスタ名・命令バイト・ステップ方式など）。
-  arm64 実装はコンパイル・構文確認済みだが、**実機検証は未**（HW ブレイク本数・arm64e の PAC strip 等は実機要確認）。
-- **B. 依存最小**: 外部ライブラリは **capstone 1 つだけ**（x86_64/arm64 両対応なので arm64 化でも増えない）。
-  md5/sha1 はシステムの CommonCrypto、JSON は同梱の picojson（ヘッダ 1 つ）。それ以外はシステムフレームワーク / libSystem のみ。
+  arm64 実装は Apple シリコン実機で全機能を検証済み（[`ARM64_TESTING.md`](ARM64_TESTING.md) の全項目）。
+- **B. 依存最小**: 別途インストールが要る**外部ライブラリは capstone 1 つだけ**（x86_64/arm64 両対応なので arm64 化でも増えない）。
+  md5/sha1 はシステムの CommonCrypto、JSON は同梱の picojson（ヘッダ 1 つ）。
+  残りは macOS に最初から入っているシステムライブラリのみ: **libdtrace**（`/usr/lib`、`:scwatch`/`:scstop` の syscall 監視に使用。
+  SDK の `.tbd` でリンクし追加インストール不要。もともと SIP 無効＋root 前提なので新たな要件も増えない）と **Carbon**（起動時の IME 半角切替）、
+  それ以外は libSystem / 標準フレームワークのみ。
 
 ## セキュリティ上の制約（重要）
 
@@ -71,7 +74,7 @@ printf 'b add\nc\nwhere\nq\n' | sudo ./build/ta2debug -b <対象>       # 標準
 - `-o` か `-s` があれば `-b` は省略可。コマンドは TUI と同じ綴り（先頭 `:` は付けても付けなくても可）。`#` 始まりはコメント。
 - **実行制御コマンド**（TUI ではキー操作だったもの）:
   `c`/`continue`・`s`/`step`/`si`・`n`/`next`・`where`/`backtrace`（バックトレース表示）・`wait`（次の停止まで待つ）。
-- 停止すると **位置・ブレイク命中・クラッシュ理由・syscall 注記・バックトレース**を自動で出力する。
+- 停止すると **位置・ブレイク命中・ウォッチ命中・クラッシュ理由・syscall 注記・バックトレース**を自動で出力する。
 - `run` はエントリ停止まで、`c`/`s`/`n`/`auto` は次の停止まで自動で待つ。
   `attach` は対象を走らせたままなので、ブレイク設定後に `wait` で停止を待つ。
 - レジスタは式中で `$`（または `%`）を付けて参照。**アーキ非依存の別名 `$pc` / `$sp` / `$fp`**（+ arm64 は `$lr`）が
@@ -202,6 +205,7 @@ dSYM に **DWARF 行情報（`.debug_line`）があれば、ソース行を表�
 | `:scwatch <名前>` | その **BSD syscall** を**引数・戻り値つきでトレース**（例 `:scwatch write`）。直近の呼び出しを保持 |
 | `:scwatch all` | **全 BSD syscall** を名前別の**回数で集計**（引数は付けない。全件だと洪水になるため） |
 | `:scwatch mach[:<名前>]` | **Mach トラップ**を監視。`mach:<名前>` は引数つきトレース、`mach`（全件）は集計 |
+| `:scwatch list [語]` | 使える **BSD syscall / Mach トラップ名の一覧**（`語` で絞込・`mach` で Mach のみ。例 `:scwatch list port`）。監視の有無・attach 前後に関係なく使える |
 | `:scwatch` | 監視状況を表示（名指し＝トレース行を新しい順、全件＝名前別の回数） |
 | `:scwatch off` | 監視停止 |
 
@@ -235,6 +239,7 @@ BSD システムコール（`syscall` プロバイダ）と Mach トラップ（
 |----------|------|
 | `:scstop <名前\|all>` | その **BSD syscall** 発火で対象を停止（例 `:scstop write` / `:scstop all`） |
 | `:scstop mach[:<名前>]` | その **Mach トラップ**発火で停止（例 `:scstop mach` / `:scstop mach:mach_msg_trap`） |
+| `:scstop list [語]` | 使える名前の一覧（`:scwatch list` と同じ） |
 | `:scstop` | 停止キャッチポイントの状況（対象フィルタ・命中回数）を表示 |
 | `:scstop off` | 解除 |
 
@@ -354,10 +359,6 @@ dSYM が無い／strip 済みで関数名が出ない対象を、解析しなが
 
 ## 既知の制約
 
-- **arm64 は実機未検証**（構文・クロスコンパイルのみ）。LR アンワインド・arm64 Mach クラス判定・
-  HW ブレイク/ウォッチ本数・arm64e の PAC strip は実機で要確認。**arm64 でビルドすると CMake が実機
-  テスト手順（[`ARM64_TESTING.md`](ARM64_TESTING.md)）への案内を出す。** そこに何を確認すべきかの
-  チェックリストがある。
 - SIP 無効 + root 前提。
 - x86 では `$sp` を**完全な 64bit スタックポインタ**（=`$rsp`）として扱う（伝統の 16bit sp よりクロスアーキ一貫性を優先）。
   16/32bit が要るときは `spl`/`esp`/`rsp` を使う。
