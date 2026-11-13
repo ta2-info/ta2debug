@@ -10,9 +10,10 @@
 namespace ta2 {
 
 struct Event {
-  enum Kind { Key, Stopped, TargetExited, Progress, JobDone } kind;
+  enum Kind { Key, Stopped, TargetExited, Progress, JobDone, Resize } kind;
   // Progress: 進捗更新で再描画を促す（シンボル先読み・シンボル探索の進捗）
   // JobDone : 非同期ジョブ（シンボル式の評価）が完了。メインスレッドが結果を適用する。
+  // Resize  : 端末サイズ変更（SIGWINCH）。メインスレッドが render() で全画面を描き直す。
   int key = 0;          // Kind::Key のときのバイト
 };
 
