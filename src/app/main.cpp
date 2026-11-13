@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +16,8 @@
 #include <thread>
 #include <vector>
 
+#include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "app/EventQueue.h"
@@ -32,6 +36,14 @@ namespace {
 Terminal g_term;
 EventQueue g_queue;
 Session g_session(g_queue);
+
+// 端末リサイズ(SIGWINCH)通知用の self-pipe。シグナルハンドラからは async-signal-safe な
+// write() だけを行い、入力スレッドが poll() で拾って Event::Resize をキューへ積む
+// （キューは mutex なのでハンドラから直接 push できない）。
+int g_winchPipe[2] = {-1, -1};
+void onSigwinch(int) {
+  if (g_winchPipe[1] >= 0) { char b = 1; ssize_t r = write(g_winchPipe[1], &b, 1); (void)r; }
+}
 
 enum class UiState { Idle, Running, Stopped };
 UiState g_state = UiState::Idle;
@@ -2036,13 +2048,37 @@ int main(int argc, char** argv) {
   g_term.enter();
   render();
 
-  // 入力スレッド: 1 バイトずつ読んでキューへ
+  // 端末リサイズ(SIGWINCH)を self-pipe で受け、入力スレッドの poll で拾う。
+  if (pipe(g_winchPipe) == 0) {
+    fcntl(g_winchPipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(g_winchPipe[1], F_SETFL, O_NONBLOCK);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = onSigwinch;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART; // 他スレッドの read 等を EINTR で中断させない
+    sigaction(SIGWINCH, &sa, nullptr);
+  }
+
+  // 入力スレッド: stdin（キー）と winch パイプ（リサイズ）を poll で同時に待ち、キューへ流す。
   std::thread input([] {
+    struct pollfd fds[2];
+    fds[0].fd = STDIN_FILENO;  fds[0].events = POLLIN;
+    fds[1].fd = g_winchPipe[0]; fds[1].events = POLLIN;
+    int nfds = (g_winchPipe[0] >= 0) ? 2 : 1;
     for (;;) {
-      unsigned char ch;
-      ssize_t n = read(STDIN_FILENO, &ch, 1);
-      if (n <= 0) break;
-      g_queue.push({Event::Key, (int)ch});
+      int pr = poll(fds, nfds, -1);
+      if (pr < 0) { if (errno == EINTR) continue; break; }
+      if (nfds == 2 && (fds[1].revents & POLLIN)) {            // リサイズ通知
+        char buf[64]; while (read(g_winchPipe[0], buf, sizeof(buf)) > 0) {} // まとめて排出（coalesce）
+        g_queue.push({Event::Resize, 0});
+      }
+      if (fds[0].revents & (POLLIN | POLLHUP)) {               // キー入力（1 バイト）
+        unsigned char ch;
+        ssize_t n = read(STDIN_FILENO, &ch, 1);
+        if (n <= 0) break;
+        g_queue.push({Event::Key, (int)ch});
+      }
     }
   });
   input.detach();
@@ -2059,6 +2095,7 @@ int main(int argc, char** argv) {
   for (;;) {
     Event e = g_queue.pop();
     if (e.kind == Event::Key) onKey(e.key);
+    else if (e.kind == Event::Resize) { render(); } // 端末リサイズ → render が新サイズで全消去＋再描画
     else if (e.kind == Event::Progress) { render(); } // シンボル先読み・探索の進捗更新 → 再描画
     else if (e.kind == Event::JobDone) {              // 非同期シンボル探索の完了 → 結果を適用
       if (g_jobThread.joinable()) g_jobThread.join();
