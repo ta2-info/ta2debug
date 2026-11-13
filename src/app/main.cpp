@@ -346,7 +346,35 @@ std::vector<std::string> computeBacktrace(bool color, bool fast = false) {
     if (depth == 0) {
       uint32_t enc = 0; uint64_t fstart = 0;
       bool hasEnc = addrIsCode(regs.pc) && unw.encodingFor(regs.pc, enc, fstart);
-      bool certain = !addrIsCode(regs.pc) || (hasEnc && regs.pc == fstart); // (a)(b): [sp] は確実に戻り先
+      // 関数入口の判定。compact unwind は同じエンコーディングの隣接関数を 1 エントリに
+      // まとめる（例: -O2 で work と main が同一 FRAME エンコーディング）ため、fstart だけでは
+      // 後ろ側の関数の入口を見逃す。シンボル先頭とも照合する。
+      bool atEntry = hasEnc && regs.pc == fstart;
+      if (hasEnc && !atEntry) {
+        if (const Image* eim = g_session.images().byAddress(regs.pc))
+          if (const Symbol* s = g_session.symbols().byAddress(*eim, regs.pc))
+            atEntry = (s->addr == regs.pc);
+      }
+      // (b') arm64 のプロローグ途中（sub sp / stp x29,x30 は済んだが add x29,sp が未実行）。
+      //      x29 はまだ呼び出し元のものなので FRAME ルールだと 1 段飛ぶ。戻り先は LR に残っている。
+      if (hasEnc && !atEntry && !a.retAddrAtEntryOnStack()) {
+        uint64_t fn = fstart;
+        if (const Image* eim = g_session.images().byAddress(regs.pc))
+          if (const Symbol* s = g_session.symbols().byAddress(*eim, regs.pc)) fn = s->addr;
+        if (fn < regs.pc && regs.pc - fn <= 64) {
+          uint8_t buf[64] = {};
+          size_t len = sizeof(buf); // プロローグは先頭 16 命令以内に収まる前提で探す
+          if (g_session.target().readMemory(fn, buf, len)) {
+            g_session.breaks().maskInto(fn, buf, len); // bp の BRK を元命令に戻して判定
+            for (const Insn& in : dis.disasm(buf, len, fn, 16)) {
+              bool setsFp = (in.mnemonic == "add" || in.mnemonic == "mov") &&
+                            in.opStr.rfind("x29, sp", 0) == 0;
+              if (setsFp) { atEntry = (in.address >= regs.pc); break; } // pc 以降なら未確立
+            }
+          }
+        }
+      }
+      bool certain = !addrIsCode(regs.pc) || atEntry; // (a)(b): [sp] は確実に戻り先
       bool stub = addrIsCode(regs.pc) && !hasEnc;                           // (c): スタブ/サンク疑い
       if (certain || stub) {
         uint64_t ret = 0;
@@ -370,7 +398,11 @@ std::vector<std::string> computeBacktrace(bool color, bool fast = false) {
     // (2) 本命: CFI（compact unwind）で正確に 1 段。RBP フレームも frameless も正しく辿れる。
     if (!scanning && addrIsCode(regs.pc)) {
       UnwindRegs next;
-      if (unw.step(regs, next) && next.pc && addrIsCode(next.pc) && next.sp > regs.sp) {
+      // sp は通常単調増加。ただし arm64 の leaf frameless（stackSize=0）は最内フレームでのみ
+      // sp 不変のまま LR へ戻るのが正しい（next.lr=0 なので 2 段目以降で再発せずループしない）。
+      bool stepped = unw.step(regs, next);
+      bool spOk = next.sp > regs.sp || (depth == 0 && next.sp == regs.sp && next.pc != regs.pc);
+      if (stepped && next.pc && addrIsCode(next.pc) && spOk) {
         scanBase = regs.fp ? regs.fp + 16 : next.sp;
         regs = next;
         continue;
@@ -1828,6 +1860,12 @@ void batchStopReport() {
   else head = "stopped @ " + where;
   const Breakpoint* ub = g_session.breaks().userAt(pc);
   if (ub && ub->enabled) { char b[48]; snprintf(b, sizeof(b), "  [bp #%d, %lluhit]", ub->id, (unsigned long long)ub->hits); head += b; }
+  int wid = g_session.lastWatchHit(); // ウォッチ命中（TUI ヘッダと同じ情報をバッチにも出す）
+  if (wid >= 0)
+    if (const Breakpoint* wb = g_session.breaks().byId(wid)) {
+      char b[96]; snprintf(b, sizeof(b), "  [watch #%d, %lluhit @0x%llx]", wid, (unsigned long long)wb->hits, (unsigned long long)wb->addr);
+      head += b;
+    }
   batchPrint(head);
   SourceLoc loc;
   if (g_session.sourceLineFor(pc, loc)) { // dSYM の DWARF 行情報があれば
