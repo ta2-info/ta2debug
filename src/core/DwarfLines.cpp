@@ -27,9 +27,9 @@ struct Rd {
   void skip(size_t n) { if (p + n > end) { p = end; ok = false; } else p += n; }
 };
 
-// DWARF4 の __debug セクション群（必要なものだけ）。
+// __debug セクション群（必要なものだけ）。line_str は DWARF5 の行テーブル用。
 struct Sections {
-  std::vector<uint8_t> line, info, abbrev, str;
+  std::vector<uint8_t> line, info, abbrev, str, lineStr;
 };
 
 // Mach-O(64) スライスから __DWARF の各セクションを読む。uuid 一致・debug_line 必須。
@@ -55,7 +55,10 @@ bool readDwarfSlice(FILE* f, uint64_t off, const uint8_t wantUuid[16], Sections&
         auto* s = reinterpret_cast<const section_64*>(p + sizeof(segment_command_64));
         for (uint32_t j = 0; j < sg->nsects; j++, s++) {
           std::vector<uint8_t>* dst = nullptr;
-          if (!strncmp(s->sectname, "__debug_line", 16)) dst = &out.line;
+          // __debug_line_str（DWARF5 の行テーブル文字列）。ちょうど 16 文字で char[16] に終端なく
+          // 収まる。__debug_line より先に見る（strncmp は NUL 止まりなので誤判定はしないが明示）。
+          if (!strncmp(s->sectname, "__debug_line_str", 16)) dst = &out.lineStr;
+          else if (!strncmp(s->sectname, "__debug_line", 16)) dst = &out.line;
           else if (!strncmp(s->sectname, "__debug_info", 16)) dst = &out.info;
           else if (!strncmp(s->sectname, "__debug_abbrev", 16)) dst = &out.abbrev;
           else if (!strncmp(s->sectname, "__debug_str", 16)) dst = &out.str;
@@ -131,13 +134,13 @@ std::unordered_map<uint64_t, Abbrev> parseAbbrev(const std::vector<uint8_t>& ab,
 // form 値を読み飛ばしつつ、文字列系/sec_offset は値を取り出す。
 // kindOut: 1=文字列（sOut）, 2=数値（nOut）, 0=その他。addrSize はヘッダ由来。
 void readForm(Rd& r, uint64_t form, int addrSize, const std::vector<uint8_t>& str,
-              int& kindOut, std::string& sOut, uint64_t& nOut) {
+              const std::vector<uint8_t>& lineStr, int& kindOut, std::string& sOut, uint64_t& nOut) {
   kindOut = 0;
   switch (form) {
     case 0x01: r.skip(addrSize); break;                 // addr
     case 0x08: sOut = r.cstr(); kindOut = 1; break;     // string(inline)
     case 0x0e: { uint32_t o = r.u32(); if (o < str.size()) { sOut = (const char*)str.data() + o; kindOut = 1; } break; } // strp
-    case 0x1f: { r.u32(); break; }                      // line_strp（.debug_line_str 未保持→スキップ）
+    case 0x1f: { uint32_t o = r.u32(); if (o < lineStr.size()) { sOut = (const char*)lineStr.data() + o; kindOut = 1; } break; } // line_strp（DWARF5）
     case 0x0b: case 0x0c: r.skip(1); break;             // data1/flag
     case 0x05: r.skip(2); break;                        // data2
     case 0x06: nOut = r.u32(); kindOut = 2; break;      // data4
@@ -169,12 +172,33 @@ void readForm(Rd& r, uint64_t form, int addrSize, const std::vector<uint8_t>& st
   }
 }
 
+// DWARF5 の行テーブル（ディレクトリ/ファイル）1 エントリ内の 1 フォーム値を読む。
+// path は文字列（kind=1, sOut）、directory_index 等は数値（kind=2, nOut）で返す。
+// 数値系（data1/2/8, udata）は readForm では値を取り出さない（スキップ）ので、ここで明示的に拾う。
+// 文字列系（string/strp/line_strp）とその他は readForm に委譲する。
+void readLineForm(Rd& r, uint64_t form, int addrSize, const std::vector<uint8_t>& str,
+                  const std::vector<uint8_t>& lineStr, int& kind, std::string& sOut, uint64_t& nOut) {
+  kind = 0;
+  switch (form) {
+    case 0x0b: nOut = r.u8(); kind = 2; break;          // data1
+    case 0x05: nOut = r.u16(); kind = 2; break;         // data2
+    case 0x07: nOut = r.u64(); kind = 2; break;         // data8
+    case 0x0f: nOut = r.uleb(); kind = 2; break;        // udata
+    default: readForm(r, form, addrSize, str, lineStr, kind, sOut, nOut); break; // data4/16, strp, line_strp, string...
+  }
+}
+
 } // namespace
 
-// stmt_list(=.debug_line 内オフセット) → comp_dir を .debug_info から集める。
-static std::unordered_map<uint64_t, std::string>
-parseCompDirs(const Sections& s, std::string& defaultCompDir) {
-  std::unordered_map<uint64_t, std::string> out;
+// CU 単位の comp_dir と主ソース名（DW_AT_comp_dir / DW_AT_name）。
+struct CuInfo { std::string compDir, name; };
+
+// stmt_list(=.debug_line 内オフセット) → {comp_dir, name} を .debug_info から集める。
+// name/comp_dir は、Apple dsymutil が DWARF5 で __debug_line_str を落として行テーブルの
+// ファイル名が引けないとき（line_strp 参照が宙に浮く）の表示フォールバックに使う。
+static std::unordered_map<uint64_t, CuInfo>
+parseCompDirs(const Sections& s, CuInfo& defaultCu) {
+  std::unordered_map<uint64_t, CuInfo> out;
   if (s.info.empty() || s.abbrev.empty()) return out;
   Rd r{s.info.data(), s.info.data() + s.info.size()};
   while (r.ok && r.p < r.end) {
@@ -193,15 +217,16 @@ parseCompDirs(const Sections& s, std::string& defaultCompDir) {
     if (it != ab.end()) {
       for (auto& a : it->second.attrs) {
         int kind; std::string sv; uint64_t nv = 0;
-        readForm(r, a.form, addrSize, s.str, kind, sv, nv);
+        readForm(r, a.form, addrSize, s.str, s.lineStr, kind, sv, nv);
         if (a.attr == 0x1b && kind == 1) compDir = sv;        // DW_AT_comp_dir
         else if (a.attr == 0x03 && kind == 1) name = sv;      // DW_AT_name
         else if (a.attr == 0x10 && kind == 2) { stmt = nv; haveStmt = true; } // DW_AT_stmt_list
         if (!r.ok) break;
       }
     }
-    if (haveStmt) out[stmt] = compDir;
-    if (defaultCompDir.empty()) defaultCompDir = compDir;
+    if (haveStmt) out[stmt] = CuInfo{compDir, name};
+    if (defaultCu.compDir.empty()) defaultCu.compDir = compDir;
+    if (defaultCu.name.empty()) defaultCu.name = name;
     r.p = cuEnd; // 次の CU へ（最初の DIE だけ見れば十分）
   }
   return out;
@@ -216,8 +241,8 @@ bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[1
   if (!loadDwarfSections(dsym, uuid, s)) return false;
   slide_ = slide;
 
-  std::string defCompDir;
-  auto compDirs = parseCompDirs(s, defCompDir);
+  CuInfo defCu;
+  auto compDirs = parseCompDirs(s, defCu);
 
   // 表示名+絶対パスを intern する
   std::unordered_map<std::string, int> intern;
@@ -241,9 +266,14 @@ bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[1
     const uint8_t* progEnd = r.p + unitLen;
     if (progEnd > r.end) break;
     uint16_t ver = r.u16();
-    if (ver < 2 || ver > 4) { r.p = progEnd; continue; } // v5 等は今回は飛ばす（行表示なしに劣化）
+    if (ver < 2 || ver > 5) { r.p = progEnd; continue; } // v2〜v5 に対応（それ以外は行表示なしに劣化）
+    int addrSize = 8;
+    if (ver >= 5) {                              // DWARF5 は header_length の前に 2 バイト増える
+      addrSize = r.u8();                         // address_size
+      r.u8();                                    // segment_selector_size
+    }
     uint32_t headerLen = r.u32();
-    const uint8_t* progStart = r.p + headerLen; // オペコード開始
+    const uint8_t* progStart = r.p + headerLen; // オペコード開始（header_length の直後起点）
     uint8_t minInst = r.u8();
     if (ver >= 4) r.u8();                        // max_ops_per_inst（=1 前提）
     uint8_t defaultIsStmt = r.u8(); (void)defaultIsStmt;
@@ -253,33 +283,88 @@ bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[1
     std::vector<uint8_t> stdLens(opcodeBase > 0 ? opcodeBase - 1 : 0);
     for (size_t i = 0; i < stdLens.size(); i++) stdLens[i] = r.u8();
 
-    std::string compDir = defCompDir;
-    { auto it = compDirs.find(progOff); if (it != compDirs.end() && !it->second.empty()) compDir = it->second; }
+    std::string compDir = defCu.compDir, cuName = defCu.name;
+    { auto it = compDirs.find(progOff);
+      if (it != compDirs.end()) {
+        if (!it->second.compDir.empty()) compDir = it->second.compDir;
+        if (!it->second.name.empty()) cuName = it->second.name;
+      } }
 
-    std::vector<std::string> dirs;         // 1 始まり参照、0=comp_dir
-    for (;;) { std::string d = r.cstr(); if (d.empty() || !r.ok) break; dirs.push_back(d); }
-    // file_names（1 始まり）
-    std::vector<int> fileGlobal; fileGlobal.push_back(-1); // index 0 は未使用
-    for (;;) {
-      std::string fn = r.cstr();
-      if (fn.empty() || !r.ok) break;
-      uint64_t di = r.uleb(); r.uleb(); r.uleb(); // dir_index, mtime, size
-      std::string label = fn, path;
-      auto joinDir = [&](const std::string& base) { if (fn[0] == '/') path = fn; else if (!base.empty()) path = base + "/" + fn; };
-      if (fn[0] == '/') path = fn;
-      else {
+    // ディレクトリ名からファイルの絶対パスを組む（絶対はそのまま、相対は comp_dir 前置）。
+    auto joinPath = [&](const std::string& fn, std::string dir) -> std::string {
+      if (!fn.empty() && fn[0] == '/') return fn;
+      if (!dir.empty() && dir[0] != '/' && !compDir.empty()) dir = compDir + "/" + dir;
+      if (dir.empty()) dir = compDir;
+      return dir.empty() ? fn : dir + "/" + fn;
+    };
+    // 表示用ラベルは basename（src: <file>:<line> 表示を v2〜v5 で揃える）。
+    auto baseName = [](const std::string& p) -> std::string {
+      size_t sl = p.find_last_of('/'); return sl == std::string::npos ? p : p.substr(sl + 1);
+    };
+
+    std::vector<int> fileGlobal;
+    if (ver <= 4) {
+      // --- v2〜v4: NUL 終端のディレクトリ列（1 始まり）→ ファイル列（1 始まり）---
+      std::vector<std::string> dirs;         // 1 始まり参照、0=comp_dir
+      for (;;) { std::string d = r.cstr(); if (d.empty() || !r.ok) break; dirs.push_back(d); }
+      fileGlobal.push_back(-1);              // index 0 は未使用（ファイルは 1 始まり）
+      for (;;) {
+        std::string fn = r.cstr();
+        if (fn.empty() || !r.ok) break;
+        uint64_t di = r.uleb(); r.uleb(); r.uleb(); // dir_index, mtime, size
         std::string dir = (di == 0) ? compDir : (di <= dirs.size() ? dirs[di - 1] : std::string());
-        if (!dir.empty() && dir[0] != '/' && !compDir.empty()) dir = compDir + "/" + dir;
-        joinDir(dir.empty() ? compDir : dir);
+        fileGlobal.push_back(internFile(baseName(fn), joinPath(fn, dir)));
       }
-      fileGlobal.push_back(internFile(label, path));
+    } else {
+      // --- v5: フォーマット記述子つきテーブル（ディレクトリ/ファイルとも 0 始まり）---
+      // ディレクトリ[0] は comp_dir、ファイル[0] は主ソース。パスは通常 line_strp。
+      auto readTable = [&](std::vector<std::pair<uint64_t, uint64_t>>& fmt, uint64_t& count) {
+        uint8_t fc = r.u8();
+        fmt.resize(fc);
+        for (uint8_t i = 0; i < fc; i++) { fmt[i].first = r.uleb(); fmt[i].second = r.uleb(); } // (content_type, form)
+        count = r.uleb();
+      };
+      std::vector<std::string> dirs;         // 0 始まり
+      {
+        std::vector<std::pair<uint64_t, uint64_t>> fmt; uint64_t count = 0;
+        readTable(fmt, count);
+        for (uint64_t i = 0; i < count && r.ok; i++) {
+          std::string pathv;
+          for (auto& pf : fmt) {
+            int kind; std::string sv; uint64_t nv = 0;
+            readLineForm(r, pf.second, addrSize, s.str, s.lineStr, kind, sv, nv);
+            if (pf.first == 0x1 /*DW_LNCT_path*/ && kind == 1) pathv = sv;
+          }
+          dirs.push_back(pathv);
+        }
+      }
+      {
+        std::vector<std::pair<uint64_t, uint64_t>> fmt; uint64_t count = 0;
+        readTable(fmt, count);
+        for (uint64_t i = 0; i < count && r.ok; i++) {
+          std::string fn; uint64_t di = 0;
+          for (auto& pf : fmt) {
+            int kind; std::string sv; uint64_t nv = 0;
+            readLineForm(r, pf.second, addrSize, s.str, s.lineStr, kind, sv, nv);
+            if (pf.first == 0x1 && kind == 1) fn = sv;                 // DW_LNCT_path
+            else if (pf.first == 0x2 && kind == 2) di = nv;           // DW_LNCT_directory_index
+          }
+          // Apple dsymutil は DWARF5 で __debug_line_str を dSYM に残さないことがあり、その場合
+          // line_strp 参照（path/dir）が空になる。CU の DW_AT_name / DW_AT_comp_dir で補う。
+          if (fn.empty()) fn = cuName;
+          std::string dir = (di < dirs.size()) ? dirs[di] : std::string();
+          fileGlobal.push_back(internFile(baseName(fn), joinPath(fn, dir)));
+        }
+      }
     }
 
     // ---- 行番号プログラム実行 ----
+    // file レジスタの初期値は全バージョン 1（DWARF5 でも規格上 1）。v5 は fileGlobal が 0 始まり、
+    // v2〜v4 は index 0 が番兵 -1 なので、下限を 0 にしても両対応できる。
     Rd pr{progStart, progEnd};
     uint64_t addr = 0; int file = 1, line = 1; bool endSeq = false;
     auto emit = [&]() {
-      int gidx = (file >= 1 && file < (int)fileGlobal.size()) ? fileGlobal[file] : -1;
+      int gidx = (file >= 0 && file < (int)fileGlobal.size()) ? fileGlobal[file] : -1;
       rows_.push_back({addr, gidx, line, endSeq});
     };
     while (pr.ok && pr.p < pr.end) {

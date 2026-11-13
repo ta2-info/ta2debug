@@ -129,11 +129,12 @@ backtrace:
 バイナリの隣に **dSYM（`<バイナリ>.dSYM/…`）があり UUID が一致すれば、その symtab も読み込む**ので、
 **strip 済みバイナリでも関数名が出る**（thin / fat 両対応）。
 
-dSYM に **DWARF 行情報（`.debug_line`）があれば、ソース行を表示**する（自前パーサ、DWARF v2–4 対応）：
+dSYM に **DWARF 行情報（`.debug_line`）があれば、ソース行を表示**する（自前パーサ、DWARF **v2–v5** 対応）：
 - 逆アセンブル画面に、該当する **`ファイル:行  ソーステキスト`** を淡色で挿入（lldb 風）。
 - バッチの停止レポートに `src: <ファイル>:<行>  <ソース>` を出力。
 - `comp_dir` を `.debug_info` から取り、ソースファイルを読んで実際の行テキストも表示（見つかる場合）。
-- dSYM 生成は `clang -g -c` で `.o` を残してから `dsymutil`（単一ステップの `clang -g` は `.o` が消え行情報が入らないことがある）。DWARF v5 は未対応（行表示なしに劣化）。
+- DWARF v5 の新形式（ヘッダの `address_size`/`segment_selector_size`、書式記述子つきで 0 始まりのディレクトリ/ファイルテーブル、`line_strp`）に対応。Apple の `dsymutil` が v5 で `__debug_line_str` を dSYM に残さず行テーブルのファイル名が引けない場合は、CU の `DW_AT_name`/`DW_AT_comp_dir` で補完する（行番号は常に正しく出る）。
+- dSYM 生成は `clang -g -c` で `.o` を残してから `dsymutil`（単一ステップの `clang -g` は `.o` が消え行情報が入らないことがある）。`-gdwarf-5` も可。
 
 アタッチ／起動時に**全ライブラリのシンボル一覧をバックグラウンドで先読みし、`~/Library/Caches/ta2debug/syms/` に UUID 別名で保存**する。
 ライブラリが更新されると UUID が変わるので自動的に新しいキャッシュを作る（古いものは参照されない）。2 回目以降の起動は読み込みが速い。
