@@ -6,10 +6,21 @@
 #include <fstream>
 #include <sstream>
 
+#include <sys/stat.h>
+
 #include <mach-o/fat.h>
 #include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach-o/stab.h>
 
 namespace ta2 {
+
+// __debug セクション群（必要なものだけ）。line_str は DWARF5 の行テーブル用。
+// dSYM（__DWARF セグメント）と .o（無名セグメント内の __DWARF セクション）の両方から読む。
+struct DwarfSections {
+  std::vector<uint8_t> line, info, abbrev, str, lineStr;
+};
+
 namespace {
 
 // ---- バイト列リーダ（境界チェック付き）----
@@ -27,20 +38,19 @@ struct Rd {
   void skip(size_t n) { if (p + n > end) { p = end; ok = false; } else p += n; }
 };
 
-// __debug セクション群（必要なものだけ）。line_str は DWARF5 の行テーブル用。
-struct Sections {
-  std::vector<uint8_t> line, info, abbrev, str, lineStr;
-};
-
-// Mach-O(64) スライスから __DWARF の各セクションを読む。uuid 一致・debug_line 必須。
-bool readDwarfSlice(FILE* f, uint64_t off, const uint8_t wantUuid[16], Sections& out) {
+// Mach-O(64) スライスから __DWARF の各セクションを読む。
+// wantUuid!=nullptr のときは LC_UUID 一致を要求する（dSYM 用）。nullptr なら要求しない（.o 用）。
+// __DWARF の判定は「セクション側の segname」で行う: dSYM はセクションが __DWARF セグメントに
+// 属するが、.o（MH_OBJECT）は全セクションが無名セグメントに入り、各セクションの segname が
+// __DWARF になっている。どちらもセクション単位で見れば拾える。
+bool readDwarfSlice(FILE* f, uint64_t off, const uint8_t* wantUuid, DwarfSections& out) {
   struct mach_header_64 mh;
   if (fseeko(f, (off_t)off, SEEK_SET) != 0 || fread(&mh, sizeof(mh), 1, f) != 1) return false;
   if (mh.magic != MH_MAGIC_64) return false;
   std::vector<uint8_t> lc(mh.sizeofcmds);
   if (fread(lc.data(), 1, mh.sizeofcmds, f) != mh.sizeofcmds) return false;
 
-  bool uuidOk = false;
+  bool uuidOk = (wantUuid == nullptr);
   struct Sec { uint64_t fileoff; uint64_t size; std::vector<uint8_t>* dst; };
   std::vector<Sec> want;
   const uint8_t* p = lc.data(); const uint8_t* end = p + mh.sizeofcmds;
@@ -48,22 +58,21 @@ bool readDwarfSlice(FILE* f, uint64_t off, const uint8_t wantUuid[16], Sections&
     auto* c = reinterpret_cast<const load_command*>(p);
     if (c->cmdsize < sizeof(load_command) || p + c->cmdsize > end) break;
     if (c->cmd == LC_UUID) {
-      uuidOk = (memcmp(reinterpret_cast<const uuid_command*>(p)->uuid, wantUuid, 16) == 0);
+      if (wantUuid) uuidOk = (memcmp(reinterpret_cast<const uuid_command*>(p)->uuid, wantUuid, 16) == 0);
     } else if (c->cmd == LC_SEGMENT_64) {
       auto* sg = reinterpret_cast<const segment_command_64*>(p);
-      if (strncmp(sg->segname, "__DWARF", 16) == 0) {
-        auto* s = reinterpret_cast<const section_64*>(p + sizeof(segment_command_64));
-        for (uint32_t j = 0; j < sg->nsects; j++, s++) {
-          std::vector<uint8_t>* dst = nullptr;
-          // __debug_line_str（DWARF5 の行テーブル文字列）。ちょうど 16 文字で char[16] に終端なく
-          // 収まる。__debug_line より先に見る（strncmp は NUL 止まりなので誤判定はしないが明示）。
-          if (!strncmp(s->sectname, "__debug_line_str", 16)) dst = &out.lineStr;
-          else if (!strncmp(s->sectname, "__debug_line", 16)) dst = &out.line;
-          else if (!strncmp(s->sectname, "__debug_info", 16)) dst = &out.info;
-          else if (!strncmp(s->sectname, "__debug_abbrev", 16)) dst = &out.abbrev;
-          else if (!strncmp(s->sectname, "__debug_str", 16)) dst = &out.str;
-          if (dst) want.push_back({s->offset, s->size, dst});
-        }
+      auto* s = reinterpret_cast<const section_64*>(p + sizeof(segment_command_64));
+      for (uint32_t j = 0; j < sg->nsects; j++, s++) {
+        if (strncmp(s->segname, "__DWARF", 16) != 0) continue; // __DWARF セクションだけ見る
+        std::vector<uint8_t>* dst = nullptr;
+        // __debug_line_str（DWARF5 の行テーブル文字列）はちょうど 16 文字で char[16] に終端なく
+        // 収まる。__debug_line より先に見る（strncmp は NUL 止まりなので誤判定はしないが明示）。
+        if (!strncmp(s->sectname, "__debug_line_str", 16)) dst = &out.lineStr;
+        else if (!strncmp(s->sectname, "__debug_line", 16)) dst = &out.line;
+        else if (!strncmp(s->sectname, "__debug_info", 16)) dst = &out.info;
+        else if (!strncmp(s->sectname, "__debug_abbrev", 16)) dst = &out.abbrev;
+        else if (!strncmp(s->sectname, "__debug_str", 16)) dst = &out.str;
+        if (dst) want.push_back({s->offset, s->size, dst});
       }
     }
     p += c->cmdsize;
@@ -76,8 +85,9 @@ bool readDwarfSlice(FILE* f, uint64_t off, const uint8_t wantUuid[16], Sections&
   return !out.line.empty();
 }
 
-bool loadDwarfSections(const std::string& dsymPath, const uint8_t uuid[16], Sections& out) {
-  FILE* f = fopen(dsymPath.c_str(), "rb");
+// path（dSYM または .o）から __DWARF セクションを読む。thin / fat 両対応。
+bool loadDwarfSections(const std::string& path, const uint8_t* uuid, DwarfSections& out) {
+  FILE* f = fopen(path.c_str(), "rb");
   if (!f) return false;
   bool ok = false;
   uint32_t magic = 0;
@@ -95,6 +105,78 @@ bool loadDwarfSections(const std::string& dsymPath, const uint8_t uuid[16], Sect
           uint64_t sliceOff = swap ? __builtin_bswap32(fa.offset) : fa.offset;
           long save = ftell(f);
           if (readDwarfSlice(f, sliceOff, uuid, out)) { ok = true; break; }
+          fseek(f, save, SEEK_SET);
+        }
+      }
+    }
+  }
+  fclose(f);
+  return ok;
+}
+
+// ---- LC_SYMTAB（nlist + 文字列表）の読み出し ----
+// 本体の debug map（STABS）と .o のシンボル（objAddr）をファイルから読むために使う。
+struct NList { uint8_t type; uint8_t sect; uint16_t desc; uint64_t value; std::string name; };
+
+bool readSymtabSlice(FILE* f, uint64_t off, const uint8_t* wantUuid, std::vector<NList>& out) {
+  struct mach_header_64 mh;
+  if (fseeko(f, (off_t)off, SEEK_SET) != 0 || fread(&mh, sizeof(mh), 1, f) != 1) return false;
+  if (mh.magic != MH_MAGIC_64) return false;
+  std::vector<uint8_t> lc(mh.sizeofcmds);
+  if (fread(lc.data(), 1, mh.sizeofcmds, f) != mh.sizeofcmds) return false;
+
+  bool uuidOk = (wantUuid == nullptr);
+  uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0; bool haveSym = false;
+  const uint8_t* p = lc.data(); const uint8_t* end = p + mh.sizeofcmds;
+  for (uint32_t i = 0; i < mh.ncmds && p + sizeof(load_command) <= end; i++) {
+    auto* c = reinterpret_cast<const load_command*>(p);
+    if (c->cmdsize < sizeof(load_command) || p + c->cmdsize > end) break;
+    if (c->cmd == LC_UUID) {
+      if (wantUuid) uuidOk = (memcmp(reinterpret_cast<const uuid_command*>(p)->uuid, wantUuid, 16) == 0);
+    } else if (c->cmd == LC_SYMTAB) {
+      auto* st = reinterpret_cast<const symtab_command*>(p);
+      symoff = st->symoff; nsyms = st->nsyms; stroff = st->stroff; strsize = st->strsize; haveSym = true;
+    }
+    p += c->cmdsize;
+  }
+  if (!uuidOk || !haveSym || nsyms == 0) return false;
+
+  std::vector<struct nlist_64> nl(nsyms);
+  std::vector<char> str(strsize ? strsize : 1, '\0');
+  if (fseeko(f, (off_t)(off + symoff), SEEK_SET) != 0 ||
+      fread(nl.data(), sizeof(struct nlist_64), nsyms, f) != nsyms) return false;
+  if (strsize && (fseeko(f, (off_t)(off + stroff), SEEK_SET) != 0 ||
+                  fread(str.data(), 1, strsize, f) != strsize)) return false;
+  out.reserve(nsyms);
+  for (auto& n : nl) {
+    const char* nm = "";
+    uint32_t sx = n.n_un.n_strx;
+    if (sx && sx < strsize) nm = &str[sx];
+    out.push_back({n.n_type, n.n_sect, n.n_desc, n.n_value, std::string(nm)});
+  }
+  return true;
+}
+
+// path から LC_SYMTAB を読む（thin / fat 両対応）。wantUuid 指定時はスライスを UUID で選ぶ。
+bool loadSymtab(const std::string& path, const uint8_t* uuid, std::vector<NList>& out) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+  bool ok = false;
+  uint32_t magic = 0;
+  if (fread(&magic, 4, 1, f) == 1) {
+    if (magic == MH_MAGIC_64) {
+      ok = readSymtabSlice(f, 0, uuid, out);
+    } else if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+      bool swap = (magic == FAT_CIGAM);
+      uint32_t nfat = 0;
+      if (fread(&nfat, 4, 1, f) == 1) {
+        if (swap) nfat = __builtin_bswap32(nfat);
+        for (uint32_t i = 0; i < nfat && i < 32; i++) {
+          struct fat_arch fa;
+          if (fread(&fa, sizeof(fa), 1, f) != 1) break;
+          uint64_t sliceOff = swap ? __builtin_bswap32(fa.offset) : fa.offset;
+          long save = ftell(f);
+          if (readSymtabSlice(f, sliceOff, uuid, out)) { ok = true; break; }
           fseek(f, save, SEEK_SET);
         }
       }
@@ -197,7 +279,7 @@ struct CuInfo { std::string compDir, name; };
 // name/comp_dir は、Apple dsymutil が DWARF5 で __debug_line_str を落として行テーブルの
 // ファイル名が引けないとき（line_strp 参照が宙に浮く）の表示フォールバックに使う。
 static std::unordered_map<uint64_t, CuInfo>
-parseCompDirs(const Sections& s, CuInfo& defaultCu) {
+parseCompDirs(const DwarfSections& s, CuInfo& defaultCu) {
   std::unordered_map<uint64_t, CuInfo> out;
   if (s.info.empty() || s.abbrev.empty()) return out;
   Rd r{s.info.data(), s.info.data() + s.info.size()};
@@ -232,28 +314,21 @@ parseCompDirs(const Sections& s, CuInfo& defaultCu) {
   return out;
 }
 
-bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[16], uint64_t slide) {
-  if (imagePath.empty()) return false;
-  size_t sl = imagePath.find_last_of('/');
-  std::string name = (sl == std::string::npos) ? imagePath : imagePath.substr(sl + 1);
-  std::string dsym = imagePath + ".dSYM/Contents/Resources/DWARF/" + name;
-  Sections s;
-  if (!loadDwarfSections(dsym, uuid, s)) return false;
-  slide_ = slide;
-
+// s の .debug_line を解釈し、xlate で変換したアドレスで rows_ へ追加する。
+void DwarfLines::parseLineSections(const DwarfSections& s,
+                                   const std::function<bool(uint64_t, bool, uint64_t&)>& xlate) {
   CuInfo defCu;
   auto compDirs = parseCompDirs(s, defCu);
 
-  // 表示名+絶対パスを intern する
-  std::unordered_map<std::string, int> intern;
-  auto internFile = [&](const std::string& label, const std::string& path) -> int {
+  // 表示名+絶対パスを intern する（複数 .o 間でも共有）。
+  auto internFile = [this](const std::string& label, const std::string& path) -> int {
     std::string key = label + "\x01" + path;
-    auto it = intern.find(key);
-    if (it != intern.end()) return it->second;
+    auto it = intern_.find(key);
+    if (it != intern_.end()) return it->second;
     int idx = (int)fileLabels_.size();
     fileLabels_.push_back(label);
     filePaths_.push_back(path);
-    intern[key] = idx;
+    intern_[key] = idx;
     return idx;
   };
 
@@ -365,7 +440,9 @@ bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[1
     uint64_t addr = 0; int file = 1, line = 1; bool endSeq = false;
     auto emit = [&]() {
       int gidx = (file >= 0 && file < (int)fileGlobal.size()) ? fileGlobal[file] : -1;
-      rows_.push_back({addr, gidx, line, endSeq});
+      uint64_t outAddr = addr;
+      if (!xlate(addr, endSeq, outAddr)) return; // 変換不可（マップ外の関数）→ 捨てる
+      rows_.push_back({outAddr, gidx, line, endSeq});
     };
     while (pr.ok && pr.p < pr.end) {
       uint8_t op = pr.u8();
@@ -399,6 +476,102 @@ bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[1
       }
     }
     r.p = progEnd;
+  }
+}
+
+// dSYM が無いとき、imagePath 本体の debug map（STABS）を辿って各 .o の DWARF を取り込む。
+bool DwarfLines::loadViaDebugMap(const std::string& imagePath, const uint8_t uuid[16]) {
+  std::vector<NList> syms;
+  if (!loadSymtab(imagePath, uuid, syms)) return false;
+
+  // STABS を走査して .o（N_OSO）ごとに関数（N_FUN）を集める。
+  //   N_OSO: .o パス（n_value=mtime）
+  //   N_FUN: 名前つき = 関数開始（n_value=リンク後アドレス）、名前なし = 直前関数のサイズ（n_value）
+  struct Func { std::string name; uint64_t bin; uint64_t size; };
+  struct Group { std::string oso; uint64_t mtime; std::vector<Func> funcs; };
+  std::vector<Group> groups;
+  Group* cur = nullptr;
+  Func pend; bool pendOpen = false;
+  for (auto& n : syms) {
+    if (!(n.type & N_STAB)) continue;
+    if (n.type == N_OSO) {
+      groups.push_back({n.name, n.value, {}});
+      cur = &groups.back();
+      pendOpen = false;
+    } else if (n.type == N_FUN) {
+      if (!n.name.empty()) { pend = {n.name, n.value, 0}; pendOpen = true; }
+      else if (pendOpen && cur) { pend.size = n.value; cur->funcs.push_back(pend); pendOpen = false; }
+    }
+  }
+  if (groups.empty()) return false; // debug map が無い（strip 済み/-g 無し）
+
+  bool any = false;
+  for (auto& g : groups) {
+    // .o の mtime が debug map と食い違う（作り直した）なら行情報がズレるので使わない。
+    struct stat stb;
+    if (stat(g.oso.c_str(), &stb) != 0) continue;             // .o が見つからない
+    if (g.mtime != 0 && (uint64_t)stb.st_mtime != g.mtime) continue; // 古い .o（stale）
+
+    DwarfSections s;
+    if (!loadDwarfSections(g.oso, nullptr, s)) continue;      // .o に DWARF が無い
+
+    // .o のシンボル（objAddr 空間）: 関数名 → .o 内アドレス。
+    std::vector<NList> osyms;
+    if (!loadSymtab(g.oso, nullptr, osyms)) continue;
+    std::unordered_map<std::string, uint64_t> objAddr;
+    for (auto& n : osyms) {
+      if (n.type & N_STAB) continue;
+      if ((n.type & N_TYPE) != N_SECT) continue;              // __text 等の実体を持つシンボルだけ
+      if (n.name.empty()) continue;
+      objAddr.emplace(n.name, n.value);                       // 先勝ち（重複は無視）
+    }
+
+    // 関数ごとの区間 [objBeg, objEnd) と差分 delta=bin-obj を作る。
+    struct Iv { uint64_t beg, end, delta; };
+    std::vector<Iv> ivs;
+    for (auto& fn : g.funcs) {
+      auto it = objAddr.find(fn.name);
+      if (it == objAddr.end()) continue;                      // .o 側に実体が無い（まれ）
+      uint64_t ob = it->second;
+      uint64_t sz = fn.size ? fn.size : 1;
+      ivs.push_back({ob, ob + sz, fn.bin - ob});
+    }
+    if (ivs.empty()) continue;
+    std::sort(ivs.begin(), ivs.end(), [](const Iv& a, const Iv& b) { return a.beg < b.beg; });
+
+    // objAddr 空間の行アドレスを、属する関数の区間 delta でリンク後(unslid)アドレスへ変換。
+    // end_sequence 行は関数末尾ちょうど（beg+size）に載るので、所属判定は raw-1 で行う
+    // （区間 [beg,end) に収め、変換自体は raw+delta でそのまま末尾を指す）。
+    auto xlate = [&ivs](uint64_t raw, bool isEnd, uint64_t& out) -> bool {
+      uint64_t probe = (isEnd && raw > 0) ? raw - 1 : raw;
+      auto it = std::upper_bound(ivs.begin(), ivs.end(), probe,
+                                 [](uint64_t v, const Iv& i) { return v < i.beg; });
+      if (it == ivs.begin()) return false;
+      --it;
+      if (probe >= it->end) return false;                     // 関数の外（パディング/除去済み）
+      out = raw + it->delta;
+      return true;
+    };
+    parseLineSections(s, xlate);
+    any = true;
+  }
+  return any;
+}
+
+bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[16], uint64_t slide) {
+  if (imagePath.empty()) return false;
+  slide_ = slide;
+  size_t sl = imagePath.find_last_of('/');
+  std::string name = (sl == std::string::npos) ? imagePath : imagePath.substr(sl + 1);
+  std::string dsym = imagePath + ".dSYM/Contents/Resources/DWARF/" + name;
+
+  DwarfSections s;
+  if (loadDwarfSections(dsym, uuid, s)) {
+    // dSYM: アドレスはリンク済み（unslid）なので恒等変換でそのまま取り込む。
+    parseLineSections(s, [](uint64_t a, bool, uint64_t& o) { o = a; return true; });
+  } else {
+    // dSYM 無し: -g ビルド本体の debug map から各 .o の DWARF を取り込む。
+    loadViaDebugMap(imagePath, uuid);
   }
 
   std::sort(rows_.begin(), rows_.end(), [](const Row& a, const Row& b) { return a.addr < b.addr; });
