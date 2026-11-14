@@ -47,29 +47,18 @@ std::vector<Insn> Disassembler::disasm(const uint8_t* code, size_t size, uint64_
     ins.kind = arch_.classify(insn->mnemonic, isCall, isRet);
     ins.isBranch = (isCall || isJump) && !isRet; // call / jmp（ret は除く）
 
-    // 直値 call/branch の飛び先（アーキ別に operand を見る）
-    if (ins.kind == InsnKind::Call && insn->detail) {
-      if (arch_.csArch() == CS_ARCH_X86) {
-        auto& x = insn->detail->x86;
-        if (x.op_count > 0 && x.operands[0].type == X86_OP_IMM) {
-          ins.hasCallTarget = true; ins.callTarget = (uint64_t)x.operands[0].imm;
-        }
-      } else if (arch_.csArch() == CS_ARCH_ARM64) {
-        auto& a = insn->detail->arm64;
-        if (a.op_count > 0 && a.operands[0].type == ARM64_OP_IMM) {
-          ins.hasCallTarget = true; ins.callTarget = (uint64_t)a.operands[0].imm;
-        }
-      }
-    }
-
-    // 間接 call/jmp のオペランド情報（レジスタ状況から飛び先を解くのは UI 側）。
-    // x86: *%reg / *disp(base,index,scale) / *disp(%rip)。arm64: blr/br Xn（レジスタのみ）。
+    // call/jmp（ret を除く分岐）の飛び先オペランドを解析する。
+    //  - 直値（IMM）: 飛び先が静的に決まる → hasCallTarget/callTarget（call も jmp/Jcc も対象。表示でシンボルを添える）。
+    //  - レジスタ/メモリ（間接）: レジスタ状況から解く必要があるので種別だけ拾い、解決は UI 側（PC 行）。
+    //    x86: *%reg / *disp(base,index,scale) / *disp(%rip)。arm64: blr/br Xn（レジスタのみ）。
     if (ins.isBranch && insn->detail) {
       if (arch_.csArch() == CS_ARCH_X86) {
         auto& x = insn->detail->x86;
         if (x.op_count > 0) {
           const auto& op = x.operands[0];
-          if (op.type == X86_OP_REG) {
+          if (op.type == X86_OP_IMM) {
+            ins.hasCallTarget = true; ins.callTarget = (uint64_t)op.imm;
+          } else if (op.type == X86_OP_REG) {
             ins.indirect = true; ins.branchOp = BranchOp::Reg;
             ins.baseReg = cs_reg_name(h, op.reg);
           } else if (op.type == X86_OP_MEM) {
@@ -82,7 +71,15 @@ std::vector<Insn> Disassembler::disasm(const uint8_t* code, size_t size, uint64_
         }
       } else if (arch_.csArch() == CS_ARCH_ARM64) {
         auto& a = insn->detail->arm64;
-        if (a.op_count > 0 && a.operands[0].type == ARM64_OP_REG) {
+        // 直値分岐（b/bl/b.cond/cbz/cbnz/tbz/tbnz）は飛び先が IMM オペランド（末尾）。
+        // cbz/tbz は operand[0] が条件レジスタなので「operand[0]=REG＝間接」とはできない。
+        // IMM が無く operand[0] がレジスタのときだけ br/blr Xn（レジスタ間接）。
+        int immIdx = -1;
+        for (int k = (int)a.op_count - 1; k >= 0; k--)
+          if (a.operands[k].type == ARM64_OP_IMM) { immIdx = k; break; }
+        if (immIdx >= 0) {
+          ins.hasCallTarget = true; ins.callTarget = (uint64_t)a.operands[immIdx].imm;
+        } else if (a.op_count > 0 && a.operands[0].type == ARM64_OP_REG) {
           ins.indirect = true; ins.branchOp = BranchOp::Reg;
           ins.baseReg = cs_reg_name(h, a.operands[0].reg);
         }
