@@ -1715,6 +1715,7 @@ void runCommand(const std::string& line) {
       "\x1b[36m― 自動解析（操作不要・停止時に出る） ―\x1b[0m",
       "  バックトレース: CFI（compact unwind / DWARF eh_frame）で正確化。関数入口・IP=0・stub でも呼び元を復元。",
       "  syscall 直前で停まると呼ぶ内容を解析表示（例 write(1, 0x.., 14) \"hi\"）。Mach トラップ・引数フラグ・mach_msg も分解。",
+      "  直値の call/jmp/分岐（例 jmp 0x…）は飛び先にシンボルを添える（\"; func+0x..\"）。",
       "  PC が間接 call/jmp（例 callq *%rax、*(%rbp)、*off(%rip)）のとき、実行前でもレジスタ状況から飛び先を解いて",
       "    \"; → 0x… <シンボル>\" と補足表示（既知シンボルならアドレスと両方。jmp 系も同じ）。",
       "  PLT/スタブは \"symbol stub for: X\" と解決表示。C++ 名はデマングルしテンプレートを省略（std::map<…>）。",
