@@ -565,9 +565,43 @@ static std::string uuidHexOf(const Image& img) {
   return std::string(hex, 32);
 }
 
+// まだ所属イメージが未ロードで張れていない保存ブレイク（dlopen 待ち）。停止のたびに再挑戦する。
+std::vector<BpRecord> g_pendingBp;
+
+// 1 件の保存レコードを、所属イメージがロード済みなら張る。張れたら true。未ロードなら false。
+static bool applyOneBp(const BpRecord& r, bool& usedHw) {
+  const Image* im = nullptr;
+  for (const auto& x : g_session.images().images()) if (uuidHexOf(x) == r.imageUuid) { im = &x; break; }
+  if (!im) return false; // そのイメージがまだ無い（dlopen 前）
+  uint64_t addr = r.unslid + im->slide;
+  const Breakpoint* nb;
+  if (r.kind == 2)      { nb = g_session.breaks().addWatch(addr, r.watchSize ? r.watchSize : 8, r.onRead, r.onWrite); usedHw = true; }
+  else if (r.kind == 1) { nb = g_session.breaks().addHw(addr); usedHw = true; }
+  else                  { nb = g_session.breaks().add(addr); }
+  if (nb && !r.enabled) g_session.breaks().setEnabled(nb->id, false);
+  return nb != nullptr;
+}
+
+// 保留中（dlopen 待ち）の保存ブレイクのうち、イメージがロード済みになったものを張る。返り値=今回張れた件数。
+// onStoppedEvent から毎停止で呼ぶ。dlopen 後に（別のブレイク等で）停止した時点で自動的に張られる。
+int applyPendingBreakpoints() {
+  if (g_pendingBp.empty()) return 0;
+  int applied = 0; bool anyHw = false;
+  std::vector<BpRecord> still;
+  for (const auto& r : g_pendingBp) {
+    if (applyOneBp(r, anyHw)) applied++;
+    else still.push_back(r); // まだ未ロード → 次の停止で再挑戦
+  }
+  g_pendingBp.swap(still);
+  if (anyHw) g_session.syncHwBreaks();
+  return applied;
+}
+
 // 永続化されたブレイクを読み、現在ロード済みイメージへ同一アドレスで張り直す。返り値=復元件数（ファイル無し=-1）。
 // 主実行ファイルの UUID をキーにファイルを引き、各行は所属イメージ UUID＋unslid なので ASLR/再実行に強い。
+// エントリ時点で未ロードのイメージ（dlopen で後から読む分）は g_pendingBp へ回し、以降の停止で張り直す。
 int restoreBreakpoints() {
+  g_pendingBp.clear();
   g_session.refreshImages();
   const Image* mainImg = g_session.images().mainExecutable();
   if (!mainImg) return -1;
@@ -577,15 +611,8 @@ int restoreBreakpoints() {
   if (!BreakpointStore::load(mainUuid, recs)) return -1; // ファイルが無い＝何もしない
   int applied = 0; bool anyHw = false;
   for (const auto& r : recs) {
-    const Image* im = nullptr;
-    for (const auto& x : g_session.images().images()) if (uuidHexOf(x) == r.imageUuid) { im = &x; break; }
-    if (!im) continue; // そのイメージが未ロードなら今回は張らない（スキップ）
-    uint64_t addr = r.unslid + im->slide;
-    const Breakpoint* nb;
-    if (r.kind == 2)      { nb = g_session.breaks().addWatch(addr, r.watchSize ? r.watchSize : 8, r.onRead, r.onWrite); anyHw = true; }
-    else if (r.kind == 1) { nb = g_session.breaks().addHw(addr); anyHw = true; }
-    else                  { nb = g_session.breaks().add(addr); }
-    if (nb) { if (!r.enabled) g_session.breaks().setEnabled(nb->id, false); applied++; }
+    if (applyOneBp(r, anyHw)) applied++;
+    else g_pendingBp.push_back(r); // 未ロードのイメージ（dlopen 待ち）は保留
   }
   if (anyHw) g_session.syncHwBreaks();
   return applied;
@@ -654,6 +681,7 @@ void doRestart() {
   pid_t oldpid = g_session.isAttached() ? g_session.pid() : 0;
   if (g_session.isAttached()) g_session.detach(); // 自分で起動した子は Target::detach が SIGKILL する
   g_session.breaks().removeAll();                 // 旧 task 向けのユーザ一覧を一掃（新プロセスへ張り直すため）
+  g_pendingBp.clear();                            // 保留中の dlopen 待ちブレイクも破棄（再起動は自前で引き継ぐ）
   if (oldpid > 0) { int st; while (waitpid(oldpid, &st, 0) < 0 && errno == EINTR) {} } // 旧プロセスを回収（ゾンビ防止）
   g_state = UiState::Idle;
 
@@ -2333,7 +2361,12 @@ bool onStoppedEvent() {
     g_restorePending = false;
     int n = restoreBreakpoints();
     if (n > 0) g_message += std::string(g_message.empty() ? "" : "  ／ ") + "保存ブレイク " + std::to_string(n) + " 件を復元";
+    if (!g_pendingBp.empty())
+      g_message += std::string(g_message.empty() ? "" : "  ／ ") + "うち " + std::to_string(g_pendingBp.size()) + " 件は未ロード（dlopen 後に自動復元）";
   }
+  // dlopen 等で後からロードされたイメージの保留ブレイクを、イメージが揃ったこの停止で張り直す。
+  int pend = applyPendingBreakpoints();
+  if (pend > 0) g_message += std::string(g_message.empty() ? "" : "  ／ ") + "保存ブレイク " + std::to_string(pend) + " 件を復元（新規ロード）";
   return true;
 }
 
