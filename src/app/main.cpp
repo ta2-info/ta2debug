@@ -1617,6 +1617,7 @@ void runCommand(const std::string& line) {
       "  : コマンド入力    l / L レイアウト切替    1 / 2 / 3 レジスタ/バックトレース/スレッド表示切替    0 全表示",
       "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
       "  b カーソル行(未選択なら現在位置)のブレイクをトグル（有れば解除／無ければ設定）    印: ●SW赤 ◆HW黄 ◆ウォッチ水 ○/◇無効",
+      "  m カーソル行にユーザシンボルを登録（未登録なら func<0詰16進オフセット> で自動命名。登録済みなら :ann 編集モードへ）＝ :ann を即実行",
       "  Tab 逆アセンブル ⇔ スレッド選択 を切替（スレッド選択中は ↑↓ で表示スレッドを切替。★=停止 👁=表示中）",
       "  マウス: クリックでカーソル移動 / ダブルクリックでブレイクトグル / Option+クリックで呼び出し先へジャンプ / Shift+クリックでそこにブレイク / ホイールでスクロール",
       "  マウス: ドラッグで選択→離すとコピー（pbcopy/OSC52）。端末側の選択に戻すなら :mouse off",
@@ -1877,6 +1878,58 @@ void toggleBreakAtCursor() {
   }
   render();
 }
+
+// そのイメージ（バイナリ／dylib）のオフセットを 16 進で表すのに要る桁数。
+// __TEXT の静的先頭（vmaddr）を基準に、全セグメントの終端（vmaddr+vmsize）の最大まで
+// を「イメージのサイズ」とみなし、その最大オフセットを表せる桁数を返す（最低 1）。
+// Mach-O の値だけで決まるのでアーキ非依存。
+int imageHexDigits(const Image& im) {
+  uint64_t base = im.loadAddr - im.slide; // __TEXT vmaddr（静的）
+  uint64_t end = im.textSize;             // 最低でも __TEXT 分
+  for (const auto& s : im.segments) {
+    if (s.vmaddr < base) continue;        // __PAGEZERO など基準より前は無視
+    uint64_t e = (s.vmaddr - base) + s.vmsize;
+    if (e > end) end = e;
+  }
+  uint64_t maxOff = end ? end - 1 : 0;
+  int d = 0; do { d++; maxOff >>= 4; } while (maxOff);
+  return d;
+}
+
+// m キー: カーソル行（未選択なら PC）にユーザシンボル（注釈）を即時登録する。
+//  - 未登録なら func<0詰16進オフセット>（桁数はイメージサイズから算出）で名前を付けて保存。
+//    以降 :b <名前> / 式で引け、逆アセンブル・バックトレースにも出て、永続化＆自動再読込される。
+//  - 既に登録済みなら、名前／メモを編集できるよう :ann コマンドをプリフィルして入力モードへ入る。
+void annotateAtCursor() {
+  if (g_state != UiState::Stopped || !g_session.isAttached()) return;
+  uint64_t a = g_curAddr ? g_curAddr : viewPc();
+  const Image* im = g_session.images().byAddress(a);
+  if (!im) { g_message = "そのアドレスはどのイメージにも入っていません"; render(); return; }
+  if (Annotations::pathFor(*im).empty()) {
+    g_message = "このイメージは UUID が無く注釈を保存できません: " + im->name; render(); return;
+  }
+  g_session.annotations().refresh(*im); // 外部編集を取り込んでから判定
+  if (const Annot* ex = g_session.annotations().atExact(*im, a)) {
+    // 既存 → 編集。:ann <0xaddr>,<名前>,<メモ> をプリフィルして入力行で直せるようにする。
+    char ab[32]; snprintf(ab, sizeof(ab), "0x%llx", (unsigned long long)a);
+    std::string line = "ann " + std::string(ab) + "," + ex->name;
+    if (!ex->memo.empty()) line += "," + ex->memo; // メモは3番目（空なら付けない）
+    g_cmdMode = true; g_cmdline = line; g_message.clear(); render();
+    return;
+  }
+  // 新規 → func<0詰16進オフセット> を自動命名して登録。
+  uint64_t off = a - im->loadAddr;        // イメージ先頭（__TEXT）からのオフセット
+  int digits = imageHexDigits(*im);
+  char nm[40]; snprintf(nm, sizeof(nm), "func%0*llx", digits, (unsigned long long)off);
+  std::string err;
+  if (!g_session.annotations().setName(*im, a, nm, err)) { g_message = "シンボル登録できません: " + err; render(); return; }
+  char buf[220];
+  snprintf(buf, sizeof(buf), "シンボル登録: %s  (0x%llx = %s+0x%llx)  → %s  ／ もう一度 m で編集",
+           nm, (unsigned long long)a, im->name.c_str(), (unsigned long long)off,
+           Annotations::pathFor(*im).c_str());
+  g_message = buf;
+  render();
+}
 // スレッド選択を動かし、表示中スレッドを切り替える（dir=+1 下 / -1 上）。
 // 注: task_threads() の並びは呼び出しごとに変わりうるので、索引ではなく「現在の表示スレッドを
 //     一覧内で探して隣へ」で辿る（tid 基準）。表示順の安定のため tid でソートする。
@@ -2051,6 +2104,7 @@ void onKey(int c) {
     case 'n': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.stepOver(); g_state = UiState::Running; render(); } break;
     case 'c': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.cont(); g_state = UiState::Running; g_message.clear(); render(); } break;
     case 'b': if (g_state == UiState::Stopped && g_session.isAttached()) toggleBreakAtCursor(); break; // カーソル行のブレイクをトグル
+    case 'm': if (g_state == UiState::Stopped && g_session.isAttached()) annotateAtCursor(); break;   // カーソル行に func<16進> シンボルを登録／編集
     case 3:   // Ctrl+C
       if (g_autoMask) { g_autoMask = 0; g_message = "auto 中断"; render(); } // 実行中の step が次に止まる
       else if (g_state == UiState::Running) { g_session.interrupt(); }
