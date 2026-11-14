@@ -1,0 +1,772 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ta2debug リファクタリング設計書</title>
+<style>
+:root{--bg:#f7f8fa;--surface:#ffffff;--text:#1c2330;--muted:#5b6676;--line:#d9dee6;--accent:#0b62c4;
+--code-bg:#eef1f5;--th-bg:#edf1f6;--zebra:#fafbfc;--shadow:0 1px 2px rgba(20,30,50,.06)}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#12161c;--surface:#1a2028;--text:#e3e8ef;--muted:#9aa6b6;--line:#2e3743;--accent:#6fb1ff;
+--code-bg:#232b36;--th-bg:#222a35;--zebra:#1d242d;--shadow:none}}
+:root[data-theme="dark"]{--bg:#12161c;--surface:#1a2028;--text:#e3e8ef;--muted:#9aa6b6;--line:#2e3743;--accent:#6fb1ff;
+--code-bg:#232b36;--th-bg:#222a35;--zebra:#1d242d;--shadow:none}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);
+font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Hiragino Kaku Gothic ProN","Yu Gothic",Meiryo,sans-serif;
+font-size:15px;line-height:1.75;-webkit-text-size-adjust:100%}
+.layout{display:grid;grid-template-columns:270px minmax(0,1fr);gap:32px;max-width:1280px;margin:0 auto;padding:24px 16px 80px}
+.toc{position:sticky;top:16px;align-self:start;max-height:calc(100vh - 32px);overflow:auto;font-size:13px;line-height:1.5;
+border:1px solid var(--line);border-radius:8px;background:var(--surface);padding:12px 14px}
+.toc-title{font-weight:700;color:var(--muted);font-size:12px;letter-spacing:.08em;margin-bottom:6px}
+.toc ul{list-style:none;margin:0;padding:0}
+.toc li{margin:3px 0}.toc li.lv3{padding-left:14px;font-size:12.5px}
+.toc a{color:var(--text);text-decoration:none}.toc a:hover{color:var(--accent);text-decoration:underline}
+main{min-width:0}
+h1{font-size:28px;line-height:1.3;margin:0 0 12px;text-wrap:balance}
+h2{font-size:21px;margin:48px 0 12px;padding-bottom:6px;border-bottom:2px solid var(--line);scroll-margin-top:12px}
+h3{font-size:17px;margin:30px 0 8px;scroll-margin-top:12px}
+h4{font-size:15px;margin:22px 0 6px}
+p{margin:10px 0;max-width:80ch}
+ul,ol{margin:8px 0;padding-left:1.6em}li{margin:3px 0}
+a{color:var(--accent)}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88em;background:var(--code-bg);
+padding:.08em .35em;border-radius:4px;overflow-wrap:anywhere}
+pre.code{background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto;
+font-size:12.5px;line-height:1.55;margin:12px 0}
+pre.code code{background:none;padding:0;font-size:inherit;overflow-wrap:normal;white-space:pre}
+.tablewrap{overflow-x:auto;margin:12px 0;border:1px solid var(--line);border-radius:8px;background:var(--surface);box-shadow:var(--shadow)}
+table{border-collapse:collapse;width:100%;font-size:13.5px;line-height:1.6}
+th,td{padding:7px 10px;text-align:left;vertical-align:top;border-bottom:1px solid var(--line)}
+th{background:var(--th-bg);font-weight:600;white-space:nowrap}
+tbody tr:nth-child(even){background:var(--zebra)}
+tbody tr:last-child td{border-bottom:none}
+td:first-child{min-width:9em}
+figure.diagram{margin:16px 0;padding:14px;border:1px solid var(--line);border-radius:8px;background:var(--surface);overflow-x:auto;text-align:center}
+pre.mermaid{margin:0;font-family:ui-monospace,Menlo,monospace;font-size:12px;text-align:left;white-space:pre;color:var(--muted)}
+pre.mermaid[data-processed]{white-space:normal;text-align:center}
+pre.mermaid svg{max-width:100%;height:auto}
+@media (max-width:900px){.layout{grid-template-columns:minmax(0,1fr);gap:16px}.toc{position:static;max-height:none}}
+@media print{.toc{display:none}.layout{display:block}body{background:#fff}}
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc" aria-label="目次"><div class="toc-title">目次</div><ul>
+<li class="lv2"><a href="#h-0">1. 概要と目的</a></li>
+<li class="lv2"><a href="#h-1">2. 現状アーキテクチャ分析</a></li>
+<li class="lv3"><a href="#h-2">2.1 規模と構成（実測）</a></li>
+<li class="lv3"><a href="#h-3">2.2 現在のスレッド</a></li>
+<li class="lv3"><a href="#h-4">2.3 問題点</a></li>
+<li class="lv3"><a href="#h-5">2.4 現状で良い点（維持するもの）</a></li>
+<li class="lv2"><a href="#h-6">3. 目標アーキテクチャ</a></li>
+<li class="lv3"><a href="#h-7">3.1 レイヤリング</a></li>
+<li class="lv3"><a href="#h-8">3.2 ディレクトリ案</a></li>
+<li class="lv2"><a href="#h-9">4. モジュール境界と責務</a></li>
+<li class="lv3"><a href="#h-10">4.1 L0 Platform / Arch</a></li>
+<li class="lv3"><a href="#h-11">4.2 L1 Core Engine</a></li>
+<li class="lv3"><a href="#h-12">4.3 L2 Facade / API</a></li>
+<li class="lv3"><a href="#h-13">4.4 L3 Presentation</a></li>
+<li class="lv2"><a href="#h-14">5. クラス構成</a></li>
+<li class="lv2"><a href="#h-15">6. ヘッドレス API 定義</a></li>
+<li class="lv3"><a href="#h-16">6.1 ファサード</a></li>
+<li class="lv3"><a href="#h-17">6.2 コマンド</a></li>
+<li class="lv3"><a href="#h-18">6.3 スナップショット型（抜粋）</a></li>
+<li class="lv3"><a href="#h-19">6.4 CommandInterpreter</a></li>
+<li class="lv2"><a href="#h-20">7. イベント / コマンドモデル</a></li>
+<li class="lv3"><a href="#h-21">7.1 イベント</a></li>
+<li class="lv3"><a href="#h-22">7.2 スレッド境界</a></li>
+<li class="lv3"><a href="#h-23">7.3 シーケンス</a></li>
+<li class="lv3"><a href="#h-24">7.4 状態</a></li>
+<li class="lv3"><a href="#h-24b">7.5 AI エージェント（Skill）からの利用</a></li>
+<li class="lv2"><a href="#h-25">8. i18n 設計</a></li>
+<li class="lv3"><a href="#h-26">8.1 方針</a></li>
+<li class="lv3"><a href="#h-27">8.2 <code>Msg</code> と ID</a></li>
+<li class="lv3"><a href="#h-28">8.3 カタログ</a></li>
+<li class="lv3"><a href="#h-29">8.4 パラメータ差し込み</a></li>
+<li class="lv3"><a href="#h-30">8.5 表データの扱い</a></li>
+<li class="lv3"><a href="#h-31">8.6 ロケール選択</a></li>
+<li class="lv3"><a href="#h-32">8.7 バッチ出力の互換</a></li>
+<li class="lv3"><a href="#h-33">8.8 移行の段階案</a></li>
+<li class="lv2"><a href="#h-34">9. Arch 移植方針</a></li>
+<li class="lv3"><a href="#h-35">9.1 基本方針</a></li>
+<li class="lv3"><a href="#h-36">9.2 現状の漏れと対処</a></li>
+<li class="lv3"><a href="#h-37">9.3 強化項目</a></li>
+<li class="lv2"><a href="#h-38">10. 機能パリティ表</a></li>
+<li class="lv3"><a href="#h-39">10.1 起動とフロントエンド</a></li>
+<li class="lv3"><a href="#h-40">10.2 対象の管理</a></li>
+<li class="lv3"><a href="#h-41">10.3 実行制御</a></li>
+<li class="lv3"><a href="#h-42">10.4 ブレイクポイント</a></li>
+<li class="lv3"><a href="#h-43">10.5 表示と操作（TUI）</a></li>
+<li class="lv3"><a href="#h-44">10.6 マウス</a></li>
+<li class="lv3"><a href="#h-45">10.7 参照コマンド</a></li>
+<li class="lv3"><a href="#h-46">10.8 書き換え</a></li>
+<li class="lv3"><a href="#h-47">10.9 シンボルと注釈</a></li>
+<li class="lv3"><a href="#h-48">10.10 syscall / Mach トラップ</a></li>
+<li class="lv3"><a href="#h-49">10.11 現状で未実装の事項（パリティ対象外だが記録する）</a></li>
+<li class="lv2"><a href="#h-50">11. 段階的移行計画</a></li>
+<li class="lv2"><a href="#h-51">12. リスクと緩和</a></li>
+<li class="lv2"><a href="#h-52">付録 A. 現行コマンド一覧（コマンド表 <code>CommandSpec</code> の初期内容）</a></li>
+<li class="lv2"><a href="#h-53">付録 B. 現行キー一覧（Main モード）</a></li>
+</ul></nav>
+<main>
+<h1 id="h-0">ta2debug リファクタリング設計書</h1>
+<ul><li>対象: <code>/Users/ta2/DEVELOP/OSX/ta2debug</code>（調査時点の HEAD: <code>7065102</code>）</li><li>位置づけ: 実装前の設計。本書は既存コードを一切変更しない。実装工程はこの文書の「段階的移行計画」に沿って進める。</li><li>既存の <code>DESIGN.md</code>（初版設計）を置き換えるものではなく、その後に膨らんだ実装を整理し直すための追補である。</li></ul>
+<h2 id="h-0">1. 概要と目的</h2>
+<p>ta2debug は <code>task_for_pid</code> + Mach 例外ポートで対象を非ストップのまま扱う macOS ネイティブデバッガ（C++17）である。機能は揃っているが、次の 5 点を満たす構造にはなっていない。本設計はこれを満たす構成と移行手順を定める。</p>
+<div class="tablewrap"><table><thead><tr><th>#</th><th>要件</th><th>設計上の答え（要約）</th></tr></thead><tbody><tr><td>1</td><td>機能を 100% 維持</td><td>全コマンド・全キー・全自動動作を §10 の機能パリティ表で新モジュールへ対応づける。既定言語は日本語のままなので表示文言も変わらない</td></tr><tr><td>2</td><td>x86_64 / arm64 両対応</td><td>既存 <code>Arch</code> 抽象を踏襲。抽象の外へ漏れている 4 箇所（§9.2）を <code>Arch</code> へ戻し、非ホスト側もコンパイル検査する</td></tr><tr><td>3</td><td>表示内容の i18n</td><td>core は文字列を作らず <code>Msg</code>（メッセージ ID + 名前付き引数）を返す。翻訳は Presentation 層の <code>Translator</code> だけが行う（§8）</td></tr><tr><td>4</td><td>ロジックと UI の完全分離</td><td>ヘッドレスなファサード <code>Debugger</code> を新設。TUI / GUI / AI は「コマンド投入 + イベント購読 + 読み取りクエリ」だけで駆動する（§6, §7）</td></tr><tr><td>5</td><td>AI エージェント（Skill）から使いやすい</td><td>バッチ正面を「AI フロントエンド」として一級扱いにする。ヘッドレスな <code>Debugger</code> を非対話で駆動し、自己記述的なコマンド目録（<code>CommandSpec</code> 由来）・安定した機械可読出力・MsgId ベースの安定したエラー識別子を提供する（§7.5）。GUI / TUI / AI の 3 つを対等なユースケースとして設計する</td></tr></tbody></table></div>
+<p><strong>想定ユースケース（Presentation は 3 種類）。</strong> いずれも同一のヘッドレス <code>Debugger</code> ファサードを使う。</p>
+<ul><li><strong>TUI</strong> … 端末上の対話 UI（現行）。</li><li><strong>GUI</strong> … 将来のネイティブ GUI。</li><li><strong>AI</strong> … AI エージェントが <code>ta2debug</code> スキル経由で非対話に駆動する（現行の <code>-b -o</code> バッチの発展）。人間の対話を介さず、出力を解析して次のコマンドを決める利用を一級要件とする。</li></ul>
+<p>前提として次を維持する（<code>DESIGN.md</code> の大前提と同じ）。</p>
+<ul><li>依存最小: capstone、libdtrace、CommonCrypto、Carbon（IME）、システムフレームワークのみ。i18n のために gettext / ICU などを足さない。</li><li>ホスト PC のアーキ = ターゲットのアーキ。Rosetta 越しの x86_64 プロセスなど異アーキ対象は扱わない。</li><li>非ストップ型・sudo 前提・自作プログラム専用という性格は変えない。</li></ul>
+<h2 id="h-1">2. 現状アーキテクチャ分析</h2>
+<h3 id="h-2">2.1 規模と構成（実測）</h3>
+<div class="tablewrap"><table><thead><tr><th>場所</th><th>主なファイル</th><th>行数</th><th>役割</th></tr></thead><tbody><tr><td><code>src/app/main.cpp</code></td><td>1 ファイル</td><td>2934</td><td>TUI 本体、バッチ、コマンド解釈、ブレイク復元、auto、非同期ジョブ、バックトレース計算まで全部</td></tr><tr><td><code>src/app/Expression.cpp</code></td><td></td><td>237</td><td>式評価（<code>Session</code> に依存）</td></tr><tr><td><code>src/core/Session.cpp</code></td><td></td><td>1193</td><td>例外処理・ステップ状態機械・dtrace・dyld 通知フック・syscall デコード表と整形</td></tr><tr><td><code>src/core/*</code>（その他）</td><td>Target, Breakpoints, Symbols, ImageList, Unwind, DwarfLines, Annotations, BreakpointStore, DtraceCatch, Disassembler, ProcessList, ExceptionServer</td><td>約 2700</td><td>デバッグ機構</td></tr><tr><td><code>src/core/arch/*</code></td><td>ArchX86_64, ArchArm64</td><td>553</td><td>アーキ依存</td></tr><tr><td><code>src/ui/*</code></td><td>Terminal, Layout</td><td>409</td><td>端末制御とレイアウト計算</td></tr></tbody></table></div>
+<h3 id="h-3">2.2 現在のスレッド</h3>
+<div class="tablewrap"><table><thead><tr><th>スレッド</th><th>起点</th><th>やっていること</th></tr></thead><tbody><tr><td>メイン</td><td><code>main()</code> のループ</td><td><code>EventQueue::pop</code> → <code>onKey</code> / <code>onMouse</code> / <code>onStoppedEvent</code> / <code>render</code>。ロジックも描画も全部ここ</td></tr><tr><td>入力</td><td><code>main()</code> 内のラムダ</td><td>stdin と SIGWINCH 用 self-pipe を <code>poll</code>。ESC 列（40ms 判定）と SGR マウスを組み立てて <code>Event</code> を積む</td></tr><tr><td>例外サーバ</td><td><code>ExceptionServer</code></td><td><code>mach_msg_server</code>。<code>Session::onException</code> 内で resume 決定（<code>resumeCv_</code>）を待ってブロックする</td></tr><tr><td>終了監視</td><td><code>Session::startExitMonitor</code></td><td>kqueue <code>NOTE_EXIT</code> → <code>Event::TargetExited</code></td></tr><tr><td>シンボル先読み</td><td><code>Session::warmSymbols</code></td><td>全イメージのシンボルを読み、80ms 間引きで <code>Event::Progress</code></td></tr><tr><td>dtrace consumer</td><td><code>DtraceCatch::loop</code></td><td><code>:scwatch</code> の集計 / トレース、<code>:scstop</code> の発火（<code>onSyscallStopHit</code>）</td></tr><tr><td>ジョブ</td><td><code>evalAsync</code>（main.cpp）</td><td>式評価（全イメージ横断のシンボル探索）。<code>g_jobCancel</code> で中止、<code>Event::JobDone</code> で結果適用</td></tr></tbody></table></div>
+<h3 id="h-4">2.3 問題点</h3>
+<ol><li><strong>main.cpp にロジックが溶け込んでいる。</strong> 次はいずれも UI ではなくデバッガの振る舞いだが、<code>g_term</code> / <code>g_message</code> / <code>render()</code> と同じ関数内にある。<ul><li>ブレイク永続化と復元: <code>saveBreakpoints</code> / <code>restoreBreakpoints</code> / <code>applyOneBp</code> / <code>applyPendingBreakpoints</code> / <code>g_pendingBp</code> / <code>g_restorePending</code></li><li>再起動時のブレイク引き継ぎ: <code>doRestart</code></li><li>ブレイクの種別変換・移動: <code>bpAddKind</code> / <code>bpRebuild</code>（Soft⇄Hard、ウォッチのサイズ・アクセス変更）</li><li>dlopen 透過捕捉の後半: メインループの <code>stopIsImageLoad()</code> 分岐（イメージ更新 → 保留ブレイク装着 → 即 <code>cont</code>）</li><li>停止後処理: <code>onStoppedEvent</code>（イメージ・注釈更新、発火スレッド確定、先読み起動、通知フック設置、auto 継続判定、停止メッセージ合成）</li><li>auto: <code>g_autoMask</code> / <code>g_autoSteps</code> / <code>kindAtPc</code> / <code>kAutoMax</code></li><li>バックトレース: <code>computeBacktrace</code> とそのヒューリスティック（<code>addrIsCode</code> / <code>addrIsCallReturn</code> / <code>scanStackForReturn</code>）</li><li>間接分岐の飛び先解決: <code>resolveIndirectTarget</code></li><li>メモリ整形: <code>examineMemory</code> / <code>classicDump</code> / <code>formatValue</code></li><li>非同期式評価: <code>evalAsync</code> / <code>withBreakId</code> と <code>g_job*</code> 一式</li></ul></li><li><strong>依存方向が逆転している。</strong> <code>inc/core/Session.h</code> が <code>app/EventQueue.h</code> を include し、<code>Event</code> にはキー・マウス・リサイズという UI の語彙が入っている。core が UI のイベント型を知っている。<code>Expression</code> は core の部品を使う純ロジックなのに <code>app/</code> にある。</li><li><strong>状態が全部グローバル。</strong> main.cpp に <code>g_</code> 変数が約 70 個あり、エンジン状態（<code>g_state</code>、<code>g_pendingBp</code>、<code>g_launchArgs</code>）と表示状態（<code>g_disasmTop</code>、<code>g_pickSel</code>）が区別なく並ぶ。</li><li>**バッチと TUI が <code>g_interactive</code> の分岐で同居。** バッチでは「式評価は同期」「シンボル先読み無効」「保存ブレイクの自動復元なし」「dyld 通知フックなし」という差があるが、これは <code>if (g_interactive)</code> が各所に散っているだけで、設定として表現されていない。</li><li><strong>表示文字列がハードコード。</strong> コメントを除く非 ASCII 文字列リテラルは実測で約 550 個（main.cpp 459、Expression.cpp 36、DtraceCatch.cpp 14、Annotations.cpp 13、Session.cpp 10、BreakpointStore.cpp 8、Target.cpp 6、Layout.cpp 6 ほか）。core 層が日本語文を直接組み立てて <code>std::string&amp; err</code> や <code>stopReason()</code> で返している。</li><li><strong>結果の受け渡しが文字列。</strong> コマンド結果は <code>g_message</code>（1 行）と <code>g_output</code>（ANSI 入りの行配列）で、バッチは <code>stripAnsi</code> で色を剥がして再利用している。GUI が欲しい構造化データ（アドレス、シンボル、件数）は文字列に焼かれた後で失われている。</li><li><strong>コマンド表が二重。</strong> <code>runCommand</code> の <code>if (cmd == ...)</code> 連鎖、<code>completeCommand</code> の <code>CMDS[]</code>、<code>:help</code> の <code>H[]</code>、<code>printUsage</code> が別々に手書きされ、同期していない（例: <code>disas</code> / <code>disassemble</code> / <code>att</code> / <code>launch</code> の別名は補完表やヘルプに無い）。</li><li><strong>Arch 抽象の外への漏れ</strong>（§9.2 に列挙）。</li><li><strong>UI スレッドで重い処理が走る。</strong> <code>render()</code> のたびにメモリ読取・逆アセンブル・シンボル解決・バックトレースを実行する。式評価だけは非同期化済みだが、「UI を決して固めない」を構造として保証していない。</li></ol>
+<figure class="diagram"><pre class="mermaid">flowchart LR
+  subgraph APP["app (main.cpp 2934 行)"]
+    UI["TUI 描画 / キー / マウス"]
+    LOGIC["ブレイク復元 / auto / dlopen 後処理&lt;br/&gt;バックトレース / 式の非同期 / バッチ"]
+  end
+  EQ["app/EventQueue.h&lt;br/&gt;Key Mouse Resize Stopped ..."]
+  SES["core/Session"]
+  CORE["core その他"]
+  TERM["ui/Terminal, Layout"]
+  UI --- LOGIC
+  APP --&gt; SES
+  APP --&gt; CORE
+  APP --&gt; TERM
+  SES --&gt; CORE
+  SES -. "逆向き依存" .-&gt; EQ
+  APP --&gt; EQ</pre></figure>
+<h3 id="h-5">2.4 現状で良い点（維持するもの）</h3>
+<ul><li><code>Arch</code> 抽象は十分に機能している。<code>Target</code> / <code>Breakpoints</code> / <code>Unwinder</code> / <code>Disassembler</code> はアーキ非依存に書けている。</li><li>例外スレッドが resume 決定を待つ方式、Ctrl+C / dtrace <code>stop()</code> の「手動停止」経路（<code>manualStop_</code> → <code>resumeManual</code>）、SW/HW ブレイクをまたぐ <code>uncoverBreakAtPc</code> の統一手順は正しく動いており、ロジックは変えずに置き場所だけ移す。</li><li><code>.t2a</code> / <code>.t2b</code> はイメージ UUID + unslid アドレスで保存しており、ASLR と再実行に強い。形式は変えない。</li><li>イベントをメインスレッド 1 本に直列化する考え方は正しい。直列化する場所を「UI スレッド」から「エンジンスレッド」へ移すだけである。</li></ul>
+<h2 id="h-6">3. 目標アーキテクチャ</h2>
+<h3 id="h-7">3.1 レイヤリング</h3>
+<p>依存は上から下への一方向のみ。CMake のライブラリ分割でこれを強制する（下位ライブラリは上位のヘッダを include できない）。</p>
+<div class="tablewrap"><table><thead><tr><th>層</th><th>ライブラリ</th><th>内容</th><th>知ってはいけないもの</th></tr></thead><tbody><tr><td>L3 Presentation</td><td><code>ta2tui</code>（TUI）/ <code>ta2ai</code>（AI フロントエンド＝バッチ発展、Skill が使う）/（将来）GUI</td><td>画面、入力、ページャ、ピッカー、機械可読出力、翻訳</td><td>Mach API、<code>Target</code>、<code>Session</code> の内部</td></tr><tr><td>L2 Facade / API</td><td><code>ta2engine</code></td><td><code>Debugger</code>、<code>Command</code>、<code>DebugEvent</code>、スナップショット型、<code>CommandInterpreter</code></td><td>端末、ANSI、言語カタログ</td></tr><tr><td>L1 Core Engine</td><td><code>ta2core</code></td><td>ステップ状態機械、ブレイク、シンボル、アンワインド、式、syscall デコード、永続化</td><td>UI、イベントループ、表示言語</td></tr><tr><td>L0 Platform / Arch</td><td><code>ta2platform</code></td><td><code>Arch</code>、<code>Target</code>、<code>ExceptionServer</code>、MIG、<code>DtraceCatch</code>、<code>ProcessList</code></td><td>L1 以上すべて</td></tr><tr><td>横断</td><td><code>ta2base</code></td><td><code>Msg</code> / <code>MsgId</code>（<code>Messages.def</code>）。全層が使う値型</td><td>何も知らない</td></tr><tr><td>横断</td><td><code>ta2i18n</code></td><td><code>Catalog</code> / <code>Translator</code>。L3 だけがリンクする</td><td>core、engine</td></tr></tbody></table></div>
+<figure class="diagram"><pre class="mermaid">flowchart TB
+  subgraph L3["L3 Presentation"]
+    TUI["TUI&lt;br/&gt;TuiApp / Views / Overlays&lt;br/&gt;InputDecoder / Terminal / Layout"]
+    BATCH["AI フロントエンド (Skill)&lt;br/&gt;BatchRunner / 機械可読出力"]
+    GUI["GUI (将来)"]
+    REPORT["ui/common&lt;br/&gt;TextReport (構造化結果 → 行)"]
+    I18N["ta2i18n&lt;br/&gt;Translator / Catalog"]
+  end
+  subgraph L2["L2 Facade / API (ta2engine)"]
+    DBG["Debugger&lt;br/&gt;post / subscribe / Query"]
+    CI["CommandInterpreter&lt;br/&gt;CommandSpec 表"]
+    TYPES["Command / DebugEvent&lt;br/&gt;StopInfo などのスナップショット型"]
+  end
+  subgraph L1["L1 Core Engine (ta2core)"]
+    SVC["BreakpointService / AutoRunner&lt;br/&gt;StopProcessor / JobRunner"]
+    SES["TargetSession + Stepper&lt;br/&gt;DyldNotifier / SyscallMonitor&lt;br/&gt;SymbolWarmer / ExitMonitor"]
+    ANA["Expression / Backtracer / BranchResolver&lt;br/&gt;MemoryExaminer / SyscallDecoder"]
+    DATA["Breakpoints / ImageList / Symbols&lt;br/&gt;Annotations / BreakpointStore&lt;br/&gt;Disassembler / Unwinder / DwarfLines"]
+  end
+  subgraph L0["L0 Platform / Arch (ta2platform)"]
+    ARCH["Arch&lt;br/&gt;ArchX86_64 / ArchArm64"]
+    TGT["Target / ExceptionServer / mach_exc&lt;br/&gt;DtraceCatch / ProcessList"]
+  end
+  BASE["ta2base&lt;br/&gt;Msg / MsgId / Messages.def"]
+  TUI --&gt; REPORT
+  BATCH --&gt; REPORT
+  REPORT --&gt; I18N
+  TUI --&gt; I18N
+  TUI --&gt; DBG
+  TUI --&gt; CI
+  BATCH --&gt; DBG
+  BATCH --&gt; CI
+  GUI --&gt; DBG
+  CI --&gt; DBG
+  DBG --&gt; SVC
+  SVC --&gt; SES
+  SVC --&gt; ANA
+  SES --&gt; DATA
+  ANA --&gt; DATA
+  DATA --&gt; TGT
+  SES --&gt; TGT
+  TGT --&gt; ARCH
+  DATA --&gt; ARCH
+  I18N --&gt; BASE
+  L2 --&gt; BASE
+  L1 --&gt; BASE
+  L0 --&gt; BASE</pre></figure>
+<h3 id="h-8">3.2 ディレクトリ案</h3>
+<p><code>inc/</code> と <code>src/</code> の両方に同じ構成を置く（現行の流儀を踏襲）。</p>
+<div class="tablewrap"><table><thead><tr><th>ディレクトリ</th><th>入るもの</th><th>由来</th></tr></thead><tbody><tr><td><code>base/</code></td><td><code>Msg.h</code>、<code>Messages.def</code></td><td>新規</td></tr><tr><td><code>platform/</code></td><td><code>Arch.h</code>、<code>arch/ArchX86_64.cpp</code>、<code>arch/ArchArm64.cpp</code>、<code>Target</code>、<code>ExceptionServer</code>、<code>mach_exc*</code>、<code>DtraceCatch</code>、<code>ProcessList</code></td><td><code>core/</code> から移動</td></tr><tr><td><code>core/</code></td><td><code>Breakpoints</code>、<code>ImageList</code>、<code>Symbols</code>、<code>Annotations</code>、<code>BreakpointStore</code>、<code>Disassembler</code>、<code>Unwind</code>、<code>DwarfLines</code>、<code>Stepper</code>、<code>TargetSession</code>、<code>DyldNotifier</code>、<code>SyscallMonitor</code>、<code>SymbolWarmer</code>、<code>ExitMonitor</code>、<code>SyscallDecoder</code>、<code>SyscallTables</code>、<code>SyscallNames.inc</code>、<code>Expression</code>、<code>Backtracer</code>、<code>BranchResolver</code>、<code>MemoryExaminer</code></td><td>既存 + <code>Session.cpp</code> の分割 + main.cpp / <code>app/</code> からの引き上げ</td></tr><tr><td><code>engine/</code></td><td><code>Debugger</code>、<code>Command.h</code>、<code>DebugEvent.h</code>、<code>Snapshots.h</code>、<code>EngineInbox</code>、<code>StopProcessor</code>、<code>BreakpointService</code>、<code>AutoRunner</code>、<code>JobRunner</code>、<code>CommandInterpreter</code>、<code>CommandSpec</code></td><td>新規（中身の大半は main.cpp からの引き上げ）</td></tr><tr><td><code>i18n/</code></td><td><code>Catalog</code>、<code>Translator</code></td><td>新規</td></tr><tr><td><code>ui/common/</code></td><td><code>TextReport</code>（構造化結果を表示行へ。TUI のオーバレイとバッチ出力が共用）</td><td>main.cpp の <code>g_output</code> 生成部</td></tr><tr><td><code>ui/tui/</code></td><td><code>TuiApp</code>、<code>InputDecoder</code>、<code>UiQueue</code>、<code>Terminal</code>、<code>Layout</code>、<code>views/</code>（Disasm / Registers / Backtrace / Threads / Header / StatusLine）、<code>overlays/</code>（Pager / ProcessPicker / BreakpointEditor / CommandLine）</td><td><code>ui/</code> + main.cpp</td></tr><tr><td><code>ui/batch/</code></td><td><code>BatchRunner</code></td><td>main.cpp のバッチ部</td></tr><tr><td><code>app/</code></td><td><code>main.cpp</code>（引数解析と front-end 選択だけ。100 行程度）</td><td>main.cpp</td></tr><tr><td><code>res/i18n/</code></td><td><code>en.msg</code> など追加言語のカタログ</td><td>新規</td></tr></tbody></table></div>
+<h2 id="h-9">4. モジュール境界と責務</h2>
+<h3 id="h-10">4.1 L0 Platform / Arch</h3>
+<div class="tablewrap"><table><thead><tr><th>モジュール</th><th>責務</th><th>変更点</th></tr></thead><tbody><tr><td><code>Arch</code></td><td>レジスタ、スレッド状態 flavor、ソフトブレイク命令、単一ステップ、HW ブレイク / ウォッチ、CFI 1 ステップ、syscall レジスタ、capstone 設定、命令分類</td><td>§9 の強化（syscall クラス判定、PC 相対ベース名、ベクタレジスタ名、記法切替の可否を追加）</td></tr><tr><td><code>Target</code></td><td>attach / launch / detach、suspend 計上（外部 suspend の取り込み含む）、メモリ R/W、スレッド状態</td><td>エラーを <code>std::string&amp; err</code> から <code>Msg&amp; err</code> へ</td></tr><tr><td><code>ExceptionServer</code></td><td>例外ポート差し替え・復元、受信スレッド</td><td>変更なし</td></tr><tr><td><code>DtraceCatch</code></td><td>libdtrace の観測 / トレース / <code>stop()</code></td><td>エラーを <code>Msg</code> へ（<code>dtrace_errmsg</code> の文字列は引数として渡す）</td></tr><tr><td><code>ProcessList</code></td><td>プロセス列挙と attach 可否</td><td>変更なし</td></tr></tbody></table></div>
+<h3 id="h-11">4.2 L1 Core Engine</h3>
+<p><code>Session</code>（1193 行）は責務ごとに分ける。分けるだけでアルゴリズムは変えない。</p>
+<div class="tablewrap"><table><thead><tr><th>新モジュール</th><th>由来</th><th>責務</th></tr></thead><tbody><tr><td><code>Stepper</code></td><td><code>Session::onException</code> / <code>applyResume</code> / <code>decide</code> / <code>resumeManual</code> / <code>interrupt</code> / <code>setStep</code> / <code>detectWatchHit</code> と <code>singleStepping_</code> ほかの状態</td><td>「止まる / 続ける / ステップ」の状態機械。例外スレッドで動き、停止を <code>RawStop</code> としてエンジンの受信箱へ積んで resume 決定を待つ</td></tr><tr><td><code>TargetSession</code></td><td><code>Session</code> の残り（attach / launch / detach、<code>findEntryPoint</code>、<code>syncHwBreaks</code>、<code>setRegister</code>、<code>describe</code>、<code>symbolName</code>、<code>sourceLineFor</code>、<code>defaultLib</code>）</td><td>1 対象ぶんの部品の所有者。<code>Target</code> / <code>Breakpoints</code> / <code>ImageList</code> / <code>Symbols</code> / <code>Annotations</code> / <code>Stepper</code> を束ねる</td></tr><tr><td><code>DyldNotifier</code></td><td><code>ensureDyldNotifier</code> / <code>dyldNotifyAddr_</code> / <code>stopIsImageLoad_</code></td><td>dyld のイメージ通知関数へ内部ソフトブレイクを置き、命中を「内部停止」として識別する</td></tr><tr><td><code>SyscallMonitor</code></td><td><code>startSyscallWatch</code> / <code>startSyscallStop</code> / <code>onSyscallStopHit</code> / <code>refineSyscallStopThread</code> / <code>firingThreadFor</code> と <code>sc*</code> 状態</td><td><code>:scwatch</code>（集計 / トレース）と <code>:scstop</code>（停止）の排他管理。発火スレッドの確定</td></tr><tr><td><code>SymbolWarmer</code></td><td><code>warmSymbols</code> / <code>stopSymbolWarming</code> と <code>warm*</code></td><td>全イメージのシンボル先読みと進捗</td></tr><tr><td><code>ExitMonitor</code></td><td><code>startExitMonitor</code> / <code>stopExitMonitor</code></td><td>kqueue による終了検知</td></tr><tr><td><code>SyscallDecoder</code> + <code>SyscallTables</code></td><td><code>Session.cpp</code> の無名名前空間（<code>kScalls</code> / <code>kScallNames</code> / <code>kMachTraps</code> / <code>dec*</code> / <code>joinFlags</code>）と <code>syscallAtStop</code></td><td>停止位置の syscall / Mach トラップを構造化して返す（<code>SyscallCall</code>）。表は言語非依存データ</td></tr><tr><td><code>Expression</code></td><td><code>app/Expression</code></td><td>式評価。<code>Session&amp;</code> ではなく狭いインタフェース <code>EvalContext</code>（レジスタ読取、イメージ、シンボル、既定ライブラリ、キャンセル、進捗）に依存。エラーは <code>Msg</code></td></tr><tr><td><code>Backtracer</code></td><td>main.cpp <code>computeBacktrace</code> ほか</td><td>CFI（compact unwind / DWARF）+ 入口・IP=0・スタブのヒューリスティック + スタック走査。結果は <code>Frame</code> の配列（色や文字列整形を含まない）</td></tr><tr><td><code>BranchResolver</code></td><td>main.cpp <code>resolveIndirectTarget</code></td><td>間接 call / jmp の飛び先をレジスタとメモリから解く</td></tr><tr><td><code>MemoryExaminer</code></td><td>main.cpp <code>examineMemory</code> / <code>classicDump</code> / <code>formatValue</code> / <code>parseHexBytes</code></td><td><code>x/NFS</code> の解釈と値の取り出し。結果は <code>ExamineResult</code>（行ごとのアドレス + 値 + 種別）。継続位置も返す</td></tr></tbody></table></div>
+<p>既存の <code>Breakpoints</code> / <code>ImageList</code> / <code>Symbols</code> / <code>Annotations</code> / <code>BreakpointStore</code> / <code>Disassembler</code> / <code>Unwinder</code> / <code>DwarfLines</code> は API をほぼ保ち、エラーの型だけ <code>Msg</code> に変える。</p>
+<h3 id="h-12">4.3 L2 Facade / API</h3>
+<div class="tablewrap"><table><thead><tr><th>モジュール</th><th>由来</th><th>責務</th></tr></thead><tbody><tr><td><code>Debugger</code></td><td>新規</td><td>唯一の公開窓口。コマンド受付、イベント配信、読み取りクエリ。エンジンスレッドを所有する</td></tr><tr><td><code>EngineInbox</code></td><td><code>app/EventQueue</code> のうち <code>Stopped</code> / <code>TargetExited</code> / <code>Progress</code> / <code>JobDone</code></td><td>内部スレッド（例外・終了監視・先読み・dtrace・ジョブ）→ エンジンスレッドの受信箱。UI の語彙（Key / Mouse / Resize）は持たない</td></tr><tr><td><code>StopProcessor</code></td><td>main.cpp <code>onStoppedEvent</code> とメインループの <code>Stopped</code> 分岐</td><td>生の停止を受けて後処理し、公開イベント <code>Stopped{StopInfo}</code> を作る。内部停止（dlopen）は公開せずに処理して再開する</td></tr><tr><td><code>BreakpointService</code></td><td>main.cpp <code>bpAddKind</code> / <code>bpRebuild</code> / <code>toggleBreakAtCursor</code> の中核 / <code>saveBreakpoints</code> / <code>restoreBreakpoints</code> / <code>applyOneBp</code> / <code>applyPendingBreakpoints</code> / <code>doRestart</code> の引き継ぎ部</td><td>ブレイクの追加・削除・有効無効・種別変換・移動・ウォッチ条件変更（失敗時の巻き戻し込み）、HW 同期、永続化、復元、保留（dlopen 待ち）管理</td></tr><tr><td><code>AutoRunner</code></td><td>main.cpp <code>g_autoMask</code> / <code>g_autoSteps</code> / <code>kindAtPc</code> / <code>kAutoMax</code></td><td>auto の継続判定（call / syscall / ret、ブレイク命中、例外、200 万命令上限、中断要求）</td></tr><tr><td><code>JobRunner</code></td><td>main.cpp <code>evalAsync</code> / <code>g_job*</code></td><td>キャンセル可能・進捗つきの非同期ジョブ。同時に 1 本。走行中は他の状態変更コマンドを受けない（現行の <code>g_jobRunning</code> ガードと同じ規則）</td></tr><tr><td><code>CommandInterpreter</code> + <code>CommandSpec</code></td><td>main.cpp <code>runCommand</code> / <code>completeCommand</code> / <code>withBreakId</code> / バッチ専用コマンドの解釈</td><td>テキスト 1 行 → <code>Command</code>（エンジン向け）または <code>UiAction</code>（表示側だけで完結する要求）へ変換。コマンド表は補完・ヘルプ・使用法の唯一の出所</td></tr></tbody></table></div>
+<h3 id="h-13">4.4 L3 Presentation</h3>
+<div class="tablewrap"><table><thead><tr><th>モジュール</th><th>由来</th><th>責務</th></tr></thead><tbody><tr><td><code>TuiApp</code></td><td>main.cpp のメインループ、<code>onKey</code>、<code>onMouse</code>、<code>render</code></td><td>UI スレッドのイベントループ。モード（§7.4）に応じて入力を配り、ビューを描く</td></tr><tr><td><code>UiQueue</code></td><td><code>EventQueue</code> のうち Key / Mouse / Resize + エンジンイベントの受け口</td><td>UI スレッドの受信箱。<code>IEventSink</code> 実装がエンジンイベントをここへ積む</td></tr><tr><td><code>InputDecoder</code></td><td><code>main()</code> の入力スレッドのラムダ</td><td>ESC 列の 40ms 判定、矢印の合成コード化、SGR 1006 マウス、SIGWINCH self-pipe</td></tr><tr><td><code>views/*</code></td><td><code>drawDisassembly</code> / <code>drawRegisters</code> / <code>drawBacktrace</code> / <code>drawThreads</code> / ヘッダ行 / 最下行</td><td>スナップショットを受け取って描くだけ。対象メモリへは触らない</td></tr><tr><td><code>overlays/Pager</code></td><td><code>g_output*</code> / <code>g_x*</code> とオーバレイのキー処理</td><td>出力のページング、<code>x</code> / <code>dis</code> の Enter 継続</td></tr><tr><td><code>overlays/ProcessPicker</code></td><td><code>openPicker</code> 〜 <code>handlePickerKey</code></td><td>絞り込み、縦横スクロール、選択</td></tr><tr><td><code>overlays/BreakpointEditor</code></td><td><code>openBpEditor</code> 〜 <code>handleBpEditorKey</code></td><td>一覧と操作キー。実操作は <code>Debugger</code> へ <code>Command</code> を投げる</td></tr><tr><td><code>overlays/CommandLine</code></td><td><code>g_cmdMode</code> / <code>g_cmdline</code> / <code>renderCmdline</code></td><td>入力行、TAB 補完（候補は <code>CommandInterpreter</code> から）、最下行だけの部分再描画</td></tr><tr><td><code>Terminal</code> / <code>Layout</code></td><td>現行のまま</td><td>raw / ANSI / マウス / セル格子 / 選択コピー / IME 半角化、ペイン計算と表示幅。レイアウト名だけ <code>Msg</code> 化</td></tr><tr><td><code>TextReport</code></td><td>各コマンドの <code>g_output.push_back(...)</code></td><td>構造化結果 + <code>Translator</code> → スタイル付き行。TUI は ANSI に、バッチは素のテキストにする（<code>stripAnsi</code> は不要になる）</td></tr><tr><td><code>BatchRunner</code>（= AI フロントエンド）</td><td><code>runBatch</code> / <code>batchExec</code> / <code>batchStopReport</code> / <code>batchWaitForStop</code> / <code>disToOutput</code></td><td><code>-b -o -s</code> と標準入力。<code>Debugger</code> のイベントを同期的に待つ薄いフロントエンド。AI エージェント（<code>ta2debug</code> スキル）が駆動する正面。安定した機械可読出力と自己記述的コマンド目録を提供する（§7.5）</td></tr></tbody></table></div>
+<h2 id="h-14">5. クラス構成</h2>
+<figure class="diagram"><pre class="mermaid">classDiagram
+  class Debugger {
+    +subscribe(IEventSink) SubscriptionId
+    +unsubscribe(SubscriptionId)
+    +post(Command) RequestId
+    +cancel(RequestId)
+    +interrupt()
+    +state() RunState
+    +stopInfo() StopInfo
+    +disassemble(addr, count, opts) DisasmResult
+    +backtrace(thread, fast) FrameList
+    +registers(thread) RegisterSet
+    +breakpoints() BreakpointList
+  }
+  class IEventSink {
+    &lt;&lt;interface&gt;&gt;
+    +onEvent(DebugEvent)
+  }
+  class CommandInterpreter {
+    +table() CommandSpecList
+    +complete(prefix) StringList
+    +parse(line, ctx) ParseResult
+  }
+  class EngineInbox {
+    +push(InternalEvent)
+    +pop() InternalEvent
+  }
+  class StopProcessor {
+    +onRawStop(RawStop) bool
+  }
+  class BreakpointService {
+    +add(addr, kind, watch) BpResult
+    +remove(id) bool
+    +setEnabled(id, on) bool
+    +rebuild(id, kind, addr, watch) BpResult
+    +save() SaveResult
+    +restoreSaved() RestoreResult
+    +applyPending() int
+    +carryOver() BreakpointList
+  }
+  class AutoRunner {
+    +start(mask)
+    +requestStop()
+    +shouldContinue(RawStop) bool
+  }
+  class JobRunner {
+    +run(job, onDone) JobId
+    +cancel(JobId)
+    +status() JobStatus
+  }
+  class TargetSession {
+    +attach(pid, err) bool
+    +launch(args, err) bool
+    +detach()
+    +syncHwBreaks()
+    +describe(addr) SymbolRef
+  }
+  class Stepper {
+    +cont()
+    +stepInto()
+    +stepOver()
+    +interrupt()
+    -onException(thread, exc, codes) kern_return_t
+    -applyResume(decision, thread)
+  }
+  class DyldNotifier {
+    +ensure()
+    +isNotifierAddr(addr) bool
+  }
+  class SyscallMonitor {
+    +startWatch(filter, err) bool
+    +startStop(filter, err) bool
+    +stop()
+    +refineStopThread()
+  }
+  class Arch {
+    &lt;&lt;abstract&gt;&gt;
+    +pc(state) uint64
+    +softBreakBytes() bytes
+    +setSingleStep(state, on)
+    +stepUnwind(enc, start, in, out, read) bool
+    +decodeSyscallNumber(state) SyscallNo
+  }
+  class ArchX86_64
+  class ArchArm64
+  class Target
+  class Breakpoints
+  class TuiApp
+  class BatchRunner
+  class Translator {
+    +tr(Msg) string
+    +setLanguage(code)
+  }
+  Debugger o-- EngineInbox
+  Debugger o-- StopProcessor
+  Debugger o-- BreakpointService
+  Debugger o-- AutoRunner
+  Debugger o-- JobRunner
+  Debugger o-- TargetSession
+  Debugger ..&gt; IEventSink : イベント配信
+  StopProcessor --&gt; BreakpointService
+  StopProcessor --&gt; AutoRunner
+  StopProcessor --&gt; DyldNotifier
+  StopProcessor --&gt; SyscallMonitor
+  TargetSession o-- Stepper
+  TargetSession o-- Target
+  TargetSession o-- Breakpoints
+  TargetSession o-- DyldNotifier
+  TargetSession o-- SyscallMonitor
+  Stepper --&gt; EngineInbox : RawStop
+  Stepper --&gt; Breakpoints
+  Target o-- Arch
+  Arch &lt;|-- ArchX86_64
+  Arch &lt;|-- ArchArm64
+  TuiApp ..|&gt; IEventSink
+  BatchRunner ..|&gt; IEventSink
+  TuiApp --&gt; Debugger
+  TuiApp --&gt; CommandInterpreter
+  TuiApp --&gt; Translator
+  BatchRunner --&gt; Debugger
+  BatchRunner --&gt; CommandInterpreter
+  BatchRunner --&gt; Translator
+  CommandInterpreter --&gt; Debugger</pre></figure>
+<h2 id="h-15">6. ヘッドレス API 定義</h2>
+<p>名前空間は <code>ta2::engine</code>。以下は擬似シグネチャで、型名は実装時に微調整してよいが、形（コマンドは非同期投入、結果はイベント、参照は同期クエリ）は固定する。</p>
+<h3 id="h-16">6.1 ファサード</h3>
+<pre class="code"><code>enum class RunState { Idle, Running, Stopped };
+using RequestId = uint64_t;
+using ThreadId  = uint32_t;            // thread_act_t を UI に見せるための別名。0 = 停止スレッド
+
+struct EngineOptions {                 // 現行の g_interactive 分岐を設定として表す
+  bool warmSymbols            = true;  // バッチは false（Session::setWarmingEnabled(false) 相当）
+  bool dyldNotifier           = true;  // バッチは false（現行は TUI のみ ensureDyldNotifier）
+  bool autoRestoreBreakpoints = true;  // バッチは false（現行は g_restorePending が TUI のみ）
+};
+
+class IEventSink {                     // エンジンスレッドから呼ばれる。積むだけですぐ戻ること
+public:
+  virtual ~IEventSink() = default;
+  virtual void onEvent(const DebugEvent&amp; ev) = 0;
+};
+
+class Debugger {
+public:
+  explicit Debugger(EngineOptions opts = {});
+  ~Debugger();                         // detach してから内部スレッドを止める
+
+  // ---- イベント購読 ----
+  SubscriptionId subscribe(IEventSink* sink);
+  void unsubscribe(SubscriptionId id);
+
+  // ---- コマンド（非同期。結果は CommandFinished{RequestId, ...} で届く）----
+  RequestId post(Command cmd);
+  void cancel(RequestId id);           // 走行中ジョブ（シンボル探索）を中止。現行の ESC
+  void interrupt();                    // 現行の Ctrl+C。auto 中なら auto 中断、Running なら停止、Stopped なら無視
+
+  // ---- クエリ（同期・読み取り専用・どのスレッドからでも可）----
+  RunState state() const;
+  pid_t pid() const;
+  ArchInfo arch() const;               // 名前、レジスタ名一覧、HW 本数、記法切替の可否など
+  StopInfo stopInfo() const;           // 直近の停止（Stopped 以外では空）
+  std::vector&lt;ThreadInfo&gt; threads() const;
+  RegisterSet registers(ThreadId t = 0) const;
+  std::vector&lt;VecRegValue&gt; vectorRegisters(ThreadId t = 0) const;
+  std::vector&lt;RegValue&gt; debugRegisters(ThreadId t = 0) const;
+  DisasmResult disassemble(uint64_t addr, int count, DisasmOptions o, ThreadId t = 0) const;
+  uint64_t disasmBack(uint64_t addr, int insns) const;       // 上スクロール用（現行 disasmBack / prevInsnAddr）
+  std::vector&lt;Frame&gt; backtrace(ThreadId t = 0, bool fast = false) const;
+  MemoryBlock readMemory(uint64_t addr, size_t len) const;   // ブレイク命令は元バイトで見せる
+  ExamineResult examine(const ExamineSpec&amp; spec, uint64_t addr) const;
+  SymbolRef describe(uint64_t addr) const;                   // image / symbol / offset
+  bool sourceLine(uint64_t addr, SourceLoc&amp; out) const;
+  std::vector&lt;BreakpointInfo&gt; breakpoints() const;
+  PendingInfo pendingBreakpoints() const;                    // dlopen 待ちの件数
+  std::vector&lt;ImageInfo&gt; images() const;
+  std::vector&lt;Segment&gt; segments(const std::string&amp; image) const;
+  SymbolPage symbols(const std::string&amp; image, const std::string&amp; filter, size_t limit) const;
+  std::vector&lt;Annot&gt; annotations(const std::string&amp; image, std::string* path = nullptr) const;
+  SyscallWatchStatus syscallWatch() const;                   // 稼働 / フィルタ / 件数 / 集計 or トレース行
+  JobStatus job() const;                                     // 探索の done / total
+  WarmStatus symbolWarming() const;
+  static std::vector&lt;ProcessInfo&gt; processes();               // ピッカー用
+  static SyscallNameList syscallNames(const std::string&amp; filter, Msg&amp; err);
+};</code></pre>
+<h3 id="h-17">6.2 コマンド</h3>
+<p><code>Command</code> は構造体の <code>std::variant</code>。アドレスを取るものは数値でも式でも渡せる（式ならエンジン側で評価する。重い探索になればジョブ扱いになり、進捗イベントが出て中止できる）。</p>
+<pre class="code"><code>struct AddrSpec { std::variant&lt;uint64_t, std::string /*式*/&gt; v; };
+enum class BpKind { Soft, HwExec, Watch };
+struct WatchParams { int size = 8; bool onRead = false; bool onWrite = true; };
+struct BpRef { std::variant&lt;int /*#id*/, AddrSpec&gt; v; };
+
+namespace cmd {
+  struct Attach   { pid_t pid; };
+  struct Launch   { std::vector&lt;std::string&gt; args; };
+  struct Restart  {};                              // 同じ引数で起動し直し、ブレイクを引き継ぐ
+  struct Detach   {};
+  struct Continue {};  struct StepInto {};  struct StepOver {};
+  struct Auto     { unsigned mask; };              // 1=call 2=syscall 4=ret
+  struct AddBreakpoint      { AddrSpec at; BpKind kind; WatchParams watch; };
+  struct RemoveBreakpoint   { BpRef ref; };
+  struct ToggleEnabled      { BpRef ref; };
+  struct ToggleBreakpointAt { uint64_t addr; };    // b キー / クリック。あれば解除、無ければソフトで設定
+  struct RebuildBreakpoint  { int id; BpKind kind; uint64_t addr; WatchParams watch; }; // 失敗時は元に戻す
+  struct SaveBreakpoints    {};
+  struct SetRegister  { std::string name; AddrSpec value; };
+  struct WriteMemory  { AddrSpec at; std::vector&lt;uint8_t&gt; bytes; };
+  struct FillMemory   { AddrSpec at; uint8_t value; uint64_t size; };
+  struct DumpToFile   { AddrSpec at; uint64_t size; std::string path; };
+  struct LoadFromFile { AddrSpec at; uint64_t size; std::string path; };
+  struct SetAnnotation    { AddrSpec at; std::optional&lt;std::string&gt; name, memo; };
+  struct RemoveAnnotation { AddrSpec at; };
+  struct SetDefaultLib    { std::string name; };   // 空で解除
+  struct SyscallWatch     { std::string filter; }; // "off" 相当は SyscallOff
+  struct SyscallStop      { std::string filter; };
+  struct SyscallOff       {};
+  struct Evaluate         { std::string expr; };   // :p / :sym / :dis の移動先 / :x の開始アドレス
+  struct SetDisasmSyntax  { bool intel; };
+}
+using Command = std::variant&lt;cmd::Attach, cmd::Launch, /* ... 上の全部 ... */ cmd::SetDisasmSyntax&gt;;</code></pre>
+<h3 id="h-18">6.3 スナップショット型（抜粋）</h3>
+<p>表示言語に依存する文字列は含めない。シンボル名、レジスタ名、syscall 名、<code>EXC_*</code> などの識別子はそのまま持つ。</p>
+<pre class="code"><code>enum class StopKind { Entry, Breakpoint, Watchpoint, Step, Interrupt, Exception, SyscallCatch, Auto, Unknown };
+enum class AutoStop { None, Call, Syscall, Return, Limit, Interrupted };
+
+struct StopInfo {
+  StopKind kind;  uint64_t pc;  ThreadId thread;
+  SymbolRef where;                         // describe(pc) 相当
+  int bpId = -1;  uint64_t bpHits = 0;  bool bpHw = false;
+  int watchId = -1;  uint64_t watchAddr = 0;  uint64_t watchHits = 0;
+  int exception = 0;  int64_t code0 = 0;  uint64_t faultAddr = 0;   // EXC_* と code
+  std::string syscallCaught;               // :scstop で捕捉した名前
+  std::optional&lt;SyscallCall&gt; syscall;      // PC が syscall / svc のときの呼び出し内容
+  AutoStop autoStop = AutoStop::None;  long autoSteps = 0;
+  std::vector&lt;Msg&gt; notes;                  // 復元件数など（現行は "／" 連結で g_message に足している）
+};
+
+struct DisasmLine {
+  uint64_t addr;  std::string mnemonic, opStr;  InsnKind kind;
+  bool isPc;  BpMark bp;                    // None / Soft / Hw / Watch と enabled
+  std::optional&lt;std::string&gt; funcHeader;    // 関数先頭なら名前
+  std::optional&lt;SourceLoc&gt; source;          // DWARF 行が変わる位置
+  std::optional&lt;BranchTarget&gt; target;       // 直値 / 間接解決の飛び先とシンボル、スタブ先
+  std::string memo;                         // ユーザ注釈のメモ
+};
+
+struct Frame { int index; uint64_t pc; SymbolRef sym; FrameOrigin origin; };  // CFI / FP / Entry / StackScan
+struct SyscallCall { bool mach; uint64_t number; std::string name; std::vector&lt;SyscallArg&gt; args; std::string text; };
+struct CommandResult {
+  bool ok;  Msg message;                    // 現行の g_message に相当（空可）
+  std::optional&lt;uint64_t&gt; value;            // 評価結果・設定したアドレスなど
+  std::optional&lt;int&gt; breakpointId;
+  ResultPayload payload;                    // ExamineResult / SymbolPage など（あれば）
+};</code></pre>
+<h3 id="h-19">6.4 CommandInterpreter</h3>
+<pre class="code"><code>struct CommandSpec {
+  const char* name;                      // "b"
+  std::vector&lt;const char*&gt; aliases;      // {"bedit"} など
+  CommandGroup group;                    // ヘルプの見出し
+  MsgId usage, help;                     // 使い方 1 行、ヘルプ本文
+  unsigned flags;                        // NeedsAttach / NeedsStopped / BatchOnly / UiOnly / TakesArg
+};
+
+struct UiAction {                        // 表示側だけで完結する要求（エンジンは関与しない）
+  enum Kind { OpenProcessPicker, OpenBreakpointEditor, ShowHelp, ShowOutput, GotoDisasm, FollowPc,
+              SetMouse, ToggleMouse, SetBaseRelative, WaitForStop, PrintBacktrace, PrintDisasm, Quit } kind;
+  /* 付随データ */
+};
+
+class CommandInterpreter {
+public:
+  explicit CommandInterpreter(Debugger&amp; dbg);
+  static const std::vector&lt;CommandSpec&gt;&amp; table();
+  std::vector&lt;std::string&gt; complete(const std::string&amp; prefix) const;
+  // 1 行を解釈。エンジン向けは post して RequestId を、表示向けは UiAction を、誤りは Msg を返す。
+  ParseResult execute(const std::string&amp; line, FrontEndKind fe);
+};</code></pre>
+<p><code>:be</code>、<code>:mouse</code>、<code>:baseoff</code>、<code>:help</code>、引数なしの <code>:attach</code>（ピッカー）、TUI の <code>:dis</code>（ペイン移動）は <code>UiAction</code> になる。<code>:dis</code> はバッチでは <code>PrintDisasm</code>（テキスト出力）になる。この差は現行どおりで、<code>FrontEndKind</code> で振り分ける。</p>
+<h2 id="h-20">7. イベント / コマンドモデル</h2>
+<h3 id="h-21">7.1 イベント</h3>
+<p>現行の <code>Event</code> を 2 つに割る。</p>
+<ul><li><strong>エンジン内部</strong>（<code>EngineInbox</code>）: <code>RawStop</code> / <code>TargetExited</code> / <code>WarmProgress</code> / <code>JobProgress</code> / <code>JobDone</code> / <code>SyscallStopHit</code> / <code>CommandPosted</code>。内部スレッドが積み、エンジンスレッドだけが取り出す。</li><li><strong>公開</strong>（<code>DebugEvent</code>）: 下表。<code>IEventSink::onEvent</code> で届く。</li><li><strong>UI 専用</strong>（<code>UiQueue</code>）: <code>Key</code> / <code>Mouse</code> / <code>Resize</code> と、<code>IEventSink</code> が転記した <code>DebugEvent</code>。</li></ul>
+<div class="tablewrap"><table><thead><tr><th><code>DebugEvent</code></th><th>中身</th><th>現行の対応</th></tr></thead><tbody><tr><td><code>StateChanged</code></td><td>新しい <code>RunState</code>、pid</td><td><code>g_state = ...</code> の各所</td></tr><tr><td><code>Stopped</code></td><td><code>StopInfo</code></td><td><code>Event::Stopped</code> + <code>onStoppedEvent()</code> が true を返したとき</td></tr><tr><td><code>TargetExited</code></td><td>なし</td><td><code>Event::TargetExited</code></td></tr><tr><td><code>BreakpointsChanged</code></td><td>なし（一覧はクエリで取る）</td><td>明示イベントなし（毎回 <code>render</code>）</td></tr><tr><td><code>ImagesChanged</code></td><td>追加 / 削除の件数、今回装着できた保留ブレイク数</td><td>dlopen 透過処理（現行は無言）</td></tr><tr><td><code>Progress</code></td><td>種別（先読み / 探索）、done、total</td><td><code>Event::Progress</code></td></tr><tr><td><code>CommandFinished</code></td><td><code>RequestId</code>、<code>CommandResult</code></td><td><code>Event::JobDone</code> + <code>g_jobApply</code>、および同期実行の直後</td></tr><tr><td><code>Notice</code></td><td><code>Msg</code></td><td>エンジン起点の通知（例: auto 中断）</td></tr></tbody></table></div>
+<p>配信規則:</p>
+<ul><li><code>onEvent</code> はエンジンスレッドから呼ぶ。購読側は自分のキューへ積んで戻るだけにする（TUI は <code>UiQueue::push</code>、GUI はメインスレッドへディスパッチ）。</li><li>auto の途中経過や dlopen の内部停止は <code>Stopped</code> として公開しない。UI から見ると <code>Running</code> のままである（現行の「止まって見えない」を保つ）。</li><li><code>Progress</code> は現行と同じ 80ms 間引きを送信側で行う。</li></ul>
+<h3 id="h-22">7.2 スレッド境界</h3>
+<div class="tablewrap"><table><thead><tr><th>スレッド</th><th>所有するもの</th><th>触ってよいもの</th></tr></thead><tbody><tr><td>UI（TUI のメイン）</td><td>表示状態（カーソル、スクロール、モード、選択）、<code>Terminal</code></td><td><code>Debugger</code> の公開 API のみ</td></tr><tr><td>エンジン（新設、<code>Debugger</code> が所有）</td><td>対象の論理状態（ブレイク一覧、保留、auto、<code>RunState</code>）、イメージ / 注釈の更新</td><td>core の全部品</td></tr><tr><td>例外サーバ</td><td><code>Stepper</code> の例外処理中の状態</td><td><code>Target</code> / <code>Breakpoints</code> の物理層。エンジンとは「停止を積む → resume 決定を待つ」で同期</td></tr><tr><td>終了監視 / 先読み / dtrace / ジョブ</td><td>それぞれの作業</td><td><code>EngineInbox::push</code> のみ（+ 各部品の既存 mutex 内の処理）</td></tr></tbody></table></div>
+<p>同期の取り決め:</p>
+<ol><li><strong>状態変更は全部エンジンスレッド。</strong> 現行で「メインスレッドの境界で行う」と決めている処理（<code>refreshImages</code>、<code>refreshAnnotations</code>、<code>refineSyscallStopThread</code>、ブレイク操作）をそのままエンジンスレッドへ移す。直列化の性質は変わらない。</li><li>**クエリは <code>std::shared_mutex</code>。** エンジンスレッドは状態を変える区間で排他ロック、クエリは共有ロックを取る。対象が走行中でも読める（非ストップ型なので <code>:x</code> や <code>:img</code> は Running でも有効。現行どおり）。</li><li><strong>重いものはジョブへ。</strong> 全イメージ横断のシンボル探索は <code>JobRunner</code>。クエリが遅くなり得るもの（初回の <code>symbols()</code>、深い <code>backtrace()</code>）は UI 側がワーカから呼べるよう、クエリ API をスレッドセーフにしておく。TUI は当面 UI スレッドから直接呼び（現行と同じ負荷）、GUI や将来の TUI 改善でワーカ化できる。</li><li><strong>例外スレッドの待ち合わせは現行のまま。</strong> <code>resumeCv_</code> で決定を待つ。手動停止（Ctrl+C、dtrace <code>stop()</code>、エントリ不明時の launch）は例外スレッドが待っていないので、エンジンスレッドが <code>applyResume</code> を実行する（現行 <code>resumeManual</code>）。</li><li><strong>終了順序。</strong> <code>~Debugger</code> は「ジョブ中止 → dtrace 停止 → 先読み停止 → detach（例外スレッドへ <code>Resume::Detach</code> を渡して ack を待つ）→ エンジンスレッド join」。現行 <code>Session::detach</code> の順序を守る。</li></ol>
+<p>移行の途中段階として、エンジンスレッドを作らず UI スレッドが <code>Debugger::pump()</code> を呼んで受信箱を処理する「インライン実行」構成を許す（フェーズ 4）。API の形は同じなので、フェーズ 5 でスレッドを分けても Presentation 側は変わらない。バッチは最後までインライン実行でよい。</p>
+<h3 id="h-23">7.3 シーケンス</h3>
+<p>ブレイク命中から画面更新まで:</p>
+<figure class="diagram"><pre class="mermaid">sequenceDiagram
+  participant K as カーネル / 対象
+  participant X as 例外スレッド (Stepper)
+  participant E as エンジンスレッド (Debugger)
+  participant U as UI スレッド (TuiApp)
+  K-&gt;&gt;X: EXC_BREAKPOINT
+  X-&gt;&gt;X: task suspend / PC を命令先頭へ戻す / hits を加算
+  X-&gt;&gt;E: EngineInbox.push(RawStop)
+  Note over X: resumeCv で決定待ち
+  E-&gt;&gt;E: StopProcessor: イメージと注釈を更新 / 先読み起動 / 通知フック設置
+  E-&gt;&gt;E: AutoRunner.shouldContinue は false
+  E-&gt;&gt;E: StopInfo を作る (where / bp / syscall / notes)
+  E--&gt;&gt;U: onEvent(StateChanged Stopped) / onEvent(Stopped)
+  U-&gt;&gt;U: 表示状態を初期化 (PC 追従 / 停止スレッド選択)
+  U-&gt;&gt;E: disassemble / registers / backtrace / threads
+  E--&gt;&gt;U: スナップショット
+  U-&gt;&gt;U: Translator.tr(Msg) して描画
+  U-&gt;&gt;E: post(Continue)
+  E-&gt;&gt;X: decide(Cont)
+  X-&gt;&gt;K: ブレイクをまたいで resume
+  E--&gt;&gt;U: onEvent(StateChanged Running)</pre></figure>
+<p>dlopen の透過捕捉と保留ブレイクの自動装着:</p>
+<figure class="diagram"><pre class="mermaid">sequenceDiagram
+  participant K as 対象 (dyld)
+  participant X as 例外スレッド (Stepper)
+  participant E as エンジンスレッド
+  participant B as BreakpointService
+  participant U as UI スレッド
+  Note over E,B: 起動時: 保存レコードのうち未ロード分は pending に保留
+  K-&gt;&gt;X: dlopen が通知関数に到達 (内部ソフトブレイク命中)
+  X-&gt;&gt;X: DyldNotifier.isNotifierAddr は true / hits は数えない
+  X-&gt;&gt;E: push(RawStop imageLoad)
+  E-&gt;&gt;E: ImageList.refreshIfChanged
+  E-&gt;&gt;B: applyPending()
+  B-&gt;&gt;B: UUID 一致のイメージへ unslid + slide で装着 / HW なら syncHwBreaks
+  B--&gt;&gt;E: 装着件数
+  E-&gt;&gt;X: decide(Cont)
+  X-&gt;&gt;K: resume (ロードしたコードの実行前)
+  E--&gt;&gt;U: onEvent(ImagesChanged) のみ (Stopped は出さない)
+  Note over U: 画面は Running のまま
+  K-&gt;&gt;X: 新規ライブラリ内のブレイク命中
+  X-&gt;&gt;E: push(RawStop)
+  E--&gt;&gt;U: onEvent(Stopped)</pre></figure>
+<p>非同期シンボル探索（<code>:b &lt;シンボル&gt;</code>）:</p>
+<figure class="diagram"><pre class="mermaid">sequenceDiagram
+  participant U as UI スレッド
+  participant C as CommandInterpreter
+  participant E as エンジンスレッド
+  participant J as ジョブスレッド (JobRunner)
+  U-&gt;&gt;C: execute("b foo")
+  C-&gt;&gt;E: post(AddBreakpoint expr=foo)
+  C--&gt;&gt;U: RequestId
+  E-&gt;&gt;E: イメージと注釈を更新 (ジョブ開始前の境界)
+  E-&gt;&gt;J: run(Expression.eval)
+  loop 既定ライブラリに無く全イメージを探索
+    J-&gt;&gt;E: push(JobProgress done total)
+    E--&gt;&gt;U: onEvent(Progress)
+    U-&gt;&gt;U: ヘッダに探索 n/m を表示 (操作は受け付け続ける)
+  end
+  alt ESC
+    U-&gt;&gt;E: cancel(RequestId)
+    E-&gt;&gt;J: cancel フラグ
+    J-&gt;&gt;E: push(JobDone 中止)
+    E--&gt;&gt;U: onEvent(CommandFinished ok=false, Msg job.cancelled)
+  else 解決
+    J-&gt;&gt;E: push(JobDone addr)
+    E-&gt;&gt;E: BreakpointService.add(addr, Soft)
+    E--&gt;&gt;U: onEvent(BreakpointsChanged) / onEvent(CommandFinished ok, Msg bp.set)
+  end</pre></figure>
+<h3 id="h-24">7.4 状態</h3>
+<p>エンジンの実行状態（公開されるのは Idle / Running / Stopped の 3 つ。Launching / AutoStepping / InternalStop は UI からは Running に見える内部状態）:</p>
+<figure class="diagram"><pre class="mermaid">stateDiagram-v2
+  [*] --&gt; Idle
+  Idle --&gt; Running: Attach 成功
+  Idle --&gt; Launching: Launch
+  Launching --&gt; Stopped: エントリの一時ブレイク命中
+  Running --&gt; Stopped: ブレイク / ウォッチ / 例外 / interrupt / scstop
+  Stopped --&gt; Running: Continue / StepInto / StepOver
+  Stopped --&gt; AutoStepping: Auto
+  AutoStepping --&gt; AutoStepping: 対象外の命令は自動で StepInto
+  AutoStepping --&gt; Stopped: call syscall ret 命中 / BP / 例外 / 上限 / interrupt
+  Running --&gt; InternalStop: dyld 通知フック命中
+  InternalStop --&gt; Running: イメージ更新と保留 BP 装着の後に自動再開
+  Running --&gt; Idle: TargetExited / Detach
+  Stopped --&gt; Idle: Detach / TargetExited
+  Stopped --&gt; Launching: Restart
+  Running --&gt; Launching: Restart
+  Idle --&gt; [*]: Quit</pre></figure>
+<p>TUI の入力モード（現行の <code>g_pickerMode</code> / <code>g_bpEditMode</code> / <code>!g_output.empty()</code> / <code>g_cmdMode</code> / <code>g_bpInput</code> の優先順をそのまま状態にしたもの）:</p>
+<figure class="diagram"><pre class="mermaid">stateDiagram-v2
+  [*] --&gt; Main
+  Main --&gt; CommandLine: コロン
+  CommandLine --&gt; Main: Enter で実行 / ESC
+  Main --&gt; Pager: 出力のあるコマンド
+  Pager --&gt; Main: ESC / q
+  Pager --&gt; CommandLine: コロン
+  Pager --&gt; Pager: 矢印 j k Space b g G / Enter で x と dis の続き
+  Main --&gt; ProcessPicker: attach を引数なしで実行
+  ProcessPicker --&gt; Main: Enter で attach / ESC
+  Main --&gt; BreakpointEditor: e キー / be
+  BreakpointEditor --&gt; Main: ESC / q
+  BreakpointEditor --&gt; AddressInput: a
+  AddressInput --&gt; BreakpointEditor: Enter で移動 / ESC</pre></figure>
+<p>ジョブ走行中（探索の進捗表示中）はモードではなくフラグで、どのモードでも ESC が最優先で中止に割り当たる（現行 <code>onKey</code> 冒頭と同じ）。Main モードのキーは <code>RunState</code> が Stopped のときだけ有効なものが多い（§10）。</p>
+<h3 id="h-24b">7.5 AI エージェント（Skill）からの利用（要件 5）</h3>
+<p>AI フロントエンド（<code>ta2ai</code> ＝ 現行 <code>-b -o</code> バッチの発展）は、人間の対話を介さず AI エージェントが <code>ta2debug</code> スキル経由で駆動する正面である。TUI / GUI と同じヘッドレス <code>Debugger</code> を使い、<code>CommandInterpreter</code> で 1 行コマンドを <code>Command</code> に変換して <code>post</code> → <code>DebugEvent</code> を同期的に待つだけの薄いアダプタにする。設計上、AI にとっての「使いやすさ」を次の性質で担保する。</p>
+<ul>
+<li><strong>非対話で完結。</strong> 対話プロンプトやカーソル/ペインに依存しない。コマンド列（<code>-o "cmd"</code> 複数、またはスクリプト <code>-s</code>、標準入力）を与えれば、各コマンドの結果を決定的な順序で出力して終わる。確認待ちで止まらない。</li>
+<li><strong>安定した機械可読出力。</strong> 出力は「構造を示す固定トークン（翻訳しない。<code>stopped @</code>、<code>backtrace:</code>、<code>src:</code>、<code>[bp #N, Mhit]</code> 等）＋本文」で構成する（§8.7）。既定ロケールは日本語のままなので、既存スクリプトと現行 <code>ta2debug</code> スキルの期待値は不変。将来、機械可読性をさらに上げる<strong>任意の構造化出力モード（<code>DebugEvent</code> / スナップショットを 1 行 1 レコードの JSON で吐く）</strong>を同じファサードの上に追加できる余地を残す（本設計の必須範囲外。追加時も TUI/GUI/エンジンは不変）。</li>
+<li><strong>自己記述的なコマンド目録。</strong> コマンド表 <code>CommandSpec</code>（補完・ヘルプ・使用法の唯一の出所、§4.3）を機械可読に書き出せるようにし、スキルやエージェントがコマンド名・引数・用法を動的に把握できる（<code>--help</code> の素テキストに加え、目録そのものを取り出す口を用意）。4 重管理をやめた単一表なのでドリフトしない。</li>
+<li><strong>安定したエラー識別子。</strong> エラーは MsgId（§8.2）で識別できる。表示文は i18n で変わり得るが、<code>err.expr.div_zero</code> のような<strong>ID は言語やバージョンを跨いで安定</strong>なので、エージェントは表示文の文字列一致ではなく ID で分岐できる（構造化出力モードでは ID を添える）。</li>
+<li><strong>終了コードと到達可否。</strong> コマンド列の成否・対象の終了・アタッチ可否などは終了コードと明示トークンで判別できるようにする（現行バッチの挙動を踏襲しつつ整理）。</li>
+<li><strong>決定性。</strong> 可変部（アドレス、pid、時刻）以外は実行ごとに同じ出力になる。スキル側はアドレス等を正規化して比較できる（§11 P0 の基準出力と同じ考え方）。</li>
+</ul>
+<p>要するに、AI 向けの「正しさ」は engine の構造化イベント／スナップショットと安定 ID に由来し、<code>ta2ai</code> はそれをテキスト（または将来 JSON）へ写すだけにする。TUI が画面に、GUI がウィジェットに写すのと対等な、第 3 のレンダラと位置づける。</p>
+<h2 id="h-25">8. i18n 設計</h2>
+<h3 id="h-26">8.1 方針</h3>
+<ol><li><strong>core / engine は文を作らない。</strong> 返すのは <code>Msg</code>（ID + 名前付き引数）。<code>std::string&amp; err</code> は <code>Msg&amp; err</code> に、<code>Session::stopReason()</code> のような整形関数は構造化データ（<code>StopInfo</code>）に置き換える。</li><li><strong>翻訳は Presentation だけ。</strong> <code>Translator::tr(const Msg&amp;)</code> を呼ぶのは TUI / バッチ / GUI。UI は <code>Msg</code> のまま保持し、描画のたびに翻訳する（言語を実行中に切り替えても即反映される）。</li><li><strong>既定は日本語、どのキーにも必ず日本語文がある。</strong> 追加言語に抜けがあっても日本語へフォールバックするので、表示が欠けることはない。</li><li><strong>翻訳しないものを決める。</strong> シンボル名、レジスタ名、syscall / Mach トラップ名、<code>O_RDONLY</code> などのフラグ名、<code>EXC_BAD_ACCESS</code> / <code>KERN_INVALID_ADDRESS</code> などの識別子、<code>strerror</code> / <code>mach_error_string</code> / <code>dtrace_errmsg</code> の返す文字列は対象外。後者 3 つは <code>{detail}</code> 引数としてそのまま差し込む。</li><li><strong>依存を足さない。</strong> gettext / ICU は使わない。カタログは自前の行形式で、パーサは 100 行程度。</li></ol>
+<h3 id="h-27">8.2 <code>Msg</code> と ID</h3>
+<pre class="code"><code>// inc/base/Msg.h
+enum class MsgId : uint16_t {
+#define TA2_MSG(id, key, ja) id,
+#include "base/Messages.def"
+#undef TA2_MSG
+  Count_
+};
+
+struct MsgArg {
+  std::string name;                                   // "addr" "n" "name" ...
+  std::variant&lt;int64_t, uint64_t, std::string, std::shared_ptr&lt;Msg&gt;&gt; value;
+  bool hex = false;                                   // uint64_t を 0x.. で出すか
+};
+
+struct Msg {
+  MsgId id = MsgId::None;
+  std::vector&lt;MsgArg&gt; args;
+  bool empty() const { return id == MsgId::None; }
+  static Msg of(MsgId id);
+  Msg&amp; hex(const char* name, uint64_t v);
+  Msg&amp; num(const char* name, int64_t v);
+  Msg&amp; str(const char* name, std::string v);
+  Msg&amp; sub(const char* name, Msg m);                  // 入れ子（式エラー + 文字位置など）
+};</code></pre>
+<p><code>Messages.def</code> が唯一の出所で、ID、キー、既定の日本語文を 1 行で定義する。ID は enum なので、存在しないメッセージを参照するとコンパイルエラーになる。</p>
+<pre class="code"><code>// inc/base/Messages.def（抜粋。右端が既定の日本語文）
+TA2_MSG(None,              "",                      "")
+TA2_MSG(BpSet,             "bp.set",                "#{id} ブレイク設定 {addr}")
+TA2_MSG(BpSetFailed,       "bp.set_failed",         "ブレイク設定失敗（メモリに書けない？）")
+TA2_MSG(BpNoSuchAtAddr,    "bp.none_at_addr",       "そのアドレスにブレイクは無い")
+TA2_MSG(BpSaved,           "bp.saved",              "ブレイク {n} 件を保存 → {path}  （次回 :run 時に自動復元）")
+TA2_MSG(BpRestored,        "bp.restored",           "保存ブレイク {n} 件を復元")
+TA2_MSG(BpPendingLeft,     "bp.pending_left",       "うち {n} 件は未ロード（dlopen 後に自動復元）")
+TA2_MSG(ErrExpr,           "err.expr",              "式エラー: {detail}")
+TA2_MSG(ErrExprAtPos,      "err.expr.at_pos",       "{detail} ({pos} 文字目)")
+TA2_MSG(ErrExprDivZero,    "err.expr.div_zero",     "0 で割れない")
+TA2_MSG(ErrExprSymMissing, "err.expr.sym_missing",  "シンボル '{name}' が見つからない（{where} ほか全イメージを探した。ライブラリ名!{name} も試せます）")
+TA2_MSG(ErrTaskForPid,     "err.target.task_for_pid", "task_for_pid 失敗: {detail}（root 実行か、SIP 無効か、対象が自作バイナリかを確認）")
+TA2_MSG(StopExcBadAccess,  "stop.exc.bad_access",   "EXC_BAD_ACCESS（不正メモリ参照）")
+TA2_MSG(StopSyscallCatch,  "stop.syscall_catch",    "syscall キャッチ: {name}")
+TA2_MSG(StopCrashHint,     "stop.crash_hint",       "⚠ {reason}  — c で対象を通常終了（シグナルを本来のハンドラへ通す）")
+TA2_MSG(AutoStopped,       "auto.stopped",          "auto → {kind} で停止（{n} 命令）")
+TA2_MSG(UiRunningHint,     "ui.running_hint",       "(実行中。ブレイクに当たると停止します。Ctrl+C で割り込み停止)")
+TA2_MSG(LayoutStandard,    "layout.name.standard",  "標準")
+TA2_MSG(HelpCmdB,          "help.cmd.b",            "ソフトブレイク（INT3/BRK）")</code></pre>
+<p>キー体系は <code>&lt;領域&gt;.&lt;対象&gt;[.&lt;詳細&gt;]</code>。</p>
+<div class="tablewrap"><table><thead><tr><th>領域</th><th>用途</th><th>生成元の層</th></tr></thead><tbody><tr><td><code>err.*</code></td><td>失敗理由（<code>err.expr.*</code> / <code>err.target.*</code> / <code>err.dtrace.*</code> / <code>err.ann.*</code> / <code>err.store.*</code>）</td><td>L0 / L1</td></tr><tr><td><code>stop.*</code> / <code>auto.*</code></td><td>停止理由、auto の停止種別</td><td>L1 / L2</td></tr><tr><td><code>bp.*</code> / <code>ann.*</code> / <code>sc.*</code> / <code>mem.*</code> / <code>reg.*</code> / <code>tgt.*</code> / <code>job.*</code></td><td>コマンド結果の通知</td><td>L2</td></tr><tr><td><code>cmd.*</code></td><td>使い方（usage）、不明コマンド、補完候補</td><td>L2（ID を返すだけ）</td></tr><tr><td><code>help.*</code></td><td>ヘルプ本文（<code>help.key.*</code> / <code>help.cmd.*</code> / <code>help.section.*</code> / <code>help.note.*</code>）</td><td>L3</td></tr><tr><td><code>ui.*</code> / <code>layout.*</code> / <code>picker.*</code> / <code>bpedit.*</code> / <code>pager.*</code> / <code>batch.*</code></td><td>画面の固定文言、ペイン見出し、フッタ</td><td>L3</td></tr></tbody></table></div>
+<h3 id="h-28">8.3 カタログ</h3>
+<div class="tablewrap"><table><thead><tr><th>項目</th><th>設計</th></tr></thead><tbody><tr><td>既定言語（日本語）</td><td><code>Messages.def</code> の第 3 引数。バイナリに常に入る</td></tr><tr><td>追加言語の置き場所</td><td>リポジトリの <code>res/i18n/&lt;lang&gt;.msg</code>（例 <code>en.msg</code>）。ビルド時に CMake（<code>file(READ)</code> で文字列リテラル化）でバイナリへ埋め込む。sudo で動く単体バイナリなので、実行時にリソースファイルを探す必要を無くす</td></tr><tr><td>ユーザ上書き</td><td><code>~/Library/Application Support/ta2debug/i18n/&lt;lang&gt;.msg</code>（注釈と同じ親ディレクトリ）。あれば埋め込みより優先。翻訳の試作や未収録言語の追加に使う。<code>TA2DEBUG_I18N_DIR</code> で場所を変えられる</td></tr><tr><td>形式</td><td>UTF-8 の行形式。<code>キー = 文</code>。<code>#</code> 始まりはコメント。<code>\n</code> <code>\t</code> <code>\\</code> と <code>{{</code> <code>}}</code> をエスケープとして解釈。<code>.t2a</code> / <code>.t2b</code> と同じく手編集できる</td></tr><tr><td>解決順</td><td>ユーザ上書き（選択言語）→ 埋め込み（選択言語）→ 既定の日本語 → キー文字列そのもの</td></tr><tr><td>ロード</td><td><code>Translator</code> 生成時に 1 回。キー → <code>MsgId</code> の表を引いて <code>std::vector&lt;std::string&gt;</code>（<code>MsgId</code> 添字）に詰める。翻訳は添字参照 + 差し込みだけ</td></tr><tr><td>検査</td><td>セルフテスト <code>i18n_selftest</code> が、各 <code>.msg</code> のキーが <code>Messages.def</code> に存在すること、プレースホルダ名の集合が日本語文と一致すること、を検査する</td></tr></tbody></table></div>
+<pre class="code"><code># res/i18n/en.msg
+bp.set               = #{id} breakpoint set at {addr}
+bp.set_failed        = failed to set breakpoint (memory not writable?)
+bp.saved             = saved {n} breakpoint(s) -&gt; {path}  (auto-restored on next :run)
+err.expr             = expression error: {detail}
+err.expr.at_pos      = {detail} (at column {pos})
+err.expr.div_zero    = division by zero
+stop.exc.bad_access  = EXC_BAD_ACCESS (invalid memory access)
+auto.stopped         = auto -&gt; stopped at {kind} ({n} instructions)
+layout.name.standard = standard</code></pre>
+<h3 id="h-29">8.4 パラメータ差し込み</h3>
+<ul><li>プレースホルダは名前付き <code>{name}</code>。語順が言語で変わっても翻訳側で並べ替えられる。</li><li>値の基本の出し方は引数の型で決まる: <code>hex</code> 付き <code>uint64_t</code> は <code>0x%llx</code>、整数は 10 進、文字列はそのまま、入れ子 <code>Msg</code> は再帰的に翻訳。</li><li>書式指定は必要なものだけ: <code>{addr:016x}</code>（ゼロ詰め 16 進）、<code>{n:d}</code>、<code>{name:q}</code>（引用符で囲む）。</li><li>複数形は日本語に無いので必須にしない。英語は <code>(s)</code> 表記で足りる。必要になれば <code>{n:plural(one,other)}</code> を後から足せる構文にしておく。</li><li>カタログに無い名前のプレースホルダはそのまま残し、セルフテストで検出する。</li><li>桁揃えは翻訳後の文字列に対して <code>layout::displayWidth</code> / <code>fitWidth</code> で行う（全角 2 桁の扱いは既にある）。<code>printf("%-9s")</code> のようなバイト数基準の詰めは使わない。</li></ul>
+<p>現行の合成の置き換え例:</p>
+<div class="tablewrap"><table><thead><tr><th>現行（main.cpp / core）</th><th>新設計</th></tr></thead><tbody><tr><td><code>snprintf(buf, "#%d ブレイク設定 0x%llx", id, addr); g_message = buf + "  " + describe(addr)</code></td><td>エンジン: <code>Msg::of(BpSet).num("id", id).hex("addr", addr)</code> と <code>SymbolRef</code> を <code>CommandResult</code> で返す。UI: <code>tr(msg)</code> の後ろにシンボル表記を付ける</td></tr><tr><td><code>g_message = "式エラー: " + eerr</code>（<code>eerr</code> は <code>"0 で割れない (5 文字目)"</code>）</td><td><code>Msg::of(ErrExpr).sub("detail", Msg::of(ErrExprAtPos).sub("detail", Msg::of(ErrExprDivZero)).num("pos", 5))</code></td></tr><tr><td><code>Session::stopReason()</code> が <code>"EXC_BAD_ACCESS（不正メモリ参照） [KERN_INVALID_ADDRESS] @0x.."</code> を返す</td><td><code>StopInfo{kind=Exception, exception=EXC_BAD_ACCESS, code0, faultAddr}</code>。UI 側の <code>StopFormatter</code> が <code>stop.exc.bad_access</code> と識別子・アドレスを組み立てる</td></tr><tr><td><code>onStoppedEvent</code> が <code>" ／ "</code> で復元件数を連結</td><td><code>StopInfo::notes</code> に <code>Msg</code> を並べ、UI が区切り文字（<code>ui.note_sep</code>）で連結</td></tr><tr><td><code>err = std::string("dtrace_open 失敗: ") + dtrace_errmsg(...)</code></td><td><code>Msg::of(ErrDtraceOpen).str("detail", dtrace_errmsg(...))</code></td></tr></tbody></table></div>
+<h3 id="h-30">8.5 表データの扱い</h3>
+<div class="tablewrap"><table><thead><tr><th>データ</th><th>現在地</th><th>方針</th></tr></thead><tbody><tr><td>BSD syscall 表 <code>kScalls</code>（番号 → 名前 + 引数シグネチャ）、<code>SyscallNames.inc</code>（SDK 全 <code>SYS_*</code>）</td><td><code>Session.cpp</code></td><td>言語非依存。<code>core/SyscallTables</code> へ移すだけ。翻訳しない</td></tr><tr><td>Mach トラップ表 <code>kMachTraps</code></td><td>同上</td><td>同上</td></tr><tr><td>フラグ表（<code>decOpenFlags</code> / <code>decProt</code> / <code>decMapFlags</code> / <code>decMachOption</code> / <code>decMsghBits</code> ほか）</td><td>同上</td><td>定数名は翻訳しない。<code>SyscallDecoder</code> 内に残す</td></tr><tr><td>syscall 呼び出しの整形（<code>write(1, 0x.., 14) "hi"</code>）</td><td><code>Session::syscallAtStop</code></td><td>C 風の表記で言語非依存。<code>SyscallCall::text</code> として core が作ってよい。前置きの「→ syscall: 」だけが <code>Msg</code></td></tr><tr><td>例外名の説明（不正メモリ参照 など）</td><td><code>Session::stopReason</code></td><td><code>stop.exc.*</code></td></tr><tr><td>レイアウト名 5 種</td><td><code>Layout.cpp</code> の <code>name()</code></td><td><code>layout.name.*</code>。<code>Layout</code> は <code>MsgId</code> を返す</td></tr><tr><td>ヘルプ本文</td><td>main.cpp <code>H[]</code></td><td>コマンド行は <code>CommandSpec</code> の <code>usage</code> / <code>help</code> から生成。キー操作と注記は <code>help.key.*</code> / <code>help.note.*</code>。見出しの色付けは UI が付ける（カタログに ANSI を入れない）</td></tr><tr><td>バッチの使用法 <code>printUsage</code></td><td>main.cpp</td><td><code>batch.usage.*</code></td></tr><tr><td>ブレイク印（● ◆ ○ ◇ ★ 👁 ▸ ⚠ ⏳ 🔍）</td><td>main.cpp</td><td>記号は UI の定数で、翻訳対象外</td></tr></tbody></table></div>
+<h3 id="h-31">8.6 ロケール選択</h3>
+<p><strong>システム自体の言語設定（環境変数）をそのまま使う。</strong> 専用のコマンドやアプリ固有のオプション／環境変数は設けない。</p>
+<p>優先順（最初に決まったものを使う）:</p>
+<ol><li>環境変数 <code>LC_ALL</code> → <code>LC_MESSAGES</code> → <code>LANG</code> の言語部（<code>ja_JP.UTF-8</code> → <code>ja</code>）</li><li>既定 <code>ja</code></li></ol>
+<p>ロケールは<strong>起動時に一度だけ</strong>上記から決める（実行中の切り替えコマンドは設けない）。<code>Translator</code> が <code>Msg</code> を保持する構造自体は言語差し替えに耐えるが、本設計では切り替え口を公開しない。</p>
+<p>補足:</p>
+<ul><li>sudo は既定で環境変数を落とす（env_reset）ため、<code>LANG</code> 等が対象プロセスに届かないと既定の日本語になる。意図した言語にするには <strong><code>sudo -E</code></strong> か sudoers の <code>env_keep += "LANG LC_ALL LC_MESSAGES"</code> でシステムのロケールを引き継がせる（README に明記）。アプリ側に上書き手段は持たせない。</li><li>対応カタログが無い言語なら日本語で動き、起動時に 1 行だけ通知する。</li></ul>
+<h3 id="h-32">8.7 バッチ出力の互換</h3>
+<p>バッチ出力は AI やスクリプトが解析する。構造を示す固定トークン（<code>ta2&gt; </code>、<code>stopped @ </code>、<code>backtrace:</code>、<code>src: </code>、<code>[bp #N, Mhit]</code>、<code>[watch #N, ...]</code>）は現在も英語で、翻訳対象にしない。それ以外の本文はロケールに従う。既定が日本語のままなので、既存スクリプトと <code>ta2debug</code> スキルの期待値は変わらない。言語を固定したいスクリプトは、呼び出し側でシステムの環境変数（例 <code>LANG=ja_JP.UTF-8</code>、sudo 越しなら <code>sudo -E</code> 等）を整える。</p>
+<h3 id="h-33">8.8 移行の段階案</h3>
+<div class="tablewrap"><table><thead><tr><th>段階</th><th>作業</th><th>完了条件</th></tr></thead><tbody><tr><td>i-1</td><td><code>ta2base</code>（<code>Msg</code> / <code>Messages.def</code>）と <code>ta2i18n</code>（<code>Translator</code> / <code>Catalog</code>）を追加。既存コードは未変更</td><td><code>i18n_selftest</code> が通る</td></tr><tr><td>i-2</td><td>main.cpp の <code>g_message = "..."</code> を <code>setMessage(Msg)</code> に機械的に置換。<code>g_message</code> の型を <code>Msg</code> へ。固定文言（ヘッダ、ペイン見出し、フッタ、ヒント）を <code>tr()</code> へ</td><td>日本語表示がバイト単位で従来と一致（バッチ出力の差分ゼロ）</td></tr><tr><td>i-3</td><td>core のエラーを <code>Msg&amp; err</code> へ（<code>Target</code> → <code>DtraceCatch</code> → <code>Annotations</code> → <code>BreakpointStore</code> → <code>Expression</code> の順。呼び出し側は <code>tr(err)</code> を挟むだけ）</td><td>同上</td></tr><tr><td>i-4</td><td><code>stopReason</code> / <code>syscallAtStop</code> の前置き / auto 停止文を <code>StopInfo</code> + UI 側フォーマッタへ</td><td>同上</td></tr><tr><td>i-5</td><td><code>:help</code> / 補完 / <code>printUsage</code> を <code>CommandSpec</code> 生成へ</td><td>ヘルプ内容の差分を目視確認（行の並びは維持）</td></tr><tr><td>i-6</td><td><code>res/i18n/en.msg</code> を作成（ロケールは §8.6 のとおり環境変数から決定。切替コマンド/独自オプションは追加しない）</td><td>英語ロケールで全画面・全コマンドを一巡。未訳キーゼロ</td></tr></tbody></table></div>
+<p>i-2 から i-4 は §11 のフェーズ 1 と 3 に織り込む。</p>
+<h2 id="h-34">9. Arch 移植方針</h2>
+<h3 id="h-35">9.1 基本方針</h3>
+<ul><li>既存の <code>Arch</code> 抽象（<code>inc/core/Arch.h</code>、純粋仮想 + ホスト用ファクトリ <code>createForHost()</code>）を踏襲する。アーキ依存コードは <code>platform/arch/</code> の 2 ファイルにだけ置く。</li><li>ビルドはホストアーキの実装だけがシンボルを出す現行方式（各ファイルを自アーキの <code>#if</code> で囲み、非ホスト側は空の翻訳単位）を維持する。</li><li>ホスト = ターゲットを前提にする。<code>Target::attach</code> / <code>launch</code> で対象の cpu type を確認し、ホストと違えば <code>err.target.arch_mismatch</code> で拒否する（現行は無検査で <code>createForHost()</code> を使っており、Rosetta 下の x86_64 プロセスを掴むと誤動作し得る）。</li><li><code>Arch</code> より上の層（L1 以上）では <code>__x86_64__</code> / <code>__arm64__</code> の <code>#if</code>、レジスタ名の文字列比較、命令バイトの直書きを禁止する。レビュー項目とし、<code>grep</code> で検査する。</li></ul>
+<h3 id="h-36">9.2 現状の漏れと対処</h3>
+<p>調査で見つかった、アーキ非依存であるべきコードに入り込んでいるアーキ知識は次の 4 箇所。</p>
+<div class="tablewrap"><table><thead><tr><th>場所</th><th>内容</th><th>対処</th></tr></thead><tbody><tr><td><code>Session::syscallAtStop</code>（Session.cpp）</td><td>syscall 番号レジスタの解釈。x86 は上位バイトのクラス（1=Mach, 2=Unix）、arm64 は負値なら Mach、という判定を 1 つの if 連鎖に混在させている</td><td><code>Arch::decodeSyscallNumber(const void* state)</code> → <code>{bool mach; uint64_t number;}</code> を追加し、各実装に分ける</td></tr><tr><td>main.cpp <code>resolveIndirectTarget</code></td><td><code>in.baseReg == "rip" || in.baseReg == "pc"</code> で PC 相対を判定</td><td><code>Insn</code> に <code>pcRelative</code> フラグを足し、<code>Disassembler</code> が capstone のレジスタ ID と <code>Arch::isPcRegister()</code> で立てる</td></tr><tr><td>main.cpp <code>:reg</code> の解釈</td><td><code>xmm</code> / <code>xmmN</code> / <code>v</code> / <code>vN</code> / <code>vec</code> / <code>fp</code> をハードコードで判定</td><td><code>Arch::vectorRegisterFamily()</code>（<code>"xmm"</code> / <code>"v"</code>）と本数を返す。総称 <code>vec</code> / <code>fp</code> / <code>fpregs</code> は共通別名として <code>CommandInterpreter</code> に残す</td></tr><tr><td><code>Disassembler::setIntelSyntax</code></td><td>x86 だけ有効な静的フラグ。arm64 では無視されるが UI は <code>:intel</code> を受け付けて成功メッセージを出す</td><td><code>Arch::supportsSyntaxSwitch()</code> を追加。false なら <code>:intel</code> / <code>:atandt</code> は「このアーキでは無効」を返す。フラグは静的変数をやめ <code>Debugger</code> の設定にする</td></tr></tbody></table></div>
+<h3 id="h-37">9.3 強化項目</h3>
+<div class="tablewrap"><table><thead><tr><th>項目</th><th>内容</th></tr></thead><tbody><tr><td><code>ArchInfo</code></td><td><code>Debugger::arch()</code> が返す表示用の記述（名前、汎用レジスタ名の並び、フラグレジスタ名、ベクタレジスタ族、HW 実行 / ウォッチ本数、共有プールか、記法切替の可否）。UI とヘルプはこれを見て分岐し、アーキ名を直接比較しない</td></tr><tr><td>ヘルプの出し分け</td><td><code>:reg xmm[N] / vN</code>、<code>:dr</code> の説明は両アーキを併記した 1 文になっている。<code>ArchInfo</code> から該当アーキの文だけ出すか、併記のままにするかは翻訳キーの分割で選べるようにする</td></tr><tr><td>コンパイル検査の拡大</td><td>現行 CMake は <code>ArchArm64.cpp</code> だけを <code>-arch arm64</code> でコンパイル検査している。これを <code>ta2platform</code> と <code>ta2core</code> の全ソースへ広げる（リンクなし）。arm64 ホストでは逆に <code>-arch x86_64</code> を検査する</td></tr><tr><td>セルフテスト</td><td><code>arch_selftest</code> に <code>decodeSyscallNumber</code>、<code>isPcRegister</code>、<code>vectorRegisterFamily</code> の検査を追加。テスト内の <code>cpuType() == CPU_TYPE_X86_64</code> 分岐は <code>ArchInfo</code> 参照に置き換える</td></tr><tr><td>実機確認</td><td><code>ARM64_TESTING.md</code> の手順を、フェーズ 3 と 5 の完了条件に入れる（ステップ、SW/HW ブレイクのまたぎ、ウォッチの 1 命令またぎ、バックトレース、syscall デコード、<code>:scstop</code>）</td></tr><tr><td>既知の差の保持</td><td>arm64 固有の扱い（<code>hwWatchStopsBeforeAccess</code> による 1 命令またぎ、SS を HW 書き戻しより先に落とす順序、<code>softBreakPcBackup</code> = 0、戻りアドレスが LR）は <code>Stepper</code> / <code>Backtracer</code> へ移す際にコメントごと保つ</td></tr></tbody></table></div>
+<h2 id="h-38">10. 機能パリティ表</h2>
+<p>「現状」は調査時点の実装箇所、「エンジン」は L0〜L2 の担当、「表示」は L3 の担当。全行が新構成に載ることをもって要件 1 を満たす。</p>
+<h3 id="h-39">10.1 起動とフロントエンド</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td><code>ta2debug [pid]</code> / <code>[パス 引数...]</code> で TUI 起動（全数字なら attach、他は起動）</td><td><code>main()</code></td><td><code>cmd::Attach</code> / <code>cmd::Launch</code></td><td><code>app/main.cpp</code> → <code>TuiApp</code></td></tr><tr><td><code>-b</code> / <code>-o &lt;cmd&gt;</code>（複数）/ <code>-s &lt;file&gt;</code> / <code>-s -</code> / 標準入力</td><td><code>main()</code> / <code>runBatch</code></td><td>同上</td><td><code>BatchRunner</code></td></tr><tr><td><code>-h</code> / <code>--help</code>（root 不要）</td><td><code>printUsage</code></td><td>—</td><td><code>app/main.cpp</code> + <code>batch.usage.*</code></td></tr><tr><td>root でなければ終了</td><td><code>main()</code></td><td>—</td><td><code>app/main.cpp</code></td></tr><tr><td>バッチ: 空行・<code>#</code> コメント・<code>:</code> 接頭辞の許容、<code>ta2&gt; </code> エコー</td><td><code>batchExec</code></td><td>—</td><td><code>BatchRunner</code></td></tr><tr><td>バッチ専用: <code>c</code> / <code>continue</code>、<code>s</code> / <code>si</code> / <code>step</code> / <code>stepi</code>、<code>n</code> / <code>next</code>、<code>where</code> / <code>backtrace</code> / <code>frames</code>、<code>wait</code>、<code>q</code> / <code>quit</code> / <code>exit</code></td><td><code>batchExec</code></td><td><code>cmd::Continue</code> ほか</td><td><code>CommandInterpreter</code>（BatchOnly）+ <code>BatchRunner</code></td></tr><tr><td>バッチ: <code>dis</code> / <code>disas</code> / <code>disassemble [式] [個数]</code> のテキスト出力（Enter 継続相当は <code>x</code>）</td><td><code>disToOutput</code></td><td><code>disassemble()</code> / <code>examine()</code></td><td><code>TextReport</code></td></tr><tr><td>バッチ: 停止レポート（<code>stopped @</code>、bp / watch 命中、<code>src:</code>、理由、<code>backtrace:</code>）</td><td><code>batchStopReport</code></td><td><code>StopInfo</code> / <code>backtrace()</code></td><td><code>BatchRunner</code></td></tr><tr><td>バッチ: 停止待ち（auto 継続中はさらに待つ、対象終了の検知）</td><td><code>batchWaitForStop</code></td><td><code>Stopped</code> / <code>TargetExited</code> イベント</td><td><code>BatchRunner</code></td></tr><tr><td>バッチ: 式は同期評価、先読み無効、自動復元なし、dyld フックなし</td><td><code>g_interactive</code> 分岐</td><td><code>EngineOptions</code></td><td><code>BatchRunner</code> が設定</td></tr><tr><td>バッチ: ANSI を除いた出力</td><td><code>stripAnsi</code></td><td>—</td><td><code>TextReport</code>（スタイルを付けない出力）</td></tr></tbody></table></div>
+<h3 id="h-40">10.2 対象の管理</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td><code>:attach &lt;pid&gt;</code>（対象は走り続ける）</td><td><code>doAttach</code> / <code>Session::attach</code></td><td><code>cmd::Attach</code> → <code>TargetSession</code></td><td>結果 <code>Msg</code> 表示</td></tr><tr><td><code>:attach</code>（引数なし）→ プロセス選択（絞り込み、↑↓、Ctrl-P/N、Ctrl-F/B、←→ 横スクロール、Enter、ESC、BS、attach 可否表示）</td><td><code>openPicker</code> 〜 <code>handlePickerKey</code></td><td><code>Debugger::processes()</code></td><td><code>overlays/ProcessPicker</code></td></tr><tr><td><code>:run</code> / <code>:launch &lt;パス&gt; [引数]</code>（START_SUSPENDED、エントリの一時ブレイクで停止、出力は <code>&lt;パス&gt;.ta2debug.log</code>）</td><td><code>doLaunch</code> / <code>Session::launch</code> / <code>findEntryPoint</code></td><td><code>cmd::Launch</code> → <code>TargetSession</code></td><td>結果表示</td></tr><tr><td><code>:restart</code> / <code>:rerun</code> / <code>R</code>（同じ引数で再起動、旧プロセス回収、ブレイクを種別・有効状態ごと引き継ぐ）</td><td><code>doRestart</code></td><td><code>cmd::Restart</code> → <code>BreakpointService::carryOver</code></td><td>表示状態の初期化</td></tr><tr><td><code>:detach</code>（attach は継続、起動した子は終了）</td><td><code>Session::detach</code> / <code>Target::detach</code></td><td><code>cmd::Detach</code></td><td>—</td></tr><tr><td><code>:q</code> / <code>:quit</code> / <code>q</code> キー（detach して終了）</td><td><code>runCommand</code> / <code>onKey</code></td><td><code>~Debugger</code></td><td><code>UiAction::Quit</code></td></tr><tr><td>対象終了の検知 → Idle</td><td>kqueue 監視 / <code>Event::TargetExited</code></td><td><code>ExitMonitor</code> → <code>TargetExited</code></td><td>メッセージ表示</td></tr><tr><td>クラッシュ検知（BAD_ACCESS / BAD_INSTRUCTION / ARITHMETIC）で停止、<code>c</code> で本来のハンドラへ委譲</td><td><code>onException</code> / <code>applyResume</code> / <code>restoreOriginalPorts</code></td><td><code>Stepper</code> / <code>StopInfo{Exception}</code></td><td><code>stop.exc.*</code> + ⚠ 表示</td></tr></tbody></table></div>
+<h3 id="h-41">10.3 実行制御</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td><code>c</code> 継続 / <code>s</code> ステップイン / <code>n</code> ステップオーバ（call なら戻り先に一時ブレイク）</td><td><code>onKey</code> → <code>Session::cont</code> ほか</td><td><code>cmd::Continue</code> / <code>StepInto</code> / <code>StepOver</code> → <code>Stepper</code></td><td>キー割り当て</td></tr><tr><td>ブレイク上からの再開（SW は外して 1 命令後に張り直し、HW は一時的に反映を外す）</td><td><code>uncoverBreakAtPc</code></td><td><code>Stepper</code></td><td>—</td></tr><tr><td><code>a</code> / <code>:auto [call / syscall(sc) / ret / all]</code>（ブレイク命中・例外・200 万命令で停止、途中は描画しない）</td><td><code>runCommand</code> / <code>onStoppedEvent</code></td><td><code>cmd::Auto</code> → <code>AutoRunner</code></td><td><code>auto.*</code> 表示</td></tr><tr><td>Ctrl+C（Running は割り込み停止、auto 中は中断、Stopped は無視）</td><td><code>onKey</code> / <code>Session::interrupt</code></td><td><code>Debugger::interrupt()</code></td><td>キー割り当て</td></tr><tr><td>手動停止からの再開（例外スレッドを介さない）</td><td><code>resumeManual</code></td><td><code>Stepper</code></td><td>—</td></tr></tbody></table></div>
+<h3 id="h-42">10.4 ブレイクポイント</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td><code>:b &lt;式&gt;</code> ソフトブレイク</td><td><code>runCommand</code> / <code>Breakpoints::add</code></td><td><code>cmd::AddBreakpoint{Soft}</code></td><td>結果表示</td></tr><tr><td><code>:bh &lt;式&gt;</code> HW 実行ブレイク（空きスロット管理、全スレッドへ反映）</td><td><code>addHw</code> / <code>syncHwBreaks</code></td><td><code>cmd::AddBreakpoint{HwExec}</code> → <code>BreakpointService</code></td><td>同上</td></tr><tr><td><code>:w &lt;式&gt; [1/2/4/8] [r / w / rw]</code> ウォッチ（既定 8 バイト書込）</td><td><code>addWatch</code></td><td><code>cmd::AddBreakpoint{Watch}</code></td><td>同上</td></tr><tr><td><code>:bl</code> 一覧（種別、無効、命中回数）</td><td><code>runCommand</code></td><td><code>breakpoints()</code></td><td><code>TextReport</code></td></tr><tr><td><code>:bd &lt;#番号 / 式&gt;</code> 削除、<code>:bt &lt;#番号 / 式&gt;</code> 有効⇄無効</td><td><code>withBreakId</code></td><td><code>cmd::RemoveBreakpoint</code> / <code>ToggleEnabled</code></td><td>結果表示</td></tr><tr><td><code>b</code> キー: カーソル行（無ければ PC）のトグル</td><td><code>toggleBreakAtCursor</code></td><td><code>cmd::ToggleBreakpointAt</code></td><td>カーソル位置の提供</td></tr><tr><td><code>:be</code> / <code>:bedit</code> / <code>e</code>: 編集オーバレイ（↑↓ / Ctrl-P/N、<code>d</code> <code>x</code> 削除、<code>e</code> Space 有効無効、<code>h</code> Soft⇄Hard、<code>a</code> アドレス入力、<code>s</code> サイズ巡回、<code>r</code> アクセス巡回、ESC / q。操作は停止中のみ）</td><td><code>openBpEditor</code> 〜 <code>handleBpEditorKey</code> / <code>bpRebuild</code></td><td><code>cmd::RebuildBreakpoint</code> ほか（失敗時の巻き戻しは <code>BreakpointService</code>）</td><td><code>overlays/BreakpointEditor</code></td></tr><tr><td>命中回数、ウォッチ命中の識別、arm64 のウォッチ 1 命令またぎ</td><td><code>Breakpoints::onHit</code> / <code>detectWatchHit</code> / <code>watchStepId_</code></td><td><code>Stepper</code> / <code>StopInfo</code></td><td>ヘッダ表示</td></tr><tr><td><code>w</code> キー: 永続化（イメージ UUID + unslid、イメージ外は除外、<code>.t2b</code>、ユーザ所有へ戻す）</td><td><code>saveBreakpoints</code> / <code>BreakpointStore::save</code></td><td><code>cmd::SaveBreakpoints</code></td><td>結果表示</td></tr><tr><td><code>:run</code> 時の自動復元（エントリ停止で一度だけ）</td><td><code>g_restorePending</code> / <code>restoreBreakpoints</code></td><td><code>BreakpointService::restoreSaved</code>（<code>StopProcessor</code> が呼ぶ）</td><td><code>StopInfo::notes</code> 表示</td></tr><tr><td>未ロードイメージ分の保留と、以降の停止での再挑戦</td><td><code>g_pendingBp</code> / <code>applyPendingBreakpoints</code></td><td><code>BreakpointService::applyPending</code></td><td>同上</td></tr><tr><td>dlopen の透過捕捉（通知フックへ内部ブレイク、見える停止ゼロで装着）</td><td><code>ensureDyldNotifier</code> / <code>stopIsImageLoad</code> / メインループ分岐</td><td><code>DyldNotifier</code> + <code>StopProcessor</code></td><td><code>ImagesChanged</code>（表示は任意）</td></tr><tr><td>表示上はブレイク命令を元バイトで見せる</td><td><code>maskBreakpoints</code></td><td><code>readMemory()</code> / <code>disassemble()</code> が内部で実施</td><td>—</td></tr><tr><td>逆アセンブルの印（● SW、◆ HW、◆ ウォッチ、○ ◇ 無効、色分け）</td><td><code>drawDisassembly</code></td><td><code>DisasmLine::bp</code></td><td><code>views/Disasm</code></td></tr></tbody></table></div>
+<h3 id="h-43">10.5 表示と操作（TUI）</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td>逆アセンブル枠（関数見出し、ソース行、PC 行、カーソル ▸）</td><td><code>drawDisassembly</code></td><td><code>disassemble()</code></td><td><code>views/Disasm</code></td></tr><tr><td>直値 call / jmp / 分岐の飛び先シンボル表示</td><td>同上</td><td><code>DisasmLine::target</code></td><td>同上</td></tr><tr><td>PC が間接 call / jmp のとき飛び先を解決して表示</td><td><code>resolveIndirectTarget</code></td><td><code>BranchResolver</code></td><td>同上</td></tr><tr><td>スタブを <code>symbol stub for: X</code> と表示、C++ デマングルとテンプレート省略</td><td><code>Symbols::stubTarget</code> / <code>displayName</code></td><td><code>Symbols</code></td><td>同上</td></tr><tr><td>停止位置が syscall のとき呼び出し内容を表示</td><td><code>syscallAtStop</code></td><td><code>SyscallDecoder</code> / <code>StopInfo::syscall</code></td><td>最下行</td></tr><tr><td>ユーザ注釈の名前・メモを表示に反映</td><td><code>Annotations</code> オーバレイ</td><td><code>Symbols</code> + <code>Annotations</code></td><td>同上</td></tr><tr><td>↑↓ カーソル移動（枠端で自動スクロール）、Ctrl+F / Ctrl+B ページ、<code>s</code> <code>n</code> <code>c</code> で PC 追従へ復帰</td><td><code>moveCursor</code> / <code>pageCursor</code> / <code>ensureCursorVisible</code></td><td><code>disasmBack()</code> / <code>disassemble()</code></td><td><code>views/Disasm</code> の表示状態</td></tr><tr><td><code>:dis [式]</code>（ペインをそのアドレスへ、省略で PC へ）</td><td><code>runCommand</code></td><td><code>cmd::Evaluate</code></td><td><code>UiAction::GotoDisasm</code> / <code>FollowPc</code></td></tr><tr><td><code>:intel</code> / <code>:atandt</code> / <code>:att</code> 記法切替</td><td><code>Disassembler::setIntelSyntax</code></td><td><code>cmd::SetDisasmSyntax</code></td><td>—</td></tr><tr><td><code>:baseoff</code> / <code>:baseon</code> アドレスをイメージ先頭相対で表示</td><td><code>g_baseRelative</code></td><td><code>SymbolRef</code> にイメージ先頭を含める</td><td><code>views/Disasm</code> の表示設定</td></tr><tr><td>レジスタ枠（複数列）</td><td><code>drawRegisters</code></td><td><code>registers()</code></td><td><code>views/Registers</code></td></tr><tr><td>バックトレース枠（CFI / DWARF、入口・IP=0・スタブの復元、スタック走査。他スレッド閲覧時は軽量版）</td><td><code>computeBacktrace</code></td><td><code>Backtracer</code> / <code>backtrace(thread, fast)</code></td><td><code>views/Backtrace</code></td></tr><tr><td>スレッド枠（★ 停止、👁 表示中）、Tab でフォーカス、↑↓ で表示スレッド切替</td><td><code>drawThreads</code> / <code>selectThread</code></td><td><code>threads()</code>、各クエリの <code>ThreadId</code></td><td><code>views/Threads</code></td></tr><tr><td>レイアウト 5 種を <code>l</code> / <code>L</code> で切替（標準 / 右サイド / 下段 / 左右半分 / 逆アセンブルのみ）</td><td><code>layout::compute</code></td><td>—</td><td><code>Layout</code></td></tr><tr><td><code>1</code> <code>2</code> <code>3</code> で各枠の表示トグル、<code>0</code> で全表示</td><td><code>onKey</code></td><td>—</td><td><code>TuiApp</code></td></tr><tr><td>ヘッダ行（pid、状態、位置、命中 bp / ウォッチ、例外、レイアウト、非表示枠、先読み進捗、探索進捗）</td><td><code>render</code></td><td><code>StopInfo</code> / <code>symbolWarming()</code> / <code>job()</code></td><td><code>views/Header</code></td></tr><tr><td>最下行メッセージ（端末幅で切る）</td><td><code>render</code></td><td><code>Msg</code></td><td><code>views/StatusLine</code></td></tr><tr><td><code>:</code> コマンド入力、TAB 補完（単一なら確定、複数なら共通接頭辞 + 候補表示）、BS、ESC、最下行だけの部分再描画</td><td><code>onKey</code> / <code>completeCommand</code> / <code>renderCmdline</code></td><td><code>CommandInterpreter::complete</code></td><td><code>overlays/CommandLine</code></td></tr><tr><td>出力オーバレイ（↑↓ / j k、Space・Ctrl-F / b・Ctrl-B ページ、g / G、Enter で <code>x</code>・<code>dis</code> の続き、ESC・q で閉じる、<code>:</code> で閉じて入力へ）</td><td><code>onKey</code> のオーバレイ部</td><td><code>examine()</code> の継続位置</td><td><code>overlays/Pager</code></td></tr><tr><td>Idle / Running 時の案内表示</td><td><code>render</code></td><td><code>state()</code></td><td><code>TuiApp</code></td></tr><tr><td>端末リサイズ追従（SIGWINCH、self-pipe、まとめて 1 回）</td><td><code>onSigwinch</code> / 入力スレッド</td><td>—</td><td><code>InputDecoder</code></td></tr><tr><td>ESC 単独と矢印の判別（40ms）、矢印の合成コード化</td><td>入力スレッド</td><td>—</td><td><code>InputDecoder</code></td></tr><tr><td>起動時に IME を半角へ（一度だけ、強制はしない）</td><td><code>Terminal</code>（Carbon TIS）</td><td>—</td><td><code>Terminal</code></td></tr><tr><td>チラつき防止（全消去せず上書き）</td><td><code>Terminal::home</code></td><td>—</td><td><code>Terminal</code></td></tr></tbody></table></div>
+<h3 id="h-44">10.6 マウス</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td>クリックでカーソル移動、ダブルクリック（400ms）でブレイクのトグル</td><td><code>onDisasmClick</code></td><td><code>cmd::ToggleBreakpointAt</code></td><td><code>views/Disasm</code> のヒットテスト</td></tr><tr><td>Option+クリックで呼び出し先（無ければ行自身）へジャンプ</td><td>同上</td><td><code>DisasmLine::target</code></td><td>同上</td></tr><tr><td>Shift+クリックでそのシンボルにブレイクをトグル</td><td>同上</td><td><code>cmd::ToggleBreakpointAt</code></td><td>同上</td></tr><tr><td>ホイールで逆アセンブル枠をスクロール（停止中のみ）</td><td><code>onMouse</code> / <code>moveDisasm</code></td><td><code>disasmBack()</code></td><td>同上</td></tr><tr><td>ドラッグ選択 → 離すとコピー（pbcopy / OSC52）、キー操作で選択解除</td><td><code>onMouse</code> / <code>Terminal::sel*</code></td><td>—</td><td><code>Terminal</code></td></tr><tr><td><code>:mouse [on / off]</code>（省略でトグル）</td><td><code>runCommand</code></td><td>—</td><td><code>UiAction::SetMouse</code></td></tr></tbody></table></div>
+<h3 id="h-45">10.7 参照コマンド</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td><code>:reg</code>（一覧）/ <code>:reg &lt;名前&gt;</code></td><td><code>runCommand</code></td><td><code>registers()</code></td><td><code>TextReport</code></td></tr><tr><td><code>:reg xmm[N]</code> / <code>vN</code> / <code>vec</code> / <code>fp</code> / <code>fpregs</code></td><td>同上</td><td><code>vectorRegisters()</code> / <code>ArchInfo</code></td><td>同上</td></tr><tr><td><code>:dr</code> デバッグレジスタ</td><td>同上</td><td><code>debugRegisters()</code></td><td>同上</td></tr><tr><td><code>:p &lt;式&gt;</code> / <code>:p/x</code> / <code>:p/d</code></td><td>同上</td><td><code>cmd::Evaluate</code></td><td>値の整形</td></tr><tr><td><code>:x &lt;式&gt; [バイト数]</code>（16 進 + ASCII ダンプ、既定 64）</td><td><code>classicDump</code></td><td><code>examine()</code></td><td><code>TextReport</code></td></tr><tr><td><code>:x/&lt;個数&gt;&lt;書式&gt;&lt;サイズ&gt; &lt;式&gt;</code>（書式 x d u o t c i s f a、サイズ b h w g）</td><td><code>examineMemory</code> / <code>formatValue</code></td><td><code>MemoryExaminer</code></td><td>同上</td></tr><tr><td><code>:x</code>（引数なし）で前回の続き</td><td><code>xContinue</code></td><td><code>ExamineResult::next</code></td><td><code>overlays/Pager</code> が保持</td></tr><tr><td><code>:sym &lt;式&gt;</code> アドレスのシンボル</td><td><code>runCommand</code></td><td><code>cmd::Evaluate</code> + <code>describe()</code></td><td>結果表示</td></tr><tr><td><code>:img</code> / <code>:libs</code> イメージ一覧</td><td>同上</td><td><code>images()</code></td><td><code>TextReport</code></td></tr><tr><td><code>:seg [名前]</code> セグメント一覧</td><td>同上</td><td><code>segments()</code></td><td>同上</td></tr><tr><td><code>:syms &lt;ライブラリ&gt; [絞込]</code>（省略で既定ライブラリ、部分一致）</td><td>同上</td><td><code>symbols()</code></td><td>同上</td></tr><tr><td><code>:uselib [&lt;名前&gt; / -]</code> 既定ライブラリの表示 / 設定 / 解除</td><td><code>Session::setDefaultLib</code></td><td><code>cmd::SetDefaultLib</code></td><td>結果表示</td></tr><tr><td><code>:help</code> / <code>:h</code> / <code>:?</code></td><td><code>H[]</code></td><td><code>CommandInterpreter::table()</code></td><td><code>UiAction::ShowHelp</code> + <code>help.*</code></td></tr><tr><td>不明コマンドの案内</td><td><code>runCommand</code></td><td><code>Msg</code>（<code>cmd.unknown</code>）</td><td>表示</td></tr></tbody></table></div>
+<h3 id="h-46">10.8 書き換え</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td><code>:reg &lt;名前&gt;=&lt;式&gt;</code>（部分レジスタ含む）</td><td><code>Session::setRegister</code> / <code>Arch::writeRegisterByName</code></td><td><code>cmd::SetRegister</code></td><td>結果表示</td></tr><tr><td><code>:setmem1</code> / <code>2</code> / <code>4</code> / <code>8 &lt;式&gt;,&lt;値&gt;</code></td><td><code>runCommand</code></td><td><code>cmd::WriteMemory</code></td><td>同上</td></tr><tr><td><code>:setmem &lt;式&gt;,&lt;HEX 列&gt;</code></td><td><code>parseHexBytes</code></td><td><code>cmd::WriteMemory</code></td><td>同上</td></tr><tr><td><code>:memset &lt;式&gt;,&lt;値&gt;,&lt;サイズ&gt;</code></td><td><code>runCommand</code></td><td><code>cmd::FillMemory</code></td><td>同上</td></tr><tr><td><code>:wf &lt;式&gt;,&lt;サイズ&gt;,&lt;パス&gt;</code> / <code>:rf &lt;式&gt;,&lt;サイズ&gt;,&lt;パス&gt;</code></td><td>同上</td><td><code>cmd::DumpToFile</code> / <code>LoadFromFile</code></td><td>同上</td></tr><tr><td>コードページへの書き込み（CoW + 保護復元）</td><td><code>Target::writeMemory</code></td><td><code>Target</code></td><td>—</td></tr></tbody></table></div>
+<h3 id="h-47">10.9 シンボルと注釈</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td>式評価（16 進 / 10 進、四則、括弧、<code>$reg</code> / <code>%reg</code>、<code>ライブラリ!シンボル</code>、<code>ライブラリ!</code>、シンボル単独）</td><td><code>Expression</code></td><td><code>core/Expression</code></td><td>—</td></tr><tr><td>既定ライブラリ → 主実行ファイル → 全イメージの順に探索、曖昧・未発見の詳しいエラー</td><td><code>Expression::parseName</code></td><td>同上（エラーは <code>err.expr.*</code>）</td><td><code>tr()</code></td></tr><tr><td>重い探索の非同期化、進捗表示、ESC で中止、走行中は次のコマンドを受けない</td><td><code>evalAsync</code> / <code>g_job*</code></td><td><code>JobRunner</code> / <code>Debugger::cancel</code></td><td>ヘッダの 🔍 表示、ESC</td></tr><tr><td>シンボル表（nlist + dSYM）、UUID 別ディスクキャッシュ</td><td><code>Symbols</code></td><td><code>Symbols</code></td><td>—</td></tr><tr><td>全イメージの先読みと進捗</td><td><code>Session::warmSymbols</code></td><td><code>SymbolWarmer</code> → <code>Progress</code></td><td>ヘッダの ⏳ 表示</td></tr><tr><td>dlopen 追従（コマンド実行前と停止時にイメージ一覧を更新）</td><td><code>refreshImages</code></td><td>エンジンスレッドの境界処理</td><td>—</td></tr><tr><td><code>:ann &lt;式&gt;,&lt;名前&gt;[,&lt;メモ&gt;]</code> / <code>:memo &lt;式&gt;,&lt;メモ&gt;</code>（空で削除）/ <code>:unann &lt;式&gt;</code></td><td><code>runCommand</code> / <code>Annotations</code></td><td><code>cmd::SetAnnotation</code> / <code>RemoveAnnotation</code></td><td>結果表示</td></tr><tr><td><code>:anns [&lt;ライブラリ&gt;]</code>（保存先パスも表示）</td><td>同上</td><td><code>annotations()</code></td><td><code>TextReport</code></td></tr><tr><td><code>m</code> キー: カーソル行に <code>func&lt;0 詰め 16 進&gt;</code> を登録、既存なら編集行を開く</td><td><code>annotateAtCursor</code> / <code>imageHexDigits</code></td><td><code>cmd::SetAnnotation</code> / <code>annotations()</code></td><td><code>TuiApp</code>（コマンド行へ流し込み）</td></tr><tr><td><code>.t2a</code> の手編集と自動読み直し（mtime）、シンボル表への重ね合わせ</td><td><code>Annotations::refresh</code></td><td><code>Annotations</code>（エンジンスレッドの境界で refresh）</td><td>—</td></tr><tr><td>DWARF 行情報（dSYM / デバッグマップ経由の .o）とソース行表示</td><td><code>DwarfLines</code> / <code>sourceLineFor</code></td><td><code>sourceLine()</code> / <code>DisasmLine::source</code></td><td><code>views/Disasm</code>、バッチの <code>src:</code></td></tr></tbody></table></div>
+<h3 id="h-48">10.10 syscall / Mach トラップ</h3>
+<div class="tablewrap"><table><thead><tr><th>機能</th><th>現状</th><th>エンジン</th><th>表示</th></tr></thead><tbody><tr><td>停止位置の syscall を名前 + 引数で表示（文字列・バッファの参照先、フラグ分解、<code>mach_msg</code> ヘッダ分解）</td><td><code>Session::syscallAtStop</code></td><td><code>SyscallDecoder</code></td><td>最下行 / バッチ</td></tr><tr><td>未登録番号も SDK の全 <code>SYS_*</code> から名前を引く</td><td><code>SyscallNames.inc</code></td><td><code>SyscallTables</code></td><td>—</td></tr><tr><td><code>:scwatch &lt;名前&gt;</code>（引数・戻り値つきトレース、直近 200 行）</td><td><code>startSyscallWatch</code> / <code>DtraceCatch::startTrace</code></td><td><code>cmd::SyscallWatch</code> → <code>SyscallMonitor</code></td><td>結果表示</td></tr><tr><td><code>:scwatch all</code> / <code>mach</code> / <code>mach:&lt;名前&gt;</code>（集計 / トレース）</td><td>同上</td><td>同上</td><td>同上</td></tr><tr><td><code>:scwatch</code>（状況表示: トレース行 or 回数順）/ <code>:scwatch off</code></td><td><code>runCommand</code></td><td><code>syscallWatch()</code> / <code>cmd::SyscallOff</code></td><td><code>TextReport</code></td></tr><tr><td><code>:scwatch list [語]</code> / <code>:scstop list [語]</code></td><td><code>showSyscallNames</code></td><td><code>Debugger::syscallNames()</code></td><td>同上</td></tr><tr><td><code>:scstop &lt;名前 / all / mach[:&lt;名前&gt;]&gt;</code>（発火で停止、<code>c</code> で次の発火まで）、<code>:scstop</code>（状況）、<code>:scstop off</code>、<code>:scwatch</code> と排他</td><td><code>startSyscallStop</code> / <code>onSyscallStopHit</code></td><td><code>cmd::SyscallStop</code> → <code>SyscallMonitor</code></td><td>結果表示</td></tr><tr><td>複数スレッドでの発火スレッド確定</td><td><code>refineSyscallStopThread</code></td><td><code>StopProcessor</code> → <code>SyscallMonitor</code></td><td>—</td></tr><tr><td>dtrace が掛けた suspend の取り込み / 相殺</td><td><code>Target::adoptExternalSuspend</code> ほか</td><td><code>Target</code></td><td>—</td></tr></tbody></table></div>
+<h3 id="h-49">10.11 現状で未実装の事項（パリティ対象外だが記録する）</h3>
+<ul><li><code>DESIGN.md</code> §1 が求める「SIGTERM / SIGHUP / SIGINT / SIGQUIT 受信時に detach してから終了」は、現行ソースに該当コードが無い（<code>sigaction</code> は SIGWINCH のみ）。新構成では <code>app/main.cpp</code> がシグナルを self-pipe で受けて <code>Debugger</code> を破棄すれば自然に実現できるので、フェーズ 4 で追加する。</li><li><code>DESIGN.md</code> の「auto 中の画面更新を 0.2 秒に 1 回」は、現行は auto 中に描画しない実装になっている。現行動作を正として維持する。</li></ul>
+<h2 id="h-50">11. 段階的移行計画</h2>
+<p>各フェーズは単独でビルドが通り、機能が落ちない状態で終える。フェーズごとにコミットを分け、ファイル移動は <code>git mv</code> で履歴を保つ。</p>
+<figure class="diagram"><pre class="mermaid">flowchart LR
+  P0["P0 安全網&lt;br/&gt;バッチ出力の記録"] --&gt; P1["P1 i18n 基盤&lt;br/&gt;Msg / Translator"]
+  P1 --&gt; P2["P2 main.cpp 分割&lt;br/&gt;挙動不変"]
+  P2 --&gt; P3["P3 ロジック引き上げ&lt;br/&gt;core / engine へ"]
+  P3 --&gt; P4["P4 ファサード導入&lt;br/&gt;インライン実行"]
+  P4 --&gt; P5["P5 エンジンスレッド化"]
+  P5 --&gt; P6["P6 多言語と Arch 仕上げ"]
+  P6 --&gt; P7["P7 GUI (将来)"]</pre></figure>
+<div class="tablewrap"><table><thead><tr><th>フェーズ</th><th>作業</th><th>完了条件</th></tr></thead><tbody><tr><td>P0 安全網</td><td>自作テスト対象に対するバッチ実行（<code>-b -o</code>）の出力を基準として保存する。対象: attach / run / ブレイク 3 種 / ステップ / auto / <code>x</code> 各書式 / <code>reg</code> / <code>img</code> / <code>syms</code> / 注釈 / <code>scwatch</code> / <code>scstop</code> / クラッシュ停止。アドレスなど可変部を正規化する比較スクリプトを用意。TUI は既存の expect + 画面レンダリング方式の検証を流用</td><td>基準出力が再現可能。x86_64 で全セルフテスト通過</td></tr><tr><td>P1 i18n 基盤</td><td>§8.8 の i-1、i-2。<code>ta2base</code> / <code>ta2i18n</code> 追加、main.cpp の文言を <code>Msg</code> 経由に</td><td>P0 との差分ゼロ</td></tr><tr><td>P2 main.cpp 分割</td><td>グローバルを <code>TuiState</code>（表示状態）と <code>AppLogicState</code>（後で engine へ行くもの）の 2 構造体へ分類。ファイルを <code>ui/tui/*</code>、<code>ui/batch/*</code> へ分割。関数の中身は動かさない</td><td>P0 との差分ゼロ。main.cpp が 150 行以下</td></tr><tr><td>P3 ロジック引き上げ</td><td><code>Expression</code> を core へ。<code>Session.cpp</code> から <code>SyscallDecoder</code> / <code>SyscallTables</code> を分離。<code>Backtracer</code> / <code>BranchResolver</code> / <code>MemoryExaminer</code> を core へ。<code>Session</code> を <code>Stepper</code> / <code>TargetSession</code> / <code>DyldNotifier</code> / <code>SyscallMonitor</code> / <code>SymbolWarmer</code> / <code>ExitMonitor</code> に分割。core のエラーを <code>Msg</code> へ（i-3、i-4）。§9.2 の Arch 漏れ 4 件を解消。<code>Session.h</code> から <code>app/EventQueue.h</code> の include を除去（<code>EngineInbox</code> へ）</td><td>P0 との差分ゼロ。core が <code>app/</code> <code>ui/</code> を include していないことを CMake のライブラリ分割で保証。arm64 コンパイル検査を core 全体へ拡大</td></tr><tr><td>P4 ファサード導入</td><td><code>Debugger</code> / <code>Command</code> / <code>DebugEvent</code> / <code>StopProcessor</code> / <code>BreakpointService</code> / <code>AutoRunner</code> / <code>JobRunner</code> / <code>CommandInterpreter</code> を実装。TUI とバッチを <code>Debugger</code> API だけで動かす（UI スレッドが <code>pump()</code> を呼ぶインライン実行）。<code>g_interactive</code> を <code>EngineOptions</code> に置換。ヘルプ / 補完をコマンド表から生成（i-5）。終了シグナルでの detach を追加</td><td>P0 との差分ゼロ（ヘルプは目視）。<code>ui/</code> から <code>core/</code> <code>platform/</code> のヘッダ include がゼロ。engine 単体のヘッドレステスト（イベント列の検査）が通る</td></tr><tr><td>P5 エンジンスレッド化</td><td><code>Debugger</code> がエンジンスレッドを持つ。クエリに <code>shared_mutex</code>。TUI は <code>IEventSink</code> → <code>UiQueue</code>。ThreadSanitizer ビルドで検査</td><td>P0 との差分ゼロ。探索中・先読み中・auto 中に UI 操作（スクロール、ESC）が即応。arm64 実機で <code>ARM64_TESTING.md</code> を完走</td></tr><tr><td>P6 多言語と Arch 仕上げ</td><td><code>en.msg</code>（i-6。ロケールは環境変数から決定。切替コマンド/独自オプションは無し）。<code>ArchInfo</code> によるヘルプ出し分け。README 更新</td><td>英語ロケールで未訳キーゼロ。<code>i18n_selftest</code> 通過。両アーキで P0 相当を確認</td></tr><tr><td>P7 GUI（将来）</td><td><code>ta2engine</code> をリンクする GUI フロントエンド。<code>IEventSink</code> をメインスレッドへディスパッチし、ビューは同じクエリ API を使う。エンジン側の変更は不要であることを確認する</td><td>本設計の範囲外。API の過不足を洗い出して §6 に反映</td></tr></tbody></table></div>
+<p>P1 を先に置く理由: 文言の <code>Msg</code> 化は機械的で挙動が変わらず、以降のフェーズで新設する API（<code>CommandResult</code> / <code>StopInfo</code> / エラー）を最初から <code>Msg</code> で定義できる。後回しにすると API を 2 度作ることになる。</p>
+<h2 id="h-51">12. リスクと緩和</h2>
+<div class="tablewrap"><table><thead><tr><th>リスク</th><th>内容</th><th>緩和</th></tr></thead><tbody><tr><td>挙動の退行</td><td>2934 行の main.cpp は条件分岐が細かく、移す途中で細部（例: <code>:dis</code> の評価中に状態が変わった場合の再チェック、編集失敗時の巻き戻し、<code>g_message</code> の消し方）が落ちやすい</td><td>P0 の基準出力と TUI 検証を毎フェーズ実行。P2 は「移動だけ」、P3 は「置き場所だけ」と変更の種類を分ける</td></tr><tr><td>スレッド競合</td><td>エンジンスレッド化で、クエリと先読み・dtrace・例外スレッドの同時アクセスが増える。<code>ImageList</code> は現状ロックを持たず「メインスレッドの境界でだけ更新」という規約で守られている</td><td>更新はエンジンスレッドの排他ロック区間に限定し、規約を型（ロックを取らないと呼べない内部 API）で表す。ThreadSanitizer。P4（インライン実行）で API を固めてから P5 でスレッドを分ける</td></tr><tr><td>デッドロック</td><td>例外スレッドは resume 決定待ちでブロックし、detach は ack を待つ。エンジンスレッドが排他ロックを持ったまま ack を待つとクエリが止まる</td><td>ack 待ち・join の間はロックを持たない。<code>~Debugger</code> の停止順序を §7.2 の通り固定し、ヘッドレステストで「停止中 detach」「実行中 detach」「手動停止中 detach」「ジョブ中 detach」を検査</td></tr><tr><td>バッチ出力の互換</td><td><code>ta2debug</code> スキルや既存スクリプトが出力を解析している</td><td>既定言語は日本語、構造トークンは不変。P0 の差分ゼロを完了条件に入れる</td></tr><tr><td>表示幅の崩れ</td><td>翻訳で文の幅が変わる。全角 / 半角が混ざる</td><td>桁揃えは <code>layout::displayWidth</code> 基準に統一。ヘッダとフッタは <code>fitWidth</code> で切る（現行どおり）</td></tr><tr><td>sudo とロケール</td><td>sudo が環境変数を落とし、<code>LANG</code> が届かず常に既定（日本語）になる</td><td>独自の上書き手段は設けない方針（§8.6）。<code>sudo -E</code> か sudoers の <code>env_keep</code> でシステムのロケールを引き継ぐ運用を README に明記。届かなければ日本語で安全動作</td></tr><tr><td>翻訳の抜け・食い違い</td><td>キーの追加時に追加言語が追従しない。プレースホルダ名の不一致</td><td>日本語フォールバック。<code>i18n_selftest</code> でキーとプレースホルダを検査</td></tr><tr><td>描画クエリの遅さ</td><td>逆アセンブル・バックトレースをクエリ越しに取ると、ロックとコピーのぶん遅くなる</td><td>スナップショットは 1 画面ぶん（数十行）。現行も毎描画で同じ計算をしており増分はコピーのみ。問題が出たら UI 側でアドレス範囲単位のキャッシュを持つ</td></tr><tr><td>arm64 の未検証</td><td>開発機が x86_64 の場合、arm64 側はコンパイル検査しかできない</td><td>検査範囲を core 全体へ拡大。arm64 固有の分岐はコメントごと移す。P3 / P5 の完了条件に実機手順を入れる</td></tr><tr><td>ASan 既定ビルド</td><td><code>USE_ASAN=ON</code> が既定。スレッド追加で検出が増える可能性</td><td>検出は直す。TSan は ASan と併用できないので別ビルドディレクトリで回す</td></tr><tr><td>作業量の見誤り</td><td>文言約 550 個、コマンド約 45 種（別名とバッチ専用を含めると約 65 綴り）、<code>g_</code> 変数約 70 個</td><td>フェーズを小さく刻む。P1 と P2 は機械的作業なので先に済ませて全体像を固める</td></tr><tr><td>対象範囲の逸脱</td><td>リファクタリング中に保護回避目的の機能が紛れ込む</td><td>本設計は自作プログラム用デバッガの構造整理のみを扱う。<code>LIBWIDEVINECDM</code> など他ツリーには触れない</td></tr></tbody></table></div>
+<h2 id="h-52">付録 A. 現行コマンド一覧（コマンド表 <code>CommandSpec</code> の初期内容）</h2>
+<p><code>runCommand</code> と <code>batchExec</code> から抽出。括弧内は別名。</p>
+<div class="tablewrap"><table><thead><tr><th>分類</th><th>コマンド</th></tr></thead><tbody><tr><td>対象</td><td><code>attach</code>、<code>run</code>（<code>launch</code>）、<code>restart</code>（<code>rerun</code>）、<code>detach</code>、<code>q</code>（<code>quit</code>、バッチのみ <code>exit</code>）</td></tr><tr><td>実行</td><td><code>auto</code>、バッチのみ: <code>c</code>（<code>continue</code>）、<code>s</code>（<code>si</code> <code>step</code> <code>stepi</code>）、<code>n</code>（<code>next</code>）、<code>wait</code></td></tr><tr><td>ブレイク</td><td><code>b</code>、<code>bh</code>、<code>w</code>、<code>bl</code>、<code>bd</code>、<code>bt</code>、<code>be</code>（<code>bedit</code>）</td></tr><tr><td>参照</td><td><code>reg</code>、<code>dr</code>、<code>p</code>（<code>p/x</code> <code>p/d</code>）、<code>x</code>（<code>x/&lt;fmt&gt;</code>）、<code>dis</code>（<code>disas</code> <code>disassemble</code>）、<code>sym</code>、<code>img</code>（<code>libs</code>）、<code>seg</code>、<code>syms</code>、<code>uselib</code>、バッチのみ: <code>where</code>（<code>backtrace</code> <code>frames</code>）</td></tr><tr><td>書き換え</td><td><code>reg &lt;名前&gt;=&lt;式&gt;</code>、<code>setmem</code>、<code>setmem1</code> <code>setmem2</code> <code>setmem4</code> <code>setmem8</code>、<code>memset</code>、<code>wf</code>、<code>rf</code></td></tr><tr><td>注釈</td><td><code>ann</code>、<code>memo</code>、<code>unann</code>、<code>anns</code></td></tr><tr><td>syscall</td><td><code>scwatch</code>、<code>scstop</code></td></tr><tr><td>表示設定</td><td><code>intel</code>、<code>atandt</code>（<code>att</code>）、<code>baseoff</code>、<code>baseon</code>、<code>mouse</code></td></tr><tr><td>その他</td><td><code>help</code>（<code>h</code> <code>?</code>）</td></tr><tr><td>追加予定</td><td><code>lang</code>（§8.6）</td></tr></tbody></table></div>
+<h2 id="h-53">付録 B. 現行キー一覧（Main モード）</h2>
+<div class="tablewrap"><table><thead><tr><th>キー</th><th>動作</th><th>有効な状態</th></tr></thead><tbody><tr><td><code>:</code></td><td>コマンド入力</td><td>常時</td></tr><tr><td><code>c</code> <code>s</code> <code>n</code></td><td>継続 / ステップイン / ステップオーバ</td><td>Stopped</td></tr><tr><td><code>a</code></td><td>auto（all）</td><td>Stopped</td></tr><tr><td><code>R</code></td><td>再起動</td><td><code>:run</code> で起動済み</td></tr><tr><td>Ctrl+C</td><td>割り込み停止 / auto 中断</td><td>Running / auto 中</td></tr><tr><td>↑ ↓</td><td>カーソル移動、またはスレッド選択</td><td>Stopped</td></tr><tr><td>Ctrl+F / Ctrl+B</td><td>ページ移動</td><td>Stopped（逆アセンブルにフォーカス）</td></tr><tr><td>Tab</td><td>逆アセンブル ⇔ スレッドのフォーカス切替</td><td>Stopped</td></tr><tr><td><code>b</code></td><td>カーソル行のブレイクをトグル</td><td>Stopped</td></tr><tr><td><code>m</code></td><td>カーソル行に注釈を登録 / 編集</td><td>Stopped</td></tr><tr><td><code>e</code></td><td>ブレイク編集オーバレイ</td><td>常時（操作は Stopped のみ）</td></tr><tr><td><code>w</code></td><td>ブレイクを永続化</td><td>attach 中</td></tr><tr><td><code>l</code> / <code>L</code></td><td>レイアウト切替（順 / 逆）</td><td>常時</td></tr><tr><td><code>1</code> <code>2</code> <code>3</code> / <code>0</code></td><td>レジスタ / バックトレース / スレッドの表示トグル / 全表示</td><td>Stopped</td></tr><tr><td><code>q</code></td><td>終了</td><td>常時</td></tr><tr><td>ESC</td><td>探索ジョブの中止（進捗表示中は最優先）</td><td>ジョブ走行中</td></tr></tbody></table></div>
+</main>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<script>
+(function(){
+  var nodes = Array.prototype.slice.call(document.querySelectorAll('pre.mermaid'));
+  nodes.forEach(function(n){ n.setAttribute('data-src', n.textContent); });
+  var mq = window.matchMedia('(prefers-color-scheme: dark)');
+  function draw(){
+    if (!window.mermaid) return;
+    nodes.forEach(function(n){ n.removeAttribute('data-processed'); n.textContent = n.getAttribute('data-src'); });
+    mermaid.initialize({ startOnLoad:false, securityLevel:'strict', theme: mq.matches ? 'dark' : 'default',
+      flowchart:{ htmlLabels:true, useMaxWidth:true }, sequence:{ useMaxWidth:true } });
+    mermaid.run({ nodes: nodes }).catch(function(e){ console.error(e); });
+  }
+  draw();
+  if (mq.addEventListener) mq.addEventListener('change', draw); else if (mq.addListener) mq.addListener(draw);
+})();
+</script>
+</body>
+</html>
