@@ -69,6 +69,7 @@ set(CORE_SOURCES
   src/core/Unwind.cpp
   src/core/Symbols.cpp
   src/core/Annotations.cpp
+  src/core/BreakpointStore.cpp
   src/core/DtraceCatch.cpp
   src/core/DwarfLines.cpp
   src/core/ProcessList.cpp
