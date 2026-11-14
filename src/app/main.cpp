@@ -25,6 +25,7 @@
 #include "app/EventQueue.h"
 #include "app/Expression.h"
 #include "core/Session.h"
+#include "core/BreakpointStore.h"
 #include "core/Disassembler.h"
 #include "core/ProcessList.h"
 #include "core/Unwind.h"
@@ -548,13 +549,83 @@ void doAttach(pid_t pid) {
   }
 }
 
-void render(); // 定義は後方。doRestart から使うので前方宣言。
+void render(); // 定義は後方。doRestart/saveBreakpoints から使うので前方宣言。
 
 // 直近に :run/launch で起動した対象の引数（再起動用）。:attach で付けた対象では空のまま。
 std::vector<std::string> g_launchArgs;
+// launch 直後はまだ dyld 前（images 未ロード・Running）なので、保存ブレイクの復元は
+// エントリ停止（onStoppedEvent）まで遅延する。true のとき次の確定停止で一度だけ復元する。
+bool g_restorePending = false;
+
+// Image の UUID を大文字 32 桁で返す（ブレイク永続化のキー）。無ければ空。
+static std::string uuidHexOf(const Image& img) {
+  if (!img.hasUuid) return "";
+  char hex[33];
+  for (int i = 0; i < 16; i++) snprintf(hex + i * 2, 3, "%02X", img.uuid[i]);
+  return std::string(hex, 32);
+}
+
+// 永続化されたブレイクを読み、現在ロード済みイメージへ同一アドレスで張り直す。返り値=復元件数（ファイル無し=-1）。
+// 主実行ファイルの UUID をキーにファイルを引き、各行は所属イメージ UUID＋unslid なので ASLR/再実行に強い。
+int restoreBreakpoints() {
+  g_session.refreshImages();
+  const Image* mainImg = g_session.images().mainExecutable();
+  if (!mainImg) return -1;
+  std::string mainUuid = uuidHexOf(*mainImg);
+  if (mainUuid.empty()) return -1;
+  std::vector<BpRecord> recs;
+  if (!BreakpointStore::load(mainUuid, recs)) return -1; // ファイルが無い＝何もしない
+  int applied = 0; bool anyHw = false;
+  for (const auto& r : recs) {
+    const Image* im = nullptr;
+    for (const auto& x : g_session.images().images()) if (uuidHexOf(x) == r.imageUuid) { im = &x; break; }
+    if (!im) continue; // そのイメージが未ロードなら今回は張らない（スキップ）
+    uint64_t addr = r.unslid + im->slide;
+    const Breakpoint* nb;
+    if (r.kind == 2)      { nb = g_session.breaks().addWatch(addr, r.watchSize ? r.watchSize : 8, r.onRead, r.onWrite); anyHw = true; }
+    else if (r.kind == 1) { nb = g_session.breaks().addHw(addr); anyHw = true; }
+    else                  { nb = g_session.breaks().add(addr); }
+    if (nb) { if (!r.enabled) g_session.breaks().setEnabled(nb->id, false); applied++; }
+  }
+  if (anyHw) g_session.syncHwBreaks();
+  return applied;
+}
+
+// w キー: 今のユーザブレイクを永続化する（明示操作でのみ保存。無操作の終了では触らない＝勝手に消さない）。
+// 各ブレイクを所属イメージ UUID＋unslid にして主実行ファイル UUID のファイルへ保存。ファイルはユーザ所有へ戻す。
+void saveBreakpoints() {
+  if (!g_session.isAttached()) {
+    g_message = "ブレイク保存は実行中（attach 中）のみ。対象が生きているうちに w を押してください"; render(); return;
+  }
+  g_session.refreshImages();
+  const Image* mainImg = g_session.images().mainExecutable();
+  if (!mainImg) { g_message = "主実行ファイルが見つからず保存できません"; render(); return; }
+  std::string mainUuid = uuidHexOf(*mainImg);
+  if (mainUuid.empty()) { g_message = "主実行ファイルに UUID が無く保存できません"; render(); return; }
+  std::vector<BpRecord> recs; int skipped = 0;
+  for (const auto& b : g_session.breaks().list()) {
+    const Image* im = g_session.images().byAddress(b.addr);
+    std::string u = im ? uuidHexOf(*im) : "";
+    if (u.empty()) { skipped++; continue; } // イメージ外（JIT/ヒープ等）は復元不能なので保存しない
+    BpRecord r;
+    r.imageUuid = u; r.unslid = b.addr - im->slide;
+    r.kind = b.watch ? 2 : (b.hw ? 1 : 0);
+    r.enabled = b.enabled; r.watchSize = b.watchSize; r.onRead = b.onRead; r.onWrite = b.onWrite;
+    recs.push_back(std::move(r));
+  }
+  std::string err;
+  if (!BreakpointStore::save(mainUuid, recs, err)) { g_message = "保存失敗: " + err; render(); return; }
+  std::string msg = "ブレイク " + std::to_string(recs.size()) + " 件を保存";
+  if (skipped) msg += "（イメージ外 " + std::to_string(skipped) + " 件は除外）";
+  msg += " → " + BreakpointStore::pathForUuid(mainUuid) + "  （次回 :run 時に自動復元）";
+  g_message = msg;
+  render();
+}
 
 // バイナリを起動してデバッグ開始。args[0]=実行ファイルパス、以降は対象への引数。
-void doLaunch(const std::vector<std::string>& args) {
+// restoreSaved=true なら、永続化済みブレイク（w キーで保存した分）をエントリ停止後に自動で張り直す。
+// :restart は自前でブレイクを引き継ぐので false で呼ぶ（二重復元を避ける）。
+void doLaunch(const std::vector<std::string>& args, bool restoreSaved = true) {
   if (args.empty() || args[0].empty()) { g_message = "起動するファイルパスを指定してください"; return; }
   std::vector<char*> cargv;
   for (const auto& s : args) cargv.push_back(const_cast<char*>(s.c_str()));
@@ -564,6 +635,8 @@ void doLaunch(const std::vector<std::string>& args) {
     g_launchArgs = args; // 再起動（:restart）で同じ引数・同じアドレスで起動し直せるよう控える
     g_state = g_session.stopped() ? UiState::Stopped : UiState::Running; // エントリへ走行中→Running、停止済み→Stopped
     g_message = "起動: " + args[0] + "  （エントリで停止します。出力は " + args[0] + ".ta2debug.log）";
+    // 保存ブレイクの復元は dyld 完了後（エントリ停止）に行う。ここでは予約だけ（TUI のみ）。
+    g_restorePending = (restoreSaved && g_interactive);
   } else {
     g_message = "起動失敗: " + err;
   }
@@ -585,7 +658,7 @@ void doRestart() {
   g_state = UiState::Idle;
 
   auto args = g_launchArgs; // doLaunch が g_launchArgs を書き換えるので退避
-  doLaunch(args);
+  doLaunch(args, /*restoreSaved=*/false); // 控えたブレイクを自分で張り直すのでファイル復元はしない
   if (g_state == UiState::Idle) { render(); return; } // 起動失敗（doLaunch がメッセージ済み）
 
   // ブレイクを同一アドレスへ張り直す（種別と有効状態を保つ）。
@@ -1702,6 +1775,7 @@ void runCommand(const std::string& line) {
     const char* H[] = {
       "\x1b[36m― キー操作 ―\x1b[0m",
       "  c 継続    s ステップイン    n ステップオーバ    a auto（call/syscall/ret の手前まで自動継続）    R 再起動    Ctrl+C 割り込み停止",
+      "  w 今のブレイクを永続化（次回 :run 時に同じアドレスへ自動復元。無操作の終了では保存済みを維持＝勝手に消さない）",
       "  :auto [call|syscall|ret|all]  興味のある命令の手前まで自動継続（省略で all、Ctrl+C で中断）",
       "  : コマンド入力    l / L レイアウト切替    1 / 2 / 3 レジスタ/バックトレース/スレッド表示切替    0 全表示",
       "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
@@ -2200,6 +2274,7 @@ void onKey(int c) {
     case 'm': if (g_state == UiState::Stopped && g_session.isAttached()) annotateAtCursor(); break;   // カーソル行に func<16進> シンボルを登録／編集
     case 'R': if (!g_launchArgs.empty()) doRestart(); break; // 対象を同じアドレスで起動し直す（ブレイク復元）
     case 'a': if (g_state == UiState::Stopped && g_session.isAttached()) { runCommand("auto"); render(); } break; // auto（既定=call/syscall/ret すべて）
+    case 'w': saveBreakpoints(); break; // 現在のブレイクを永続化（次回 :run で自動復元。無操作終了では維持）
     case 3:   // Ctrl+C
       if (g_autoMask) { g_autoMask = 0; g_message = "auto 中断"; render(); } // 実行中の step が次に止まる
       else if (g_state == UiState::Running) { g_session.interrupt(); }
@@ -2252,6 +2327,12 @@ bool onStoppedEvent() {
     if (!reason.empty() && !sc.empty()) g_message = reason + "  → " + sc;
     else if (!reason.empty())           g_message = reason;
     else if (!sc.empty())               g_message = "→ syscall: " + sc;
+  }
+  // 起動直後の確定停止（エントリ）で、保存ブレイクを一度だけ復元する（images が揃ったこの時点で）。
+  if (g_restorePending) {
+    g_restorePending = false;
+    int n = restoreBreakpoints();
+    if (n > 0) g_message += std::string(g_message.empty() ? "" : "  ／ ") + "保存ブレイク " + std::to_string(n) + " 件を復元";
   }
   return true;
 }
