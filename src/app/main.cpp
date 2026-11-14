@@ -115,7 +115,10 @@ bool g_disasmFollow = true;    // true=常に現在 PC を先頭に追従
 std::vector<uint64_t> g_disasmTrail; // 前方スクロールで通過した先頭アドレス履歴（後方で正確に戻す）
 int g_disasmHeight = 16;       // 直近の逆アセンブル領域の行数（ページ送り量に使う）
 uint64_t g_curAddr = 0;        // 逆アセンブル枠の選択カーソル（0=未選択=PC 追従）。↑↓で移動し b キーの対象になる。
-std::vector<std::pair<int,uint64_t>> g_visInsns; // 今フレームに描いた命令行（画面行, アドレス）。カーソルの可視判定に使う。
+// 今フレームに描いた命令行。クリック位置→アドレス解決、カーソル可視判定、修飾キー＋クリックの
+// 「呼び出し先シンボルへジャンプ/ブレイク」に使う。
+struct VisInsn { int row; uint64_t addr; bool hasCall; uint64_t callTarget; };
+std::vector<VisInsn> g_visInsns;
 uint64_t g_visFirstAddr = 0, g_visLastAddr = 0;  // 可視命令の先頭/末尾アドレス（カーソルが枠外に出たら追従スクロール）
 int g_disasmColL = -1, g_disasmColR = -1;        // 逆アセンブル枠の桁範囲[左,右)（0 始まり）。マウス click の枠内判定に使う
 bool g_baseRelative = false;   // 逆アセンブルのアドレスを「イメージ先頭からの相対値」で表示（既定=実アドレス）
@@ -244,7 +247,7 @@ void drawDisassembly(const PaneRect& p) {
     g_term.putAt(p.col, lineRow, s);
     if (g_visInsns.empty()) g_visFirstAddr = insns[i].address;
     g_visLastAddr = insns[i].address;
-    g_visInsns.push_back({lineRow, insns[i].address});
+    g_visInsns.push_back({lineRow, insns[i].address, insns[i].hasCallTarget, insns[i].callTarget});
     const Breakpoint* ub = g_session.breaks().userAt(insns[i].address);
     if (ub) {
       // 種類で色分け: SW=赤● / HW 実行=黄◆ / HW ウォッチ=シアン◆。無効は淡色の中空(○/◇)。
@@ -720,7 +723,7 @@ void render() {
     hline += w;
   }
   hline += " \x1b[0m";
-  g_term.putAt(0, 0, hline + "\x1b[K"); // 全幅ではないので行末まで消す（上書き時の残渣防止）
+  g_term.putAt(0, 0, layout::fitWidth(hline, cols)); // 幅ちょうどに切る（長い @where で折り返して 1 行目を侵さないように）
 
   // 参照コマンドの出力オーバレイ（ページャ: ↑↓/Space/b でスクロール、ESC・q で閉じる）
   if (!g_output.empty()) {
@@ -741,7 +744,7 @@ void render() {
     std::string foot;
     if (total > avail) { char b[64]; snprintf(b, sizeof(b), "%d–%d / %d 行", g_outputTop + 1, std::min(total, g_outputTop + avail), total); foot = b; }
     if (!g_message.empty()) foot += (foot.empty() ? "" : "    ") + g_message;
-    if (!foot.empty()) g_term.putAt(0, rows - 1, "\x1b[2m" + foot + "\x1b[0m");
+    if (!foot.empty()) g_term.putAt(0, rows - 1, layout::fitWidth("\x1b[2m" + foot + "\x1b[0m", cols));
     g_term.drawSelectionOverlay();
     g_term.flush();
     return;
@@ -759,14 +762,15 @@ void render() {
     g_term.putAt(0, 2, ":attach <pid> / :run <パス> で開始    :help でコマンド一覧    :q で終了\x1b[K");
   }
 
-  // 最下行: コマンド入力 or メッセージ
+  // 最下行: コマンド入力 or メッセージ。幅を超える長いメッセージ（長いシンボル名へのジャンプ等）は
+  // fitWidth で端末幅ちょうどに切る。切らないと最終行で折り返して画面全体がスクロールし残骸化する。
   g_term.clearLine(rows - 1);
   if (g_cmdMode) {
     std::string line = ":" + g_cmdline;
     if (!g_message.empty()) line += "    \x1b[2m" + g_message + "\x1b[0m"; // 補完候補など
-    g_term.putAt(0, rows - 1, line);
+    g_term.putAt(0, rows - 1, layout::fitWidth(line, cols));
   }
-  else if (!g_message.empty()) g_term.putAt(0, rows - 1, g_message);
+  else if (!g_message.empty()) g_term.putAt(0, rows - 1, layout::fitWidth(g_message, cols));
   g_term.drawSelectionOverlay();
   g_term.flush();
 }
@@ -775,13 +779,13 @@ void render() {
 // 画面全体の render() を呼ばず、これで最下行のみ更新する（無関係なペインを触らずチラつきを無くす）。
 void renderCmdline() {
   g_term.querySize();
-  int rows = g_term.rows();
+  int rows = g_term.rows(), cols = g_term.cols();
   g_term.clearLine(rows - 1);
   if (g_cmdMode) {
     std::string line = ":" + g_cmdline;
     if (!g_message.empty()) line += "    \x1b[2m" + g_message + "\x1b[0m"; // 補完候補など
-    g_term.putAt(0, rows - 1, line);
-  } else if (!g_message.empty()) g_term.putAt(0, rows - 1, g_message);
+    g_term.putAt(0, rows - 1, layout::fitWidth(line, cols));
+  } else if (!g_message.empty()) g_term.putAt(0, rows - 1, layout::fitWidth(g_message, cols));
   g_term.flush();
 }
 
@@ -1614,7 +1618,8 @@ void runCommand(const std::string& line) {
       "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
       "  b カーソル行(未選択なら現在位置)のブレイクをトグル（有れば解除／無ければ設定）    印: ●SW赤 ◆HW黄 ◆ウォッチ水 ○/◇無効",
       "  Tab 逆アセンブル ⇔ スレッド選択 を切替（スレッド選択中は ↑↓ で表示スレッドを切替。★=停止 👁=表示中）",
-      "  マウス: 命令行クリックでカーソル移動 / ダブルクリックでブレイクをトグル / ホイールでスクロール / ドラッグで選択→離すとコピー（端末側の選択に戻すなら :mouse off）",
+      "  マウス: クリックでカーソル移動 / ダブルクリックでブレイクトグル / Option+クリックで呼び出し先へジャンプ / Shift+クリックでそこにブレイク / ホイールでスクロール",
+      "  マウス: ドラッグで選択→離すとコピー（pbcopy/OSC52）。端末側の選択に戻すなら :mouse off",
       "  q 終了",
       "  出力オーバレイ（help/img/libs/syms/reg/dis/x 等）: ↑↓/Space/b ページ  g/G 先頭末尾  ESC・q 閉じる  Enter 続き(x/dis)",
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
@@ -1897,15 +1902,36 @@ void selectThread(int dir) {
 // 停止中でなくても選択・コピーはできる（実行中やオーバレイ表示中の画面もコピーしたいので）。
 // クリックによるカーソル移動／トグルは従来どおり停止中かつ逆アセンブル枠内のみ。
 
-// 移動を伴わない左クリックの本体（カーソル移動 / ダブルクリックでトグル）。
-void onDisasmClick(int mx, int my) {
+// SGR マウスの修飾ビット（ボタンコードに乗る）。Command(⌘) は端末が横取りするので来ない。
+enum { MOD_SHIFT = 4, MOD_ALT = 8, MOD_CTRL = 16 };
+
+// 移動を伴わない左クリックの本体。
+//   無修飾     : カーソル移動（ダブルクリックでその行にブレイクをトグル）
+//   Option+click: その行のシンボル（call 行なら呼び出し先、なければ行自身）の逆アセンブルへジャンプ
+//   Shift+click : そのシンボルにブレイクを設定/解除
+void onDisasmClick(int mx, int my, int mods) {
   if (g_state != UiState::Stopped || !g_session.isAttached()) return;
   if (g_focus != Focus::Disasm) g_focus = Focus::Disasm;      // クリックで逆アセンブルへフォーカス
   if (g_disasmColL < 0 || mx < g_disasmColL + 1 || mx > g_disasmColR) { render(); return; } // 枠外
-  uint64_t addr = 0; bool found = false;
-  for (auto& vi : g_visInsns) if (vi.first == my - 1) { addr = vi.second; found = true; break; }
-  if (!found) { render(); return; }                            // 命令行でない行
-  g_curAddr = addr;
+  const VisInsn* vi = nullptr;
+  for (auto& v : g_visInsns) if (v.row == my - 1) { vi = &v; break; }
+  if (!vi) { render(); return; }                               // 命令行でない行（見出し/ソース/空白）
+  // 対象アドレス: call 行なら呼び出し先シンボル、なければ行自身。
+  uint64_t symAddr = vi->hasCall ? vi->callTarget : vi->addr;
+
+  if (mods & MOD_ALT) {                                         // Option+click: シンボルへジャンプ
+    g_disasmTop = symAddr; g_disasmFollow = false; g_disasmTrail.clear();
+    g_curAddr = symAddr;
+    std::string w = g_session.describe(symAddr);
+    g_message = "ジャンプ: " + (w.empty() ? "0x" : w);
+    render(); return;
+  }
+  if (mods & MOD_SHIFT) {                                       // Shift+click: シンボルにブレイクをトグル
+    g_curAddr = symAddr; toggleBreakAtCursor();                // 内部で render
+    return;
+  }
+  // 無修飾（Ctrl 等も含む）: カーソル移動＋ダブルクリックでその行にトグル。
+  g_curAddr = vi->addr;
   static auto last = std::chrono::steady_clock::now() - std::chrono::hours(1);
   static int lastMy = -1;
   auto now = std::chrono::steady_clock::now();
@@ -1918,6 +1944,7 @@ void onDisasmClick(int mx, int my) {
 
 int g_mouseDownX = -1, g_mouseDownY = -1; // 直近の左押下位置（0 始まり）
 int g_lastDragX = -1, g_lastDragY = -1;   // 直近に反映したドラッグ位置（同一セルなら再描画を省く）
+int g_mouseDownMods = 0;                  // 左押下時の修飾キー（解放時に来ない端末もあるので控える）
 bool g_mouseDragging = false;             // 押下後に移動があった＝選択中
 
 void onMouse(int button, int mx, int my, bool press) {
@@ -1925,6 +1952,7 @@ void onMouse(int button, int mx, int my, bool press) {
   bool wheel  = (button & 0x40) != 0;
   bool motion = (button & 0x20) != 0;
   int  btn    = button & 0x03;
+  int  mods   = button & (MOD_SHIFT | MOD_ALT | MOD_CTRL); // bit2=Shift,3=Alt(Option),4=Ctrl
 
   if (wheel) {                                          // ホイール: 逆アセンブル枠を上下スクロール（停止中のみ）
     if (g_state != UiState::Stopped) return;
@@ -1934,7 +1962,7 @@ void onMouse(int button, int mx, int my, bool press) {
 
   if (press && !motion && btn == 0) {                  // 左ボタン DOWN
     g_mouseDownX = x; g_mouseDownY = y; g_mouseDragging = false;
-    g_lastDragX = g_lastDragY = -1;
+    g_lastDragX = g_lastDragY = -1; g_mouseDownMods = mods;
     if (g_term.hasSelection()) { g_term.clearSelection(); render(); } // 前回の選択を消す
     return;
   }
@@ -1953,8 +1981,8 @@ void onMouse(int button, int mx, int my, bool press) {
       g_message = ok ? "選択をコピーしました（:mouse off で端末選択）" : "選択が空です";
       g_mouseDragging = false;
       render();
-    } else {                                            // 移動なし → クリック操作
-      onDisasmClick(mx, my);
+    } else {                                            // 移動なし → クリック操作（押下時の修飾キーで分岐）
+      onDisasmClick(mx, my, g_mouseDownMods | mods);
     }
     return;
   }
