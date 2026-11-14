@@ -152,6 +152,18 @@ std::string fitWidth(const std::string& t, int width) {
   return r;
 }
 
+std::vector<std::pair<std::string, int>> glyphs(const std::string& t) {
+  std::vector<std::pair<std::string, int>> out;
+  size_t pos = 0;
+  while (pos < t.size()) {
+    size_t e = escLen(t, pos); if (e) { pos += e; continue; } // ANSI は桁を持たない
+    size_t len = std::min(utf8Len((unsigned char)t[pos]), t.size() - pos);
+    out.push_back({t.substr(pos, len), charWidth(t, pos, len)});
+    pos += len;
+  }
+  return out;
+}
+
 std::string dropLeft(const std::string& t, int cols) {
   if (cols <= 0) return t;
   int dropped = 0; size_t pos = 0;
