@@ -1804,6 +1804,7 @@ void runCommand(const std::string& line) {
       "\x1b[36m― キー操作 ―\x1b[0m",
       "  c 継続    s ステップイン    n ステップオーバ    a auto（call/syscall/ret の手前まで自動継続）    R 再起動    Ctrl+C 割り込み停止",
       "  w 今のブレイクを永続化（次回 :run 時に同じアドレスへ自動復元。無操作の終了では保存済みを維持＝勝手に消さない）",
+      "    dlopen で後から読むライブラリのブレイクも、そのライブラリがロードされた瞬間に自動装着する（止まって見えない）",
       "  :auto [call|syscall|ret|all]  興味のある命令の手前まで自動継続（省略で all、Ctrl+C で中断）",
       "  : コマンド入力    l / L レイアウト切替    1 / 2 / 3 レジスタ/バックトレース/スレッド表示切替    0 全表示",
       "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
@@ -2326,6 +2327,7 @@ bool onStoppedEvent() {
   g_session.refreshAnnotations(); // ユーザ注釈を（外部編集を含め）読み直し、停止表示・BT に反映（条件2）
   g_session.refineSyscallStopThread(); // syscall 停止キャッチポイントなら発火スレッドを確定（複数スレッド対応）
   g_session.warmSymbols(); // 初回停止でイメージが揃ったら裏でシンボルを先読み（idempotent）
+  if (g_interactive) g_session.ensureDyldNotifier(); // dlopen 追従フックを設置（冪等。dyld 初期化後＝この停止で有効）
   if (g_autoMask) {
     uint64_t pc = g_session.stopPc();
     bool crash = g_session.stopException() != 0;
@@ -2665,7 +2667,14 @@ int main(int argc, char** argv) {
       render();
     }
     else if (e.kind == Event::Stopped) {
-      if (onStoppedEvent()) { resetViewOnStop(); render(); } // auto 継続中（false）は描画せず次の停止を待つ
+      if (g_session.stopIsImageLoad()) {
+        // dlopen 等でイメージが増減した内部停止。画面には出さず（止まって見せず）、イメージ一覧を
+        // 更新して、新しく載ったイメージの保留ブレイクを装着してから即 cont する。芋づる式の
+        // ロードでも見える停止は 0 回。ロード直後＝そのコードを実行する前に張るので初回呼び出しも捕まえる。
+        g_session.refreshImages();
+        applyPendingBreakpoints();
+        g_session.cont();
+      } else if (onStoppedEvent()) { resetViewOnStop(); render(); } // auto 継続中（false）は描画せず次の停止を待つ
     }
     else if (e.kind == Event::TargetExited) {
       g_session.detach(); // 片付け（死んだ task への操作は無害に失敗する）

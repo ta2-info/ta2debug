@@ -1,5 +1,6 @@
 #include "core/Session.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -18,6 +19,8 @@
 #include <mach/vm_prot.h>
 #include <mach/vm_statistics.h>
 #include <mach-o/loader.h>
+#include <mach-o/dyld_images.h>
+#include <mach/task_info.h>
 
 #include "core/Disassembler.h"
 
@@ -114,6 +117,25 @@ uint64_t Session::findEntryPoint() {
     return 0; // メインは見つけたが LC_MAIN 無し（LC_UNIXTHREAD のみ）
   }
   return 0;
+}
+
+// dyld の all_image_infos.notification（イメージ増減のたびに dyld が呼ぶ関数）へ内部ソフトブレイクを置く。
+// gdb/lldb と同じ手法。以降 dlopen/dlclose でそこへ #BP が来るので、メインが静かに追従できる。
+// 停止中（タスク suspend 済み）に呼ぶこと。すでに設置済み、または通知アドレスが取れなければ何もしない。
+void Session::ensureDyldNotifier() {
+  if (dyldNotifyAddr_ && bps_.has(dyldNotifyAddr_)) return; // 設置済み
+  if (!target_.isAttached()) return;
+  task_dyld_info_data_t info = {};
+  mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
+  if (task_info(target_.task(), TASK_DYLD_INFO, (task_info_t)&info, &cnt) != KERN_SUCCESS) return;
+  struct dyld_all_image_infos all = {};
+  size_t want = std::min(sizeof(all), (size_t)info.all_image_info_size);
+  if (want < offsetof(struct dyld_all_image_infos, notification) + sizeof(void*)) return;
+  if (!target_.readMemory(info.all_image_info_addr, &all, want)) return;
+  uint64_t addr = (uint64_t)all.notification;
+  if (!addr) return;                 // dyld が通知関数を公開していない
+  if (!bps_.addSoft(addr)) return;   // ここに INT3/BRK を置く（物理層。ユーザ一覧には入れない）
+  dyldNotifyAddr_ = addr;
 }
 
 void Session::startExitMonitor() {
@@ -835,6 +857,7 @@ void Session::detach() {
   }
   es_.uninstall();
   target_.detach();
+  dyldNotifyAddr_ = 0; stopIsImageLoad_ = false; // 次の起動/アタッチで通知フックを張り直す
 }
 
 void Session::decide(Resume r) {
@@ -947,6 +970,7 @@ kern_return_t Session::onException(thread_act_t thread, exception_type_t exc,
   Arch& a = target_.arch();
   target_.suspend(); // 判断・停止中はタスク全体を凍結
   stopIsSyscallCatch_ = false; // 例外由来の停止（syscall キャッチではない）
+  stopIsImageLoad_ = false;    // 既定。dyld 通知フック命中時のみ下で true
 
   std::vector<uint8_t> ts(a.threadStateCount() * sizeof(natural_t), 0);
   target_.getThreadState(thread, ts.data());
@@ -1022,6 +1046,8 @@ kern_return_t Session::onException(thread_act_t thread, exception_type_t exc,
       target_.setThreadState(thread, ts.data());
       stopPc_ = at;
       if (tempValid_ && at == tempAddr_) { bps_.removeSoft(tempAddr_); tempValid_ = false; }
+      else if (dyldNotifyAddr_ && at == dyldNotifyAddr_ && !bps_.userAt(at))
+        stopIsImageLoad_ = true; // dyld イメージ通知フック命中＝dlopen 等。メインが静かに追従して即 cont する
       else bps_.onHit(at); // ユーザブレイク命中（一時ブレイクは数えない）
     } else if (hwb && hwb->hw && !hwb->watch && hwb->enabled) {
       stopPc_ = pc;        // HW 実行ブレイク命中
