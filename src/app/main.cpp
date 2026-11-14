@@ -19,6 +19,7 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "app/EventQueue.h"
@@ -547,6 +548,11 @@ void doAttach(pid_t pid) {
   }
 }
 
+void render(); // 定義は後方。doRestart から使うので前方宣言。
+
+// 直近に :run/launch で起動した対象の引数（再起動用）。:attach で付けた対象では空のまま。
+std::vector<std::string> g_launchArgs;
+
 // バイナリを起動してデバッグ開始。args[0]=実行ファイルパス、以降は対象への引数。
 void doLaunch(const std::vector<std::string>& args) {
   if (args.empty() || args[0].empty()) { g_message = "起動するファイルパスを指定してください"; return; }
@@ -555,11 +561,51 @@ void doLaunch(const std::vector<std::string>& args) {
   cargv.push_back(nullptr);
   std::string err;
   if (g_session.launch(args[0], cargv.data(), err)) {
+    g_launchArgs = args; // 再起動（:restart）で同じ引数・同じアドレスで起動し直せるよう控える
     g_state = g_session.stopped() ? UiState::Stopped : UiState::Running; // エントリへ走行中→Running、停止済み→Stopped
     g_message = "起動: " + args[0] + "  （エントリで停止します。出力は " + args[0] + ".ta2debug.log）";
   } else {
     g_message = "起動失敗: " + err;
   }
+}
+
+// 対象を終了させて、同じ引数・同じアドレス（ASLR 無効で slide=0）で起動し直す。
+// ユーザが張ったブレイクは控えておき、再起動後に同一アドレスへ張り直す（種別・有効状態も保つ）。
+// 注釈（.t2a）は UUID 別ファイルに永続化されているので自動で復活する。
+void doRestart() {
+  if (g_launchArgs.empty()) {
+    g_message = ":run で起動した対象のみ再起動できます（:attach で付けた対象は不可）"; render(); return;
+  }
+  // 再起動後に張り直すユーザブレイクを控える（list はコピーを返す）。
+  std::vector<Breakpoint> saved = g_session.breaks().list();
+  pid_t oldpid = g_session.isAttached() ? g_session.pid() : 0;
+  if (g_session.isAttached()) g_session.detach(); // 自分で起動した子は Target::detach が SIGKILL する
+  g_session.breaks().removeAll();                 // 旧 task 向けのユーザ一覧を一掃（新プロセスへ張り直すため）
+  if (oldpid > 0) { int st; while (waitpid(oldpid, &st, 0) < 0 && errno == EINTR) {} } // 旧プロセスを回収（ゾンビ防止）
+  g_state = UiState::Idle;
+
+  auto args = g_launchArgs; // doLaunch が g_launchArgs を書き換えるので退避
+  doLaunch(args);
+  if (g_state == UiState::Idle) { render(); return; } // 起動失敗（doLaunch がメッセージ済み）
+
+  // ブレイクを同一アドレスへ張り直す（種別と有効状態を保つ）。
+  int reapplied = 0; bool anyHw = false;
+  for (const auto& b : saved) {
+    const Breakpoint* nb;
+    if (b.hw && b.watch) { nb = g_session.breaks().addWatch(b.addr, b.watchSize, b.onRead, b.onWrite); anyHw = true; }
+    else if (b.hw)       { nb = g_session.breaks().addHw(b.addr); anyHw = true; }
+    else                 { nb = g_session.breaks().add(b.addr); }
+    if (nb) { if (!b.enabled) g_session.breaks().setEnabled(nb->id, false); reapplied++; }
+  }
+  if (anyHw) g_session.syncHwBreaks();
+
+  g_curAddr = 0; g_disasmFollow = true; g_disasmTop = 0; g_disasmTrail.clear(); g_viewThread = 0;
+  char m[200];
+  if (saved.empty()) snprintf(m, sizeof(m), "再起動: %s（エントリで停止）", args[0].c_str());
+  else snprintf(m, sizeof(m), "再起動: %s（エントリで停止。ブレイク %d/%zu 件を復元）",
+                args[0].c_str(), reapplied, saved.size());
+  g_message = m;
+  render();
 }
 
 void openPicker() {
@@ -1133,6 +1179,8 @@ void runCommand(const std::string& line) {
     if (arg.empty()) { g_message = "使い方: run <実行ファイルパス> [引数...]"; return; }
     std::vector<std::string> args; { std::string cur; for (char ch : arg) { if (ch==' ') { if(!cur.empty()){args.push_back(cur);cur.clear();} } else cur.push_back(ch); } if(!cur.empty()) args.push_back(cur); }
     doLaunch(args);
+  } else if (cmd == "restart" || cmd == "rerun") {
+    doRestart(); // 対象を終了して同じ引数・同じアドレスで起動し直し、ブレイクを張り直す
   } else if (cmd == "detach") {
     g_session.detach();
     g_state = UiState::Idle;
@@ -1653,7 +1701,7 @@ void runCommand(const std::string& line) {
     g_output.clear(); g_outputTitle = "ta2debug ヘルプ";
     const char* H[] = {
       "\x1b[36m― キー操作 ―\x1b[0m",
-      "  c 継続    s ステップイン    n ステップオーバ    Ctrl+C 実行中を割り込み停止",
+      "  c 継続    s ステップイン    n ステップオーバ    R 再起動（同アドレスで起動し直し）    Ctrl+C 実行中を割り込み停止",
       "  :auto [call|syscall|ret|all]  興味のある命令の手前まで自動継続（省略で all、Ctrl+C で中断）",
       "  : コマンド入力    l / L レイアウト切替    1 / 2 / 3 レジスタ/バックトレース/スレッド表示切替    0 全表示",
       "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
@@ -1667,6 +1715,7 @@ void runCommand(const std::string& line) {
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
       "  :attach [pid]              pid 省略でプロセス一覧から選択",
       "  :run <パス> [引数...]      バイナリを起動してデバッグ（エントリ手前で停止）",
+      "  :restart / :rerun (R キー) :run した対象を同じ引数・同じアドレスで起動し直す（ブレイクも張り直す）",
       "  :detach                    デタッチ（attach は動き続ける／:run した子は終了させる）",
       "\x1b[36m― ブレイクポイント ―\x1b[0m",
       "  :b  <式>                   ソフトブレイク（INT3/BRK）",
@@ -1734,7 +1783,7 @@ void runCommand(const std::string& line) {
 // コマンド名の TAB 補完（最初の語のみ。引数部では何もしない）。
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
-  static const char* CMDS[] = {"attach", "detach", "run", "launch", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "bd", "bt",
+  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "bd", "bt",
                                "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch", "scstop", "mouse"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
@@ -2149,6 +2198,7 @@ void onKey(int c) {
     case 'c': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.cont(); g_state = UiState::Running; g_message.clear(); render(); } break;
     case 'b': if (g_state == UiState::Stopped && g_session.isAttached()) toggleBreakAtCursor(); break; // カーソル行のブレイクをトグル
     case 'm': if (g_state == UiState::Stopped && g_session.isAttached()) annotateAtCursor(); break;   // カーソル行に func<16進> シンボルを登録／編集
+    case 'R': if (!g_launchArgs.empty()) doRestart(); break; // 対象を同じアドレスで起動し直す（ブレイク復元）
     case 3:   // Ctrl+C
       if (g_autoMask) { g_autoMask = 0; g_message = "auto 中断"; render(); } // 実行中の step が次に止まる
       else if (g_state == UiState::Running) { g_session.interrupt(); }
