@@ -1701,7 +1701,7 @@ void runCommand(const std::string& line) {
     g_output.clear(); g_outputTitle = "ta2debug ヘルプ";
     const char* H[] = {
       "\x1b[36m― キー操作 ―\x1b[0m",
-      "  c 継続    s ステップイン    n ステップオーバ    R 再起動（同アドレスで起動し直し）    Ctrl+C 実行中を割り込み停止",
+      "  c 継続    s ステップイン    n ステップオーバ    a auto（call/syscall/ret の手前まで自動継続）    R 再起動    Ctrl+C 割り込み停止",
       "  :auto [call|syscall|ret|all]  興味のある命令の手前まで自動継続（省略で all、Ctrl+C で中断）",
       "  : コマンド入力    l / L レイアウト切替    1 / 2 / 3 レジスタ/バックトレース/スレッド表示切替    0 全表示",
       "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
@@ -2199,6 +2199,7 @@ void onKey(int c) {
     case 'b': if (g_state == UiState::Stopped && g_session.isAttached()) toggleBreakAtCursor(); break; // カーソル行のブレイクをトグル
     case 'm': if (g_state == UiState::Stopped && g_session.isAttached()) annotateAtCursor(); break;   // カーソル行に func<16進> シンボルを登録／編集
     case 'R': if (!g_launchArgs.empty()) doRestart(); break; // 対象を同じアドレスで起動し直す（ブレイク復元）
+    case 'a': if (g_state == UiState::Stopped && g_session.isAttached()) { runCommand("auto"); render(); } break; // auto（既定=call/syscall/ret すべて）
     case 3:   // Ctrl+C
       if (g_autoMask) { g_autoMask = 0; g_message = "auto 中断"; render(); } // 実行中の step が次に止まる
       else if (g_state == UiState::Running) { g_session.interrupt(); }
