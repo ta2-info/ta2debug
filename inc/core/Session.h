@@ -93,6 +93,13 @@ public:
   const Image* defaultLibImage();
   // 停止時などに一覧が変わっていれば読み直す（dlopen 追従）
   void refreshImages() { images_.refreshIfChanged(); }
+
+  // dyld のイメージ通知フック（all_image_infos.notification）に内部ソフトブレイクを 1 本置く。
+  // 以降 dlopen/dlclose のたびにそこへ内部停止が来る。停止中（タスク suspend 済み）に呼ぶこと。冪等。
+  void ensureDyldNotifier();
+  // 直近の停止が dyld のイメージ通知（dlopen 等）由来か。true ならメインは画面に出さず
+  // イメージ更新＋保留ブレイク装着をして即 cont する（ユーザには止まって見えない）。
+  bool stopIsImageLoad() const { return stopIsImageLoad_; }
   // アドレスを "image 0x.. func+0xNN"（無ければ "image 0x.." / 空）に整形（ステータス用）
   std::string describe(uint64_t addr);
   // 関数名だけを短く（"func" / "func+0xNN"）。無ければイメージ名。call 先注記用。
@@ -210,6 +217,8 @@ private:
   int64_t stopCode0_ = 0;       // 例外 code[0]（BAD_ACCESS なら kern_return の種別）
   int64_t stopCode1_ = 0;       // 例外 code[1]（BAD_ACCESS ならフォルトしたアドレス）
   bool stopIsSyscallCatch_ = false; // 直近の停止が syscall 停止キャッチポイント由来か（表示用）
+  uint64_t dyldNotifyAddr_ = 0;     // dyld イメージ通知フックのアドレス（内部キャッチポイント）。0=未設置
+  bool stopIsImageLoad_ = false;    // 直近の停止が dyld イメージ通知由来か（dlopen 等の内部停止）
   std::string scStopCaught_;        // そのとき発火した syscall/トラップ名（stopReason 用）
 
   // 全スレッドのデバッグレジスタへ HW ブレイク集合を書き込む（呼び出し側がタスク停止を保証する）
