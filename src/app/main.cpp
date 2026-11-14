@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
@@ -113,6 +114,10 @@ uint64_t g_disasmTop = 0;      // 逆アセンブル表示の先頭アドレス�
 bool g_disasmFollow = true;    // true=常に現在 PC を先頭に追従
 std::vector<uint64_t> g_disasmTrail; // 前方スクロールで通過した先頭アドレス履歴（後方で正確に戻す）
 int g_disasmHeight = 16;       // 直近の逆アセンブル領域の行数（ページ送り量に使う）
+uint64_t g_curAddr = 0;        // 逆アセンブル枠の選択カーソル（0=未選択=PC 追従）。↑↓で移動し b キーの対象になる。
+std::vector<std::pair<int,uint64_t>> g_visInsns; // 今フレームに描いた命令行（画面行, アドレス）。カーソルの可視判定に使う。
+uint64_t g_visFirstAddr = 0, g_visLastAddr = 0;  // 可視命令の先頭/末尾アドレス（カーソルが枠外に出たら追従スクロール）
+int g_disasmColL = -1, g_disasmColR = -1;        // 逆アセンブル枠の桁範囲[左,右)（0 始まり）。マウス click の枠内判定に使う
 bool g_baseRelative = false;   // 逆アセンブルのアドレスを「イメージ先頭からの相対値」で表示（既定=実アドレス）
 int g_threadSel = 0;           // スレッド一覧の選択位置
 thread_act_t g_viewThread = 0; // 表示中スレッド（0=停止スレッド）。他スレッドのレジスタ/逆アセンブルを見る用
@@ -183,8 +188,9 @@ uint64_t disasmBack(uint64_t top, int n) {
 }
 
 void drawDisassembly(const PaneRect& p) {
-  if (!p.visible) return;
+  if (!p.visible) { g_disasmColL = g_disasmColR = -1; return; }
   g_disasmHeight = p.height;                               // ページ送り量に使う
+  g_disasmColL = p.col; g_disasmColR = p.col + p.width;    // マウス click の枠内判定に使う桁範囲
   Arch& a = g_session.arch();
   uint64_t pc = viewPc();                                  // 表示中スレッドの現在命令（反転表示の対象）
   uint64_t start = g_disasmFollow ? pc : g_disasmTop;      // 表示の先頭（スクロール中は追従解除）
@@ -195,6 +201,7 @@ void drawDisassembly(const PaneRect& p) {
   const Image* img = g_session.images().byAddress(start);
   auto insns = dis.disasm(code, got, start, p.height);
   int y = 0;
+  g_visInsns.clear(); g_visFirstAddr = g_visLastAddr = 0; // この描画で見えている命令行を記録し直す
   uint64_t lastFunc = 0; bool haveLast = false;
   std::string lastSrcFile; int lastSrcLine = -1;
   for (size_t i = 0; i < insns.size() && y < p.height; i++) {
@@ -225,20 +232,31 @@ void drawDisassembly(const PaneRect& p) {
     std::string s(line);
     if (insns[i].hasCallTarget) { std::string t = g_session.symbolName(insns[i].callTarget); if (!t.empty()) s += "  ; " + t; }
     bool cur = insns[i].address == pc;
+    bool sel = (g_curAddr != 0) && (insns[i].address == g_curAddr); // 選択カーソル行（PC とは別）
     if (cur && viewingStopThread() && insns[i].kind == InsnKind::Syscall) { // これから呼ぶシステムコールを注釈
       std::string sc = g_session.syscallAtStop();
       if (!sc.empty()) s += "  ; → " + sc;
     }
     s = layout::fitWidth(s, p.width);
-    if (cur) s = "\x1b[7m" + s + "\x1b[0m";
+    if (cur) s = "\x1b[7m" + s + "\x1b[0m";            // PC は反転
+    else if (sel) s = "\x1b[4m" + s + "\x1b[0m";       // カーソル行（PC でない）は下線
     int lineRow = p.row + y++;
     g_term.putAt(p.col, lineRow, s);
+    if (g_visInsns.empty()) g_visFirstAddr = insns[i].address;
+    g_visLastAddr = insns[i].address;
+    g_visInsns.push_back({lineRow, insns[i].address});
     const Breakpoint* ub = g_session.breaks().userAt(insns[i].address);
     if (ub) {
-      const char* mark = ub->hw ? (ub->enabled ? "\x1b[31m◆\x1b[0m" : "\x1b[2m◇\x1b[0m")
-                                : (ub->enabled ? "\x1b[31m●\x1b[0m" : "\x1b[2m○\x1b[0m");
+      // 種類で色分け: SW=赤● / HW 実行=黄◆ / HW ウォッチ=シアン◆。無効は淡色の中空(○/◇)。
+      const char* mark;
+      if (!ub->enabled)   mark = ub->hw ? "\x1b[2m◇\x1b[0m" : "\x1b[2m○\x1b[0m";
+      else if (!ub->hw)   mark = "\x1b[31m●\x1b[0m";
+      else if (ub->watch) mark = "\x1b[36m◆\x1b[0m";
+      else                mark = "\x1b[33m◆\x1b[0m";
       g_term.putAt(p.col, lineRow, mark);
     }
+    // カーソル位置の目印（溝の 2 桁目）。PC と重なっても必ず描く（重なると ▸ が消えて見失うため）。
+    if (sel) g_term.putAt(p.col + 1, lineRow, cur ? "\x1b[1;7m▸\x1b[0m" : "\x1b[1m▸\x1b[0m");
   }
   for (; y < p.height; y++) g_term.putAt(p.col, p.row + y, std::string(p.width, ' '));
 }
@@ -660,6 +678,7 @@ void render() {
 
   if (g_pickerMode) {
     drawPicker(rows, cols);
+    g_term.drawSelectionOverlay();
     g_term.flush();
     return;
   }
@@ -723,6 +742,7 @@ void render() {
     if (total > avail) { char b[64]; snprintf(b, sizeof(b), "%d–%d / %d 行", g_outputTop + 1, std::min(total, g_outputTop + avail), total); foot = b; }
     if (!g_message.empty()) foot += (foot.empty() ? "" : "    ") + g_message;
     if (!foot.empty()) g_term.putAt(0, rows - 1, "\x1b[2m" + foot + "\x1b[0m");
+    g_term.drawSelectionOverlay();
     g_term.flush();
     return;
   }
@@ -747,6 +767,7 @@ void render() {
     g_term.putAt(0, rows - 1, line);
   }
   else if (!g_message.empty()) g_term.putAt(0, rows - 1, g_message);
+  g_term.drawSelectionOverlay();
   g_term.flush();
 }
 
@@ -1189,13 +1210,13 @@ void runCommand(const std::string& line) {
     if (g_state != UiState::Stopped) { g_message = "dis は停止中のみ（逆アセンブル画面の移動）"; return; }
     std::string a = trimStr(arg);
     if (a.empty()) {
-      g_disasmFollow = true; g_disasmTrail.clear();           // 現在 PC へ戻す（追従）
+      g_disasmFollow = true; g_disasmTrail.clear(); g_curAddr = 0; // 現在 PC へ戻す（追従）
       g_message = "逆アセンブル: 現在位置(PC)へ";
     } else {
       evalAsync(a, [](bool ok, uint64_t addr, const std::string& eerr) {
         if (!ok) { g_message = "式エラー: " + eerr; return; }
         if (g_state != UiState::Stopped) { g_message = "dis は停止中のみ（逆アセンブル画面の移動）"; return; } // 評価中に状態が変わった場合
-        g_disasmTop = addr; g_disasmFollow = false; g_disasmTrail.clear(); g_focus = Focus::Disasm;
+        g_disasmTop = addr; g_disasmFollow = false; g_disasmTrail.clear(); g_curAddr = addr; g_focus = Focus::Disasm;
         std::string w = g_session.describe(addr);
         g_message = "逆アセンブル: " + (w.empty() ? "0x" : w) + " から（↑↓/Ctrl+F で移動、s/n/c で現在位置へ）";
       });
@@ -1568,6 +1589,13 @@ void runCommand(const std::string& line) {
   } else if (cmd == "baseoff" || cmd == "baseon") {
     g_baseRelative = (cmd == "baseoff"); // baseoff=イメージ先頭からの相対値 / baseon=実アドレス(既定)
     g_message = std::string("逆アセンブルのアドレス表示: ") + (g_baseRelative ? "イメージ先頭からの相対値" : "実アドレス");
+  } else if (cmd == "mouse") {
+    // マウス通知の ON/OFF。OFF 中は端末標準のドラッグ選択・コピーが戻る（クリック操作は無効になる）。
+    bool on = g_term.mouseOn();
+    if (arg == "on") on = true; else if (arg == "off") on = false; else on = !on; // 省略＝トグル
+    g_term.setMouse(on);
+    g_message = std::string("マウス操作: ") + (on ? "ON（クリック/ダブルクリック/ホイール有効）"
+                                               : "OFF（端末でドラッグ選択・コピー可。:mouse on で再開）");
   } else if (cmd == "dr") {
     if (g_state != UiState::Stopped) { g_message = "dr は停止中のみ参照できます"; return; }
     std::vector<uint8_t> ds(g_session.arch().debugStateCount() * sizeof(natural_t), 0);
@@ -1583,8 +1611,10 @@ void runCommand(const std::string& line) {
       "  c 継続    s ステップイン    n ステップオーバ    Ctrl+C 実行中を割り込み停止",
       "  :auto [call|syscall|ret|all]  興味のある命令の手前まで自動継続（省略で all、Ctrl+C で中断）",
       "  : コマンド入力    l / L レイアウト切替    1 / 2 / 3 レジスタ/バックトレース/スレッド表示切替    0 全表示",
-      "  ↑ / ↓ 逆アセンブルを 1 命令スクロール    Ctrl+F / Ctrl+B 1 ページ送り（s/n/c で現在位置へ戻る）",
+      "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
+      "  b カーソル行(未選択なら現在位置)のブレイクをトグル（有れば解除／無ければ設定）    印: ●SW赤 ◆HW黄 ◆ウォッチ水 ○/◇無効",
       "  Tab 逆アセンブル ⇔ スレッド選択 を切替（スレッド選択中は ↑↓ で表示スレッドを切替。★=停止 👁=表示中）",
+      "  マウス: 命令行クリックでカーソル移動 / ダブルクリックでブレイクをトグル / ホイールでスクロール / ドラッグで選択→離すとコピー（端末側の選択に戻すなら :mouse off）",
       "  q 終了",
       "  出力オーバレイ（help/img/libs/syms/reg/dis/x 等）: ↑↓/Space/b ページ  g/G 先頭末尾  ESC・q 閉じる  Enter 続き(x/dis)",
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
@@ -1604,6 +1634,7 @@ void runCommand(const std::string& line) {
       "  :p <式>  :p/x  :p/d         式の値を表示（10進+16進 / 16進 / 10進）",
       "  :intel / :atandt           逆アセンブルの記法を Intel / AT&T(既定) に切替（x86）",
       "  :baseoff / :baseon         逆アセンブルのアドレスを イメージ先頭相対 / 実アドレス(既定) で表示",
+      "  :mouse [on|off]            マウス操作の ON/OFF（省略でトグル）。ON=クリック/ドラッグ選択コピー、OFF=端末側の選択に戻す",
       "  :dis [<式>]                逆アセンブル画面をそのアドレスへ移動（省略で現在 PC へ。以降 ↑↓/Ctrl+F）",
       "  :x <式> [バイト数]         メモリ 16 進ダンプ",
       "  :x/<個数><書式><サイズ> <式>  書式付き（書式 x d u o t c i s f a / サイズ b h w g）",
@@ -1654,7 +1685,7 @@ void runCommand(const std::string& line) {
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
   static const char* CMDS[] = {"attach", "detach", "run", "launch", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "bd", "bt",
-                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch", "scstop"};
+                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch", "scstop", "mouse"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
     if (std::string(c).rfind(g_cmdline, 0) == 0) cands.push_back(c); // 接頭辞一致
@@ -1707,8 +1738,140 @@ void moveDisasm(int instrs) {
   }
   g_disasmTop = top; g_disasmFollow = false;
 }
-void scrollDisasm(int dir) { moveDisasm(dir > 0 ? +1 : -1); }                               // ↑↓: 1 命令
-void pageDisasm(int dir) { moveDisasm(dir > 0 ? +std::max(1, g_disasmHeight - 1) : -std::max(1, g_disasmHeight - 1)); } // Ctrl+F/B: 1 ページ
+
+// カーソルのすぐ次の命令アドレス（逆アセンブルで厳密に境界を取る。端なら同じ値）。
+static uint64_t nextInsnAddr(uint64_t a) {
+  uint8_t code[32] = {}; size_t got = 0;
+  g_session.target().readMemory(a, code, sizeof(code), &got);
+  g_session.maskBreakpoints(a, code, got);
+  Disassembler dis(g_session.arch()); auto in = dis.disasm(code, got, a, 2);
+  return (in.size() >= 2) ? in[1].address : a;
+}
+
+// drawDisassembly と同じ行割り当て（関数名ヘッダ / ソース行注釈を命令行の間に挿入）を
+// 実際には描かずに数え、top から高さ height に収まる「最後に見える命令アドレス」を返す。
+// 可視命令が無ければ 0。注釈行ぶん可視命令数が p.height より減るため、カーソル追従は
+// この測定を使って「実際に描かれる範囲」を知る必要がある。drawDisassembly の該当ロジック
+// （関数名ヘッダ / ソース行の挿入条件と break 条件）と必ず歩調を合わせること。
+static uint64_t disasmLastVisible(uint64_t top, int height) {
+  if (height <= 0) return 0;
+  uint8_t code[512] = {}; size_t got = 0;
+  g_session.target().readMemory(top, code, sizeof(code), &got);
+  g_session.maskBreakpoints(top, code, got);
+  Disassembler dis(g_session.arch());
+  const Image* img = g_session.images().byAddress(top);
+  auto insns = dis.disasm(code, got, top, height);
+  int y = 0; uint64_t last = 0;
+  uint64_t lastFunc = 0; bool haveLast = false;
+  std::string lastSrcFile; int lastSrcLine = -1;
+  for (size_t i = 0; i < insns.size() && y < height; i++) {
+    const Symbol* fn = img ? g_session.symbols().byAddress(*img, insns[i].address) : nullptr;
+    if (fn && (!haveLast || lastFunc != fn->addr)) { y++; if (y >= height) break; } // 関数名ヘッダ
+    haveLast = fn != nullptr; lastFunc = fn ? fn->addr : 0;
+    SourceLoc loc;
+    if (g_session.sourceLineFor(insns[i].address, loc) &&
+        (loc.line != lastSrcLine || loc.file != lastSrcFile)) {
+      lastSrcFile = loc.file; lastSrcLine = loc.line; y++; if (y >= height) break; // ソース行注釈
+    }
+    y++;                      // 命令行そのもの
+    last = insns[i].address;  // ここまで描けた＝可視
+  }
+  return last;
+}
+
+// 選択カーソルが実際に描画される可視範囲に入るまで追従スクロールする。
+// 枠内に注釈行（関数名ヘッダ / ソース行）が挟まると可視命令数が height より減るので、
+// 「先頭を 1 命令送る」だけでは下端からはみ出したまま取り残されることがある
+// （↓ を押し続けると数十行でカーソル ▸ が画面外に落ちて見失う不具合）。ここでは
+// disasmLastVisible で実可視範囲を測りながら、カーソルが収まるまで送る。描画はしない
+// （Terminal は差分描画せず直書きのため、ここで render すると多重描画でチラつく）。
+void ensureCursorVisible() {
+  if (!g_curAddr) return;
+  int height = std::max(1, g_disasmHeight);
+  for (int guard = 0; guard < height * 2 + 8; guard++) {
+    uint64_t top = g_disasmFollow ? viewPc() : g_disasmTop;
+    if (g_curAddr < top) { moveDisasm(-1); continue; }        // 上にはみ出し → 先頭を上へ
+    uint64_t last = disasmLastVisible(top, height);
+    if (last == 0 || g_curAddr <= last) break;                // 可視範囲に収まった
+    moveDisasm(+1);                                           // 下にはみ出し → 先頭を下へ
+  }
+}
+
+// base の直前命令の先頭（上移動の着地点）を求める。base が表示先頭より下にある間は、
+// drawDisassembly と同じ起点（renderTop）から前方デコードして「次が base になる命令」を
+// 返す。こうすると得られる境界は必ず描画と一致し ▸ が消えない。disasmBack のように手前の
+// 任意バイトから後方推定しないので、関数/イメージ先頭付近で命令途中バイトに化けることもない。
+// base が表示先頭（その上は画面外）の場合は 0 を返し、呼び出し側が「表示を 1 命令上へ送って
+// 新しい先頭を選ぶ」フォールバックに回す（先頭は常に描画境界なので、非コード領域でも消えない）。
+static uint64_t prevInsnAddr(uint64_t base) {
+  uint64_t renderTop = g_disasmFollow ? viewPc() : g_disasmTop;
+  if (!(renderTop && renderTop < base && base - renderTop <= (1u << 20)))
+    return 0;                                             // 表示先頭 or 不明 → フォールバックへ
+  size_t span = (size_t)(base - renderTop) + 16;
+  std::vector<uint8_t> buf(span, 0); size_t got = 0;
+  g_session.target().readMemory(renderTop, buf.data(), span, &got);
+  g_session.maskBreakpoints(renderTop, buf.data(), got);
+  Disassembler dis(g_session.arch());
+  auto in = dis.disasm(buf.data(), got, renderTop, (int)span); // 1 命令≥1 バイトなので span で十分
+  uint64_t prev = 0;
+  for (size_t i = 0; i < in.size(); i++) {
+    if (in[i].address == base) return prev ? prev : 0;    // base の直前命令
+    if (in[i].address > base) break;                      // 跨いだ（通常起きない）
+    prev = in[i].address;
+  }
+  return 0;
+}
+
+// 選択カーソルを 1 命令動かす（正=下/次、負=上/前）。枠外に出たら可視になるまで追従スクロール。
+// 未選択(0)のときは現在 PC を起点に、押した方向へすぐ 1 命令動かす（1 回目の押下でカーソルが見える）。
+void moveCursor(int dir) {
+  uint64_t base = g_curAddr ? g_curAddr : viewPc();
+  if (dir > 0) {                                          // 下: 次命令は前方デコードで厳密
+    uint64_t nx = nextInsnAddr(base);
+    if (nx == base) { if (!g_curAddr) g_curAddr = base; return; } // 末尾: 選択だけ
+    g_curAddr = nx; ensureCursorVisible(); return;
+  }
+  // 上: 表示先頭より下にいるなら直前命令へ（描画起点から辿るので ▸ は必ず可視）
+  uint64_t p = prevInsnAddr(base);
+  if (p) { g_curAddr = p; ensureCursorVisible(); return; }
+  // 表示先頭にいる（直前命令は画面外）: 表示を 1 命令上へ送り、新しい先頭を選択する。
+  // 先頭は drawDisassembly が必ず境界として描くので、非コード領域でも ▸ は消えない。
+  uint64_t beforeTop = g_disasmFollow ? viewPc() : g_disasmTop;
+  moveDisasm(-1);
+  if (g_disasmTop != beforeTop) g_curAddr = g_disasmTop;  // 上へ送れた → 新先頭を選択
+  else if (!g_curAddr) g_curAddr = base;                   // これ以上上が無い → 現在位置を選択だけ
+}
+
+// Ctrl+F / Ctrl+B: カーソルを 1 ページぶん上下へ動かす。
+// 「表示を動かす」のではなく「カーソルを 1 ページ進めた結果として表示が送られる」。
+// 動かした後はカーソルを表示先頭に置く（カーソル命令が最初にデコードされるので、ソース行や
+// 関数名ヘッダが挟まる小さなペインでも必ず画面内に残る）。stale な前フレーム情報には依存しない。
+void pageCursor(int dir) {
+  int n = std::max(1, g_disasmHeight - 1);
+  uint64_t a = g_curAddr ? g_curAddr : viewPc();
+  for (int i = 0; i < n; i++) { uint64_t nx = dir > 0 ? nextInsnAddr(a) : disasmBack(a, 1); if (nx == a) break; a = nx; }
+  g_curAddr = a;
+  g_disasmTop = a; g_disasmFollow = false; g_disasmTrail.clear(); // カーソルを表示先頭に
+}
+
+// b キー: カーソル行（未選択なら PC）のブレイクを即時にトグル（有れば解除 / 無ければ SW ブレイク設定）。
+void toggleBreakAtCursor() {
+  uint64_t a = g_curAddr ? g_curAddr : viewPc();
+  const Breakpoint* ex = g_session.breaks().userAt(a);
+  if (ex) {
+    int id = ex->id; bool hw = ex->hw;
+    if (g_session.breaks().removeId(id)) { if (hw) g_session.syncHwBreaks();
+      char m[80]; snprintf(m, sizeof(m), "#%d ブレイク解除 0x%llx", id, (unsigned long long)a); g_message = m; }
+    else g_message = "解除に失敗";
+  } else {
+    const Breakpoint* bp = g_session.breaks().add(a);
+    if (bp) { std::string w = g_session.describe(a);
+      char m[96]; snprintf(m, sizeof(m), "#%d ブレイク設定 0x%llx", bp->id, (unsigned long long)a);
+      g_message = std::string(m) + (w.empty() ? "" : ("  " + w)); }
+    else g_message = "ブレイク設定失敗（メモリに書けない？）";
+  }
+  render();
+}
 // スレッド選択を動かし、表示中スレッドを切り替える（dir=+1 下 / -1 上）。
 // 注: task_threads() の並びは呼び出しごとに変わりうるので、索引ではなく「現在の表示スレッドを
 //     一覧内で探して隣へ」で辿る（tid 基準）。表示順の安定のため tid でソートする。
@@ -1723,11 +1886,84 @@ void selectThread(int dir) {
   if (idx < 0) idx = 0;
   if (idx >= (int)ths.size()) idx = (int)ths.size() - 1;
   g_viewThread = ths[idx]; g_threadSel = idx; // 表示を切替（レジスタ/逆アセンブル/bt が追従）
-  g_disasmFollow = true; g_disasmTrail.clear(); // 切替直後は新スレッドの PC へ追従
+  g_disasmFollow = true; g_disasmTrail.clear(); g_curAddr = 0; // 切替直後は新スレッドの PC へ追従
+}
+
+// ----- マウス処理 -----
+// 左ドラッグ=テキスト選択（反転ハイライト＋解放でコピー）。移動を伴わない左クリック=逆アセンブル行へ
+// カーソル移動、ダブルクリック=その行のブレイクをトグル。ホイール=逆アセンブル枠スクロール。
+// 座標 (mx,my) は 1 始まり。SGR の button: bit5(0x20)=移動中, bit6(0x40)=ホイール, 下位2bit=種別。
+//
+// 停止中でなくても選択・コピーはできる（実行中やオーバレイ表示中の画面もコピーしたいので）。
+// クリックによるカーソル移動／トグルは従来どおり停止中かつ逆アセンブル枠内のみ。
+
+// 移動を伴わない左クリックの本体（カーソル移動 / ダブルクリックでトグル）。
+void onDisasmClick(int mx, int my) {
+  if (g_state != UiState::Stopped || !g_session.isAttached()) return;
+  if (g_focus != Focus::Disasm) g_focus = Focus::Disasm;      // クリックで逆アセンブルへフォーカス
+  if (g_disasmColL < 0 || mx < g_disasmColL + 1 || mx > g_disasmColR) { render(); return; } // 枠外
+  uint64_t addr = 0; bool found = false;
+  for (auto& vi : g_visInsns) if (vi.first == my - 1) { addr = vi.second; found = true; break; }
+  if (!found) { render(); return; }                            // 命令行でない行
+  g_curAddr = addr;
+  static auto last = std::chrono::steady_clock::now() - std::chrono::hours(1);
+  static int lastMy = -1;
+  auto now = std::chrono::steady_clock::now();
+  bool dbl = (my == lastMy) &&
+             std::chrono::duration_cast<std::chrono::milliseconds>(now - last).count() < 400;
+  last = now; lastMy = my;
+  if (dbl) { lastMy = -1; toggleBreakAtCursor(); }             // ダブルクリック: トグル（内部で render）
+  else render();                                               // シングルクリック: カーソル移動のみ
+}
+
+int g_mouseDownX = -1, g_mouseDownY = -1; // 直近の左押下位置（0 始まり）
+int g_lastDragX = -1, g_lastDragY = -1;   // 直近に反映したドラッグ位置（同一セルなら再描画を省く）
+bool g_mouseDragging = false;             // 押下後に移動があった＝選択中
+
+void onMouse(int button, int mx, int my, bool press) {
+  int x = mx - 1, y = my - 1;                          // 0 始まりへ
+  bool wheel  = (button & 0x40) != 0;
+  bool motion = (button & 0x20) != 0;
+  int  btn    = button & 0x03;
+
+  if (wheel) {                                          // ホイール: 逆アセンブル枠を上下スクロール（停止中のみ）
+    if (g_state != UiState::Stopped) return;
+    if (g_disasmColL < 0 || mx < g_disasmColL + 1 || mx > g_disasmColR) return;
+    moveDisasm((button & 1) ? +1 : -1); render(); return;
+  }
+
+  if (press && !motion && btn == 0) {                  // 左ボタン DOWN
+    g_mouseDownX = x; g_mouseDownY = y; g_mouseDragging = false;
+    g_lastDragX = g_lastDragY = -1;
+    if (g_term.hasSelection()) { g_term.clearSelection(); render(); } // 前回の選択を消す
+    return;
+  }
+  if (press && motion && btn == 0) {                   // 左ドラッグ（移動）→ 選択
+    if (x == g_lastDragX && y == g_lastDragY) return;  // 同一セル内の移動は無視（再描画を間引く）
+    g_lastDragX = x; g_lastDragY = y;
+    if (!g_mouseDragging) { g_term.selStart(g_mouseDownX, g_mouseDownY); g_mouseDragging = true; }
+    g_term.selUpdate(x, y);
+    render();                                           // base ＋ ハイライト重ね
+    return;
+  }
+  if (!press && btn == 0) {                             // 左ボタン UP（解放）
+    if (g_mouseDragging) {                              // ドラッグしていた → 選択確定＆コピー
+      g_term.selUpdate(x, y);
+      bool ok = g_term.copySelection();
+      g_message = ok ? "選択をコピーしました（:mouse off で端末選択）" : "選択が空です";
+      g_mouseDragging = false;
+      render();
+    } else {                                            // 移動なし → クリック操作
+      onDisasmClick(mx, my);
+    }
+    return;
+  }
 }
 
 // ----- キー処理 -----
 void onKey(int c) {
+  // マウス選択のハイライトはキー操作で消す（内容が変わるとズレるため。各ハンドラの render が反映）。
+  if (g_term.hasSelection()) g_term.clearSelection();
   // シンボル探索ジョブが進捗表示中なら ESC で中止（最優先。矢印キーの ESC 列より先に拾う）。
   if (g_jobRunning.load() && g_jobShowing.load() && c == 27) {
     g_jobCancel.store(true); g_message = "中止しています…"; render(); return;
@@ -1771,21 +2007,22 @@ void onKey(int c) {
   if (g_state == UiState::Stopped) {
     if (g_mainEsc == 1) { g_mainEsc = (c == '[') ? 2 : 0; return; }       // ESC の続き
     if (g_mainEsc == 2) { g_mainEsc = 0;                                  // ESC [ の続き
-      if (c == 'A') { (g_focus == Focus::Threads) ? selectThread(-1) : scrollDisasm(-1); render(); }
-      else if (c == 'B') { (g_focus == Focus::Threads) ? selectThread(+1) : scrollDisasm(+1); render(); }
+      if (c == 'A') { (g_focus == Focus::Threads) ? selectThread(-1) : moveCursor(-1); render(); }
+      else if (c == 'B') { (g_focus == Focus::Threads) ? selectThread(+1) : moveCursor(+1); render(); }
       return;
     }
     if (c == 27) { g_mainEsc = 1; return; }                              // ESC 列の可能性
     if (c == '\t') { g_focus = (g_focus == Focus::Disasm) ? Focus::Threads : Focus::Disasm; render(); return; }
-    if (c == 6 && g_focus == Focus::Disasm) { pageDisasm(+1); render(); return; } // Ctrl+F
-    if (c == 2 && g_focus == Focus::Disasm) { pageDisasm(-1); render(); return; } // Ctrl+B
+    if (c == 6 && g_focus == Focus::Disasm) { pageCursor(+1); render(); return; } // Ctrl+F
+    if (c == 2 && g_focus == Focus::Disasm) { pageCursor(-1); render(); return; } // Ctrl+B
   }
 
   switch (c) {
     case ':': g_cmdMode = true; g_cmdline.clear(); g_message.clear(); render(); break;
-    case 's': if (g_state == UiState::Stopped) { g_session.stepInto(); g_state = UiState::Running; render(); } break;
-    case 'n': if (g_state == UiState::Stopped) { g_session.stepOver(); g_state = UiState::Running; render(); } break;
-    case 'c': if (g_state == UiState::Stopped) { g_session.cont(); g_state = UiState::Running; g_message.clear(); render(); } break;
+    case 's': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.stepInto(); g_state = UiState::Running; render(); } break;
+    case 'n': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.stepOver(); g_state = UiState::Running; render(); } break;
+    case 'c': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.cont(); g_state = UiState::Running; g_message.clear(); render(); } break;
+    case 'b': if (g_state == UiState::Stopped && g_session.isAttached()) toggleBreakAtCursor(); break; // カーソル行のブレイクをトグル
     case 3:   // Ctrl+C
       if (g_autoMask) { g_autoMask = 0; g_message = "auto 中断"; render(); } // 実行中の step が次に止まる
       else if (g_state == UiState::Running) { g_session.interrupt(); }
@@ -2061,11 +2298,36 @@ int main(int argc, char** argv) {
   }
 
   // 入力スレッド: stdin（キー）と winch パイプ（リサイズ）を poll で同時に待ち、キューへ流す。
+  // マウス列（SGR 1006: ESC [ < b ; x ; y M/m）はここで組み立てて Event::Mouse にする。それ以外の
+  // バイトは従来どおり 1 バイトずつ Event::Key で流す（矢印キー等の既存の状態機械を壊さないため）。
   std::thread input([] {
     struct pollfd fds[2];
     fds[0].fd = STDIN_FILENO;  fds[0].events = POLLIN;
     fds[1].fd = g_winchPipe[0]; fds[1].events = POLLIN;
     int nfds = (g_winchPipe[0] >= 0) ? 2 : 1;
+    int mstate = 0;          // 0=通常, 1=ESC, 2=ESC[, 3=マウス本体(ESC[<... 収集中)
+    std::string mbuf;        // マウス本体の数字と ';'
+    auto emitKey = [](int k) { Event e; e.kind = Event::Key; e.key = k; g_queue.push(e); };
+    auto emitMouse = [](const std::string& body, bool pressDown) {
+      int b = 0, x = 0, yy = 0;                               // body = "b;x;y"
+      if (sscanf(body.c_str(), "%d;%d;%d", &b, &x, &yy) == 3) {
+        Event e; e.kind = Event::Mouse; e.key = b; e.mx = x; e.my = yy; e.press = pressDown;
+        g_queue.push(e);
+      }
+    };
+    std::function<void(unsigned char)> feed = [&](unsigned char ch) {
+      switch (mstate) {
+        case 0: if (ch == 0x1b) mstate = 1; else emitKey(ch); return;
+        case 1: if (ch == '[') { mstate = 2; return; }
+                emitKey(0x1b); mstate = 0; feed(ch); return;  // ESC 単独 → そのまま流して再処理
+        case 2: if (ch == '<') { mstate = 3; mbuf.clear(); return; } // SGR マウス開始
+                emitKey(0x1b); emitKey('['); mstate = 0; feed(ch); return; // 矢印等 → ESC [ を復元して再処理
+        case 3: if (ch == 'M' || ch == 'm') { emitMouse(mbuf, ch == 'M'); mstate = 0; return; }
+                if (mbuf.size() < 30) mbuf.push_back((char)ch);         // 数字 / ';'
+                else mstate = 0;                                        // 異常に長い → 破棄
+                return;
+      }
+    };
     for (;;) {
       int pr = poll(fds, nfds, -1);
       if (pr < 0) { if (errno == EINTR) continue; break; }
@@ -2073,11 +2335,11 @@ int main(int argc, char** argv) {
         char buf[64]; while (read(g_winchPipe[0], buf, sizeof(buf)) > 0) {} // まとめて排出（coalesce）
         g_queue.push({Event::Resize, 0});
       }
-      if (fds[0].revents & (POLLIN | POLLHUP)) {               // キー入力（1 バイト）
-        unsigned char ch;
-        ssize_t n = read(STDIN_FILENO, &ch, 1);
+      if (fds[0].revents & (POLLIN | POLLHUP)) {               // キー/マウス入力
+        unsigned char buf[64];
+        ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
         if (n <= 0) break;
-        g_queue.push({Event::Key, (int)ch});
+        for (ssize_t i = 0; i < n; i++) feed(buf[i]);
       }
     }
   });
@@ -2095,6 +2357,7 @@ int main(int argc, char** argv) {
   for (;;) {
     Event e = g_queue.pop();
     if (e.kind == Event::Key) onKey(e.key);
+    else if (e.kind == Event::Mouse) onMouse(e.key, e.mx, e.my, e.press); // クリック→カーソル移動 / ダブルクリック→トグル
     else if (e.kind == Event::Resize) { render(); } // 端末リサイズ → render が新サイズで全消去＋再描画
     else if (e.kind == Event::Progress) { render(); } // シンボル先読み・探索の進捗更新 → 再描画
     else if (e.kind == Event::JobDone) {              // 非同期シンボル探索の完了 → 結果を適用
