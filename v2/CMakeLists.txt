@@ -2,9 +2,13 @@
 # ルート CMakeLists.txt から option(TA2_BUILD_V2) で add_subdirectory される。
 # v1（ルートの src/ inc/）とは混ぜない: v1 のターゲット・include パス（ta2opts）は使わない。
 #
-# いまあるのは最下層（v1 から実ロジックを移植済み）だけ:
+# いまあるのは下 2 層（v1 から実ロジックを移植済み）:
 #   ta2base     … 横断値型（Msg / MsgId）。何にも依存しない
 #   ta2platform … L0 Platform/Arch（Arch / Target / ExceptionServer / DtraceCatch / ProcessList / MIG）
+#   ta2core     … L1 Core Engine（Breakpoints / ImageList / Symbols / Annotations / BreakpointStore /
+#                 Disassembler / Unwinder / DwarfLines / SyscallTables / SyscallDecoder / Expression /
+#                 Backtracer / BranchResolver / MemoryExaminer / SymbolRef / Stepper / DyldNotifier /
+#                 SyscallMonitor / SymbolWarmer / ExitMonitor / TargetSession）
 # 層の依存方向はライブラリ分割で強制する（下位は上位のヘッダを include パスに持たない）。
 
 # v2 共通のコンパイル設定（v1 の ta2opts 相当。ただし inc/ と capstone は入れない）。
@@ -43,8 +47,41 @@ target_include_directories(ta2platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/platfo
 # libdtrace はシステムライブラリ（DtraceCatch 用）。利用側のリンクへ伝播させる。
 target_link_libraries(ta2platform PUBLIC ta2base dtrace PRIVATE ta2v2opts)
 
+# ---- ta2core ----
+# L1 Core Engine。ta2platform / ta2base の上に積む。capstone を使うのはこの層から
+# （Disassembler.cpp だけが capstone ヘッダを include する。公開ヘッダには出さない）。
+# ui/ ・ engine/ のヘッダは include パスに入れない（＝依存できない）。
+set(TA2CORE_SOURCES
+  core/src/Breakpoints.cpp
+  core/src/ImageList.cpp
+  core/src/Symbols.cpp
+  core/src/Annotations.cpp
+  core/src/BreakpointStore.cpp
+  core/src/Disassembler.cpp
+  core/src/Unwinder.cpp
+  core/src/DwarfLines.cpp
+  core/src/SymbolRef.cpp
+  core/src/SyscallTables.cpp
+  core/src/SyscallDecoder.cpp
+  core/src/Expression.cpp
+  core/src/Backtracer.cpp
+  core/src/BranchResolver.cpp
+  core/src/MemoryExaminer.cpp
+  core/src/DyldNotifier.cpp
+  core/src/ExitMonitor.cpp
+  core/src/SymbolWarmer.cpp
+  core/src/Stepper.cpp
+  core/src/SyscallMonitor.cpp
+  core/src/TargetSession.cpp
+)
+add_library(ta2core STATIC ${TA2CORE_SOURCES})
+target_include_directories(ta2core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/include
+                                   PRIVATE ${CAPSTONE_INCLUDE_DIR})
+# capstone は利用側のリンクへ伝播させる（静的ライブラリなのでリンクは最終実行ファイルで起きる）。
+target_link_libraries(ta2core PUBLIC ta2platform ta2base ${CAPSTONE_LIBRARY} PRIVATE ta2v2opts)
+
 # ---- 非ホストアーキのコンパイル検査（リンクなし。設計書 §9.3） ----
-# x86_64 ホストでは -arch arm64、arm64 ホストでは -arch x86_64 で ta2base / ta2platform の
+# x86_64 ホストでは -arch arm64、arm64 ホストでは -arch x86_64 で ta2base / ta2platform / ta2core の
 # C++ ソースをすべてコンパイルし、非ホスト側の Arch 実装が SDK ヘッダに対して壊れていない
 # ことを毎ビルドで確かめる。コンパイラを直接起動するので -isysroot を明示的に渡す。
 if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
@@ -58,9 +95,11 @@ if(CMAKE_OSX_SYSROOT)
 endif()
 file(GLOB_RECURSE _ta2v2_headers CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/base/include/*
-  ${CMAKE_CURRENT_SOURCE_DIR}/platform/include/*)
+  ${CMAKE_CURRENT_SOURCE_DIR}/platform/include/*
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/include/*
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/src/*.inc)
 set(_ta2v2_cross_objs "")
-foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES})
+foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES})
   string(REPLACE "/" "_" _obj ${_src})
   set(_obj ${CMAKE_CURRENT_BINARY_DIR}/cross_${_ta2v2_cross_arch}/${_obj}.o)
   add_custom_command(
@@ -69,6 +108,8 @@ foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES})
     COMMAND ${CMAKE_CXX_COMPILER} -std=c++17 -arch ${_ta2v2_cross_arch} ${_ta2v2_isysroot} -g -Wall
             -I${CMAKE_CURRENT_SOURCE_DIR}/base/include
             -I${CMAKE_CURRENT_SOURCE_DIR}/platform/include
+            -I${CMAKE_CURRENT_SOURCE_DIR}/core/include
+            -I${CAPSTONE_INCLUDE_DIR}
             -c ${CMAKE_CURRENT_SOURCE_DIR}/${_src} -o ${_obj}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${_src} ${_ta2v2_headers}
     COMMENT "v2 ${_ta2v2_cross_arch} cross-compile check: ${_src}"

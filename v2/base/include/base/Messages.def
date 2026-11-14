@@ -6,8 +6,8 @@
 //   ta2base 自身は ID とキー（msgKey）しか使わない。{name} は名前付きプレースホルダ。
 // ・include ガードは付けない（include する側が TA2_MSG を定義して複数回取り込むため）。
 //
-// いまは L0（ta2platform）が返すエラーだけを置く。L1 以上の移植に合わせて追記していく。
-// 日本語文は v1 の該当リテラル（src/core/Target.cpp / DtraceCatch.cpp / ExceptionServer.cpp）
+// いまは L0（ta2platform）と L1（ta2core）が返すものを置く。L2 以上の移植に合わせて追記していく。
+// 日本語文は v1 の該当リテラル（src/core/*.cpp / src/app/Expression.cpp / src/app/main.cpp）
 // を写したもの。v1 に無い文（★）は仮置きで、i18n 工程（§8.8 i-1）で確定する。
 // {detail} には strerror / mach_error_string / dtrace_errmsg の文字列（翻訳対象外）が入る。
 
@@ -34,3 +34,69 @@ TA2_MSG(ErrDtraceExec,            "err.dtrace.exec",               "program_exec
 TA2_MSG(ErrDtraceGo,              "err.dtrace.go",                 "dtrace_go 失敗: {detail}")
 TA2_MSG(ErrDtraceNoProbe,         "err.dtrace.no_probe",           "該当する probe がありません（syscall/トラップ名を確認。例: write / mach:mach_msg_trap）")
 TA2_MSG(ErrDtraceNameRequired,    "err.dtrace.name_required",      "引数つき観測には syscall 名が必要（all は集計のみ）")
+
+// ===== L1 Core（ta2core） =====
+
+// --- err.session.*（TargetSession / SyscallMonitor） ---
+TA2_MSG(ErrNotAttached,           "err.session.not_attached",      "attach していません")
+
+// --- err.annot.*（Annotations。.t2a） ---
+TA2_MSG(ErrAnnotNoUuid,           "err.annot.no_uuid",             "UUID の無いイメージには注釈を保存できません")
+TA2_MSG(ErrAnnotOpen,             "err.annot.open",                "注釈ファイルを書けません: {path}")
+TA2_MSG(ErrAnnotWrite,            "err.annot.write",               "注釈ファイルの書込に失敗しました")
+TA2_MSG(ErrAnnotRename,           "err.annot.rename",              "注釈ファイルの置換に失敗しました")
+TA2_MSG(ErrAnnotNotFound,         "err.annot.not_found",           "そのアドレスに注釈はありません")
+
+// --- err.bpstore.*（BreakpointStore。.t2b） ---
+TA2_MSG(ErrBpStoreNoUuid,         "err.bpstore.no_uuid",           "UUID の無いプログラムはブレイクを保存できません")
+TA2_MSG(ErrBpStoreOpen,           "err.bpstore.open",              "保存ファイルを書けません: {path}")
+TA2_MSG(ErrBpStoreWrite,          "err.bpstore.write",             "保存ファイルの書込に失敗しました")
+TA2_MSG(ErrBpStoreRename,         "err.bpstore.rename",            "保存ファイルの置換に失敗しました")
+
+// --- err.expr.*（Expression） ---
+// 文字位置つきのエラーは ErrExprAt に包む: {error} は入れ子の Msg（下の err.expr.* のどれか）、
+// {pos} は 1 始まりの文字位置（v1 の「<文> (N 文字目)」）。
+TA2_MSG(ErrExprAt,                "err.expr.at",                   "{error} ({pos} 文字目)")
+TA2_MSG(ErrExprEmpty,             "err.expr.empty",                "式がない")
+TA2_MSG(ErrExprTrailing,          "err.expr.trailing",             "式の後に余分な文字がある ({pos} 文字目)")
+TA2_MSG(ErrExprDivZero,           "err.expr.div_zero",             "0 で割れない")
+TA2_MSG(ErrExprNoValue,           "err.expr.no_value",             "値がない")
+TA2_MSG(ErrExprUnclosedParen,     "err.expr.unclosed_paren",       "括弧が閉じていない")
+TA2_MSG(ErrExprUnmatchedParen,    "err.expr.unmatched_paren",      "対応する '(' がない ')'")
+TA2_MSG(ErrExprBadChar,           "err.expr.bad_char",             "解釈できない文字 '{ch}'")
+TA2_MSG(ErrExprHexDigits,         "err.expr.hex_digits",           "0x の後に 16 進数がない")
+TA2_MSG(ErrExprBadNumber,         "err.expr.bad_number",           "数値として解釈できない")
+TA2_MSG(ErrExprNoRegName,         "err.expr.no_reg_name",          "レジスタ名がない")
+TA2_MSG(ErrExprRegNeedsStop,      "err.expr.reg_needs_stop",       "レジスタは停止中のみ参照できる")
+TA2_MSG(ErrExprUnknownReg,        "err.expr.unknown_reg",          "不明なレジスタ '{name}'")
+// {candidates} は「表示名 @0x.. / 表示名 @0x.. …」（シンボル名は翻訳対象外なので整形済みで渡す）。
+TA2_MSG(ErrExprAmbiguous,         "err.expr.ambiguous",            "シンボル '{name}' は複数あります: {candidates}。アドレスか『ライブラリ名!名前』で指定してください")
+TA2_MSG(ErrExprNoLib,             "err.expr.no_lib",               "ライブラリ '{lib}' が見つからない")
+TA2_MSG(ErrExprSymNotInLib,       "err.expr.sym_not_in_lib",       "シンボル '{name}' が {lib} に無い")
+TA2_MSG(ErrExprNoName,            "err.expr.no_name",              "名前がない")
+TA2_MSG(ErrExprNoDefaultLib,      "err.expr.no_default_lib",       "既定ライブラリ／主実行ファイルが不明")
+TA2_MSG(ErrExprNoImages,          "err.expr.no_images",            "'{name}': 探すイメージが無い（アタッチ済み？）")
+TA2_MSG(ErrExprCancelled,         "err.expr.cancelled",            "中止しました")
+// {libs} は「libA, libB …」（イメージ名の列挙）。
+TA2_MSG(ErrExprMultiLib,          "err.expr.multi_lib",            "シンボル '{name}' は複数ライブラリにあります（{libs}）。『ライブラリ名!{name}』で指定してください")
+// {where} は探した既定ライブラリ／主実行ファイル名（「lib / main」）。
+TA2_MSG(ErrExprSymNotFound,       "err.expr.sym_not_found",        "シンボル '{name}' が見つからない（{where} ほか全イメージを探した。ライブラリ名!{name} も試せます）")
+
+// --- err.mem.* / err.examine.*（MemoryExaminer） ---
+TA2_MSG(ErrMemUnreadable,         "err.mem.unreadable",            "{addr} は読めません")
+TA2_MSG(ErrExamineBadFormat,      "err.examine.bad_format",        "不明な書式指定: {ch}（書式 x/d/u/o/t/c/i/s/f/a, サイズ b/h/w/g）")
+
+// --- bt.note.*（Backtracer。フレームの復元方法の注記。v1 computeBacktrace の note()） ---
+TA2_MSG(BtNoteFromSp,             "bt.note.from_sp",               "← [sp] から復元")
+TA2_MSG(BtNoteFromLr,             "bt.note.from_lr",               "← lr から復元")
+TA2_MSG(BtNoteFpChain,            "bt.note.fp_chain",              "← fp 連鎖")
+TA2_MSG(BtNoteStackScan,          "bt.note.stack_scan",            "← スタック走査で復元(推定)")
+
+// --- stop.*（Stepper の RawStop → 停止理由。v1 Session::stopReason） ---
+// EXC_* / KERN_* の識別子は翻訳対象外（{kr} にそのまま入る）。
+TA2_MSG(StopSyscallCatch,         "stop.syscall_catch",            "syscall キャッチ: {name}")
+TA2_MSG(StopBadAccess,            "stop.exc.bad_access",           "EXC_BAD_ACCESS（不正メモリ参照） [{kr}] @{addr}")
+TA2_MSG(StopBadAccessCode,        "stop.exc.bad_access_code",      "EXC_BAD_ACCESS（不正メモリ参照） [code={code}] @{addr}")
+TA2_MSG(StopBadInstruction,       "stop.exc.bad_instruction",      "EXC_BAD_INSTRUCTION（不正命令） [code={code}]")
+TA2_MSG(StopArithmetic,           "stop.exc.arithmetic",           "EXC_ARITHMETIC（算術例外） [code={code}]")
+TA2_MSG(StopException,            "stop.exc.other",                "例外 [code={code}]")
