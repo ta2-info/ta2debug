@@ -476,6 +476,13 @@ const Scall kScalls[] = {
 #endif
 };
 
+// 番号→名前だけの網羅表（SDK の全 SYS_*）。kScalls に無い syscall の素の名前表示に使う。
+// SDK <sys/syscall.h> から自動生成（SyscallNames.inc）。sig が無いので引数は汎用（xxx）で出す。
+struct ScallName { int num; const char* name; };
+const ScallName kScallNames[] = {
+#include "SyscallNames.inc"
+};
+
 // Mach トラップ（x86:rax のクラス=1 / arm64:x16 が負）。番号→名前と引数シグネチャ。
 // sig 文字: n=ポート名, r=ポート権利, m=メッセージ型disposition, v=VMフラグ, P=VM保護,
 //           d=10進, x=16進, p=ポインタ, H=mach_msgヘッダ, G=mach_msgオプション。
@@ -790,7 +797,13 @@ std::string Session::syscallAtStop() {
 
   const Scall* info = nullptr;
   for (const auto& s : kScalls) if ((uint64_t)s.num == num) { info = &s; break; }
-  std::string name = info ? info->name : (std::string("syscall#") + std::to_string((long long)num));
+  std::string name;
+  if (info) name = info->name;
+  else {
+    // 引数デコード表(kScalls)に無い syscall は、網羅表から名前だけ引く（例 sysctl）。
+    for (const auto& s : kScallNames) if ((uint64_t)s.num == num) { name = s.name; break; }
+    if (name.empty()) name = std::string("syscall#") + std::to_string((long long)num);
+  }
   return name + "(" + formatArgs(info ? info->sig : "xxx") + ")";
 }
 
