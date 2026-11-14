@@ -11,6 +11,12 @@
 
 namespace ta2 {
 
+// 間接 call/jmp のオペランド種別（レジスタ経由 / メモリ経由）。
+//   Reg: 飛び先はそのレジスタの値そのもの（例 call *%rax）。
+//   Mem: 実効アドレス base+index*scale+disp に入っているポインタが飛び先（例 call *(%rax)）。
+// capstone 型を漏らさないよう、レジスタは小文字名（readRegisterByName と同じ綴り）で持つ。
+enum class BranchOp { None, Reg, Mem };
+
 struct Insn {
   uint64_t address = 0;
   uint8_t size = 0;
@@ -19,6 +25,14 @@ struct Insn {
   InsnKind kind = InsnKind::Other;
   bool hasCallTarget = false; // 直値 call/branch の飛び先が分かるか
   uint64_t callTarget = 0;
+  // --- 間接分岐（call/jmp）の飛び先をレジスタ状況から解くためのメタ（UI が PC 行で使う） ---
+  bool isBranch = false;            // call か jmp（ret は含めない）
+  bool indirect = false;            // オペランドが reg/mem（間接）。直値 imm は false
+  BranchOp branchOp = BranchOp::None;
+  std::string baseReg;              // Reg: 対象レジスタ名 / Mem: base レジスタ名（小文字。"rip"=RIP 相対）
+  std::string indexReg;             // Mem: index レジスタ名（無ければ空）
+  int branchScale = 1;              // Mem: index 倍率
+  int64_t branchDisp = 0;           // Mem: 変位
 };
 
 class Disassembler {

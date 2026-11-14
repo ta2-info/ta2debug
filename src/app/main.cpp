@@ -190,6 +190,35 @@ uint64_t disasmBack(uint64_t top, int n) {
   return top; // 同期できない異常時は動かさない
 }
 
+// 間接 call/jmp（例 callq *%rax、jmp *(%rax,%rcx,8)、callq *0x10(%rip)）の飛び先を、
+// 指定スレッド状態 state のレジスタ（必要なら対象メモリ）から解く。解けたら out に入れて true。
+// Reg: レジスタ値そのもの。Mem: 実効アドレス base+index*scale+disp に入っているポインタ。
+// アーキ依存は Arch::readRegisterByName に委ねるので x86/arm64 共通。
+bool resolveIndirectTarget(const Insn& in, const uint8_t* state, uint64_t& out) {
+  Arch& a = g_session.arch();
+  if (in.branchOp == BranchOp::Reg) {
+    return a.readRegisterByName(state, in.baseReg, out); // 飛び先 = レジスタ値
+  }
+  if (in.branchOp == BranchOp::Mem) {
+    uint64_t ea = (uint64_t)in.branchDisp;
+    if (!in.baseReg.empty()) {
+      uint64_t bv;
+      if (in.baseReg == "rip" || in.baseReg == "pc") bv = in.address + in.size; // RIP 相対は次命令基準
+      else if (!a.readRegisterByName(state, in.baseReg, bv)) return false;
+      ea += bv;
+    }
+    if (!in.indexReg.empty()) {
+      uint64_t iv;
+      if (!a.readRegisterByName(state, in.indexReg, iv)) return false;
+      ea += iv * (uint64_t)(in.branchScale ? in.branchScale : 1);
+    }
+    uint64_t ptr = 0; size_t got = 0; // 実効アドレスに入っているポインタが飛び先
+    if (!g_session.target().readMemory(ea, &ptr, sizeof(ptr), &got) || got < sizeof(ptr)) return false;
+    out = ptr; return true;
+  }
+  return false;
+}
+
 void drawDisassembly(const PaneRect& p) {
   if (!p.visible) { g_disasmColL = g_disasmColR = -1; return; }
   g_disasmHeight = p.height;                               // ページ送り量に使う
@@ -239,6 +268,18 @@ void drawDisassembly(const PaneRect& p) {
     if (cur && viewingStopThread() && insns[i].kind == InsnKind::Syscall) { // これから呼ぶシステムコールを注釈
       std::string sc = g_session.syscallAtStop();
       if (!sc.empty()) s += "  ; → " + sc;
+    }
+    // PC が間接 call/jmp（例 callq *%rax）なら、実行前でもレジスタ状況から飛び先が判る。
+    // そのアドレスを補足表示し、既知のシンボルならアドレスとシンボルの両方を出す（lldb 風）。
+    if (cur && insns[i].isBranch && insns[i].indirect) {
+      uint64_t tgt = 0;
+      if (resolveIndirectTarget(insns[i], viewStateData(), tgt)) {
+        char b[40]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)tgt);
+        std::string nm = g_session.symbolName(tgt);
+        s += "  ; → " + std::string(b) + (nm.empty() ? "" : ("  " + nm));
+      } else {
+        s += "  ; → (飛び先を解決できません)";
+      }
     }
     s = layout::fitWidth(s, p.width);
     if (cur) s = "\x1b[7m" + s + "\x1b[0m";            // PC は反転
@@ -1674,6 +1715,8 @@ void runCommand(const std::string& line) {
       "\x1b[36m― 自動解析（操作不要・停止時に出る） ―\x1b[0m",
       "  バックトレース: CFI（compact unwind / DWARF eh_frame）で正確化。関数入口・IP=0・stub でも呼び元を復元。",
       "  syscall 直前で停まると呼ぶ内容を解析表示（例 write(1, 0x.., 14) \"hi\"）。Mach トラップ・引数フラグ・mach_msg も分解。",
+      "  PC が間接 call/jmp（例 callq *%rax、*(%rbp)、*off(%rip)）のとき、実行前でもレジスタ状況から飛び先を解いて",
+      "    \"; → 0x… <シンボル>\" と補足表示（既知シンボルならアドレスと両方。jmp 系も同じ）。",
       "  PLT/スタブは \"symbol stub for: X\" と解決表示。C++ 名はデマングルしテンプレートを省略（std::map<…>）。",
       "\x1b[36m― その他 ―\x1b[0m",
       "  :help / :h / :?            このヘルプ    :q  終了",
