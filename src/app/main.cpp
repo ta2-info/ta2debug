@@ -137,6 +137,16 @@ int g_pickTop = 0;      // スクロール先頭（絞り込み後インデッ�
 int g_pickHScroll = 0;  // 選択行の横スクロール量（表示桁。選択移動・フィルタ変更で 0 に戻す）
 int g_escState = 0;     // ピッカー内のエスケープ列: 0=なし, 1=ESC, 2=ESC[
 
+// ブレイクポイント編集オーバレイ（:be / e キー）。デバッガが認識しているブレイクを一覧し、
+// 選択して 削除／有効無効／Soft⇄Hard 切替、HW ウォッチの条件（アドレス・サイズ・アクセス）を編集する。
+bool g_bpEditMode = false;
+int g_bpSel = 0;        // 選択中のブレイク（list() の添字）
+int g_bpTop = 0;        // スクロール先頭
+int g_bpEsc = 0;        // エスケープ列: 0=なし,1=ESC,2=ESC[
+bool g_bpInput = false; // アドレス入力サブモード中か
+std::string g_bpInputBuf; // アドレス入力バッファ（16 進）
+std::string g_bpEditMsg;  // 編集オーバレイ下部の一時メッセージ
+
 uint64_t parseNum(const std::string& s) { return strtoull(s.c_str(), nullptr, 0); }
 
 using layout::PaneRect;
@@ -850,6 +860,212 @@ void drawPicker(int rows, int cols) {
                layout::fitWidth("↑↓/C-p,C-n 行   C-f/C-b ページ   ←→ 引数スクロール   Enter アタッチ   文字でフィルタ   ESC 取消", cols));
 }
 
+// ===== ブレイクポイント編集オーバレイ =====
+void openBpEditor() {
+  g_bpSel = 0; g_bpTop = 0; g_bpEsc = 0; g_bpInput = false; g_bpInputBuf.clear(); g_bpEditMsg.clear();
+  g_bpEditMode = true;
+}
+void closeBpEditor() { g_bpEditMode = false; g_bpInput = false; g_bpInputBuf.clear(); g_bpEditMsg.clear(); g_message.clear(); }
+
+// 種別の短い名前。
+static const char* bpKindName(const Breakpoint& b) {
+  if (b.watch) return "HW watch";
+  if (b.hw)    return "HW exec ";
+  return "SW      ";
+}
+// watch のアクセス表記。
+static const char* bpRw(const Breakpoint& b) { return (b.onRead && b.onWrite) ? "rw" : b.onRead ? "r " : b.onWrite ? "w " : "- "; }
+
+// 選択中のブレイク（無ければ nullptr）。list() はコピーを返すので添字で引く。
+static Breakpoint bpSelectedCopy(bool& ok) {
+  const auto& v = g_session.breaks().list();
+  if (g_bpSel < 0 || g_bpSel >= (int)v.size()) { ok = false; return Breakpoint{}; }
+  ok = true; return v[g_bpSel];
+}
+
+// 指定アドレスに、種別・有効状態・ウォッチ条件でブレイクを張り直す（旧 id は削除済み前提）。
+// 失敗（HW スロット不足など）で nullptr。成功で新しい Breakpoint*。
+static const Breakpoint* bpAddKind(int kind, uint64_t addr, bool enabled, int wsize, bool onR, bool onW) {
+  const Breakpoint* nb;
+  if (kind == 2)      nb = g_session.breaks().addWatch(addr, wsize ? wsize : 8, onR, onW);
+  else if (kind == 1) nb = g_session.breaks().addHw(addr);
+  else                nb = g_session.breaks().add(addr);
+  if (nb) { if (!enabled) g_session.breaks().setEnabled(nb->id, enabled); g_session.syncHwBreaks(); }
+  return nb;
+}
+
+// old を消して newKind/newAddr/… で張り直す。失敗したら元に戻す（best-effort）。成功で true。
+// kind: 0=SW,1=HW exec,2=HW watch。
+static bool bpRebuild(const Breakpoint& old, int newKind, uint64_t newAddr, int wsize, bool onR, bool onW) {
+  bool en = old.enabled;
+  int oldKind = old.watch ? 2 : old.hw ? 1 : 0;
+  g_session.breaks().removeId(old.id);
+  if (bpAddKind(newKind, newAddr, en, wsize, onR, onW)) {
+    g_bpSel = (int)g_session.breaks().list().size() - 1; // 張り直しで末尾に付くので選択を追従させる
+    return true;
+  }
+  // ロールバック: 元の種別・アドレスで戻す
+  bpAddKind(oldKind, old.addr, en, old.watchSize, old.onRead, old.onWrite);
+  g_bpSel = (int)g_session.breaks().list().size() - 1;
+  return false;
+}
+
+void drawBpEditor(int rows, int cols) {
+  const auto& v = g_session.breaks().list();
+  int n = (int)v.size();
+  if (g_bpSel >= n) g_bpSel = n - 1;
+  if (g_bpSel < 0) g_bpSel = 0;
+
+  char hdr[160];
+  snprintf(hdr, sizeof(hdr), " ta2debug  ブレイクポイント編集  %d 件 ", n);
+  g_term.putAt(0, 0, std::string("\x1b[7m") + layout::fitWidth(hdr, cols) + "\x1b[0m");
+  g_term.putAt(0, 1, layout::fitWidth(
+      "\x1b[2md 削除  e/Space 有効無効  h Soft⇄Hard  a アドレス  s サイズ(watch)  r アクセス(watch)  ESC/q 閉じる\x1b[0m", cols));
+
+  int listTop = 2;
+  int listRows = std::max(1, rows - 3);
+  if (g_bpSel < g_bpTop) g_bpTop = g_bpSel;
+  if (g_bpSel >= g_bpTop + listRows) g_bpTop = g_bpSel - listRows + 1;
+  if (g_bpTop < 0) g_bpTop = 0;
+
+  for (int y = 0; y < listRows; y++) {
+    int idx = g_bpTop + y;
+    if (idx < n) {
+      const Breakpoint& b = v[idx];
+      bool sel = (idx == g_bpSel);
+      std::string where = g_session.describe(b.addr);
+      char line[320];
+      if (b.watch)
+        snprintf(line, sizeof(line), " #%-3d [%s] %s 0x%010llx  %dB %s  %lluhit  %s",
+                 b.id, b.enabled ? "有効" : "無効", bpKindName(b),
+                 (unsigned long long)b.addr, b.watchSize, bpRw(b),
+                 (unsigned long long)b.hits, where.c_str());
+      else
+        snprintf(line, sizeof(line), " #%-3d [%s] %s 0x%010llx  %lluhit  %s",
+                 b.id, b.enabled ? "有効" : "無効", bpKindName(b),
+                 (unsigned long long)b.addr, (unsigned long long)b.hits, where.c_str());
+      std::string text = layout::fitWidth(line, cols);
+      std::string on;
+      if (sel && !b.enabled) on = "\x1b[7;2m";
+      else if (sel)          on = "\x1b[7m";
+      else if (!b.enabled)   on = "\x1b[2m";
+      if (!on.empty()) text = on + text + "\x1b[0m";
+      g_term.putAt(0, listTop + y, text);
+    } else {
+      g_term.putAt(0, listTop + y, std::string(cols, ' '));
+    }
+  }
+  if (n == 0) g_term.putAt(0, listTop, layout::fitWidth("  （ブレイクポイントなし。:b <式> などで設定してから）", cols));
+
+  std::string foot;
+  if (g_bpInput) foot = "新しいアドレス(16進): " + g_bpInputBuf + "\x1b[7m \x1b[0m   Enter 確定  ESC 取消";
+  else if (!g_bpEditMsg.empty()) foot = g_bpEditMsg;
+  else foot = "↑↓ 選択   d/e/h/a/s/r 編集   ESC/q 閉じる";
+  g_term.putAt(0, rows - 1, layout::fitWidth(foot, cols));
+}
+
+// アドレス入力確定: 選択ブレイクを同種別で新アドレスへ張り直す。
+void bpApplyNewAddr() {
+  bool ok; Breakpoint sel = bpSelectedCopy(ok);
+  if (!ok) { g_bpInput = false; return; }
+  if (g_bpInputBuf.empty()) { g_bpInput = false; g_bpInputBuf.clear(); return; }
+  uint64_t addr = parseNum(g_bpInputBuf.rfind("0x", 0) == 0 || g_bpInputBuf.rfind("0X", 0) == 0
+                               ? g_bpInputBuf : ("0x" + g_bpInputBuf));
+  g_bpInput = false; g_bpInputBuf.clear();
+  if (!addr) { g_bpEditMsg = "アドレスが不正です"; return; }
+  int kind = sel.watch ? 2 : sel.hw ? 1 : 0;
+  if (bpRebuild(sel, kind, addr, sel.watchSize, sel.onRead, sel.onWrite)) {
+    char m[64]; snprintf(m, sizeof(m), "#%d を 0x%llx へ移動", sel.id, (unsigned long long)addr); g_bpEditMsg = m;
+  } else g_bpEditMsg = "変更に失敗（HW スロット不足など。元に戻しました）";
+}
+
+// 編集アクション（選択ブレイクに対して）。
+void bpActDelete() {
+  bool ok; Breakpoint sel = bpSelectedCopy(ok); if (!ok) return;
+  bool hw = sel.hw;
+  if (g_session.breaks().removeId(sel.id)) { if (hw) g_session.syncHwBreaks();
+    char m[32]; snprintf(m, sizeof(m), "#%d を削除", sel.id); g_bpEditMsg = m; }
+  else g_bpEditMsg = "削除に失敗";
+}
+void bpActToggleEnabled() {
+  bool ok; Breakpoint sel = bpSelectedCopy(ok); if (!ok) return;
+  bool want = !sel.enabled;
+  if (g_session.breaks().setEnabled(sel.id, want)) { g_session.syncHwBreaks();
+    char m[32]; snprintf(m, sizeof(m), "#%d を%s", sel.id, want ? "有効化" : "無効化"); g_bpEditMsg = m; }
+  else g_bpEditMsg = "切替に失敗";
+}
+void bpActToggleSoftHard() {
+  bool ok; Breakpoint sel = bpSelectedCopy(ok); if (!ok) return;
+  if (sel.watch) { g_bpEditMsg = "ウォッチは Soft/Hard 切替の対象外（a/s/r で条件編集）"; return; }
+  int newKind = sel.hw ? 0 : 1; // HW exec ⇄ SW
+  if (bpRebuild(sel, newKind, sel.addr, 0, false, false)) {
+    char m[48]; snprintf(m, sizeof(m), "#%d を %s へ", sel.id, newKind ? "HW 実行ブレイク" : "ソフトブレイク"); g_bpEditMsg = m; }
+  else g_bpEditMsg = "切替に失敗（HW スロット不足など。元に戻しました）";
+}
+void bpActCycleWatchSize() {
+  bool ok; Breakpoint sel = bpSelectedCopy(ok); if (!ok) return;
+  if (!sel.watch) { g_bpEditMsg = "サイズ変更はウォッチのみ"; return; }
+  int sizes[4] = {1,2,4,8}; int cur = 0; for (int i=0;i<4;i++) if (sel.watchSize==sizes[i]) cur=i;
+  int ns = sizes[(cur+1)%4];
+  if (bpRebuild(sel, 2, sel.addr, ns, sel.onRead, sel.onWrite)) {
+    char m[48]; snprintf(m, sizeof(m), "#%d の監視サイズを %dB へ", sel.id, ns); g_bpEditMsg = m; }
+  else g_bpEditMsg = "変更に失敗（元に戻しました）";
+}
+void bpActCycleWatchAccess() {
+  bool ok; Breakpoint sel = bpSelectedCopy(ok); if (!ok) return;
+  if (!sel.watch) { g_bpEditMsg = "アクセス変更はウォッチのみ"; return; }
+  // r → w → rw → r ...
+  bool nR, nW;
+  if (sel.onRead && !sel.onWrite)      { nR=false; nW=true; }
+  else if (!sel.onRead && sel.onWrite) { nR=true;  nW=true; }
+  else                                 { nR=true;  nW=false; }
+  if (bpRebuild(sel, 2, sel.addr, sel.watchSize, nR, nW)) {
+    char m[48]; snprintf(m, sizeof(m), "#%d の監視を %s へ", sel.id, (nR&&nW)?"rw":nR?"r":"w"); g_bpEditMsg = m; }
+  else g_bpEditMsg = "変更に失敗（元に戻しました）";
+}
+
+void bpEditorMove(int d) {
+  int n = (int)g_session.breaks().list().size();
+  if (n == 0) { g_bpSel = 0; return; }
+  g_bpSel += d; if (g_bpSel < 0) g_bpSel = 0; if (g_bpSel >= n) g_bpSel = n - 1;
+}
+
+void handleBpEditorKey(int c) {
+  if (g_bpInput) { // アドレス入力中
+    if (c == 27) { g_bpInput = false; g_bpInputBuf.clear(); render(); return; }
+    if (c == '\r' || c == '\n') { bpApplyNewAddr(); render(); return; }
+    if (c == 127 || c == 8) { if (!g_bpInputBuf.empty()) g_bpInputBuf.pop_back(); render(); return; }
+    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == 'x' || c == 'X')
+      g_bpInputBuf.push_back((char)c);
+    render(); return;
+  }
+  if (g_bpEsc == 1) { g_bpEsc = (c == '[') ? 2 : 0; if (c != '[') { closeBpEditor(); render(); } return; }
+  if (g_bpEsc == 2) { g_bpEsc = 0;
+    if (c == 'A') bpEditorMove(-1); else if (c == 'B') bpEditorMove(+1);
+    render(); return;
+  }
+  if (c == 27) { g_bpEsc = 1; return; }
+  if (c == 'q') { closeBpEditor(); render(); return; }
+  if (c == 16) { bpEditorMove(-1); render(); return; } // Ctrl-P
+  if (c == 14) { bpEditorMove(+1); render(); return; } // Ctrl-N
+  // 以降はブレイクを触る操作（停止中・attach 中のみ）。
+  bool canEdit = (g_state == UiState::Stopped && g_session.isAttached());
+  if (!canEdit) { g_bpEditMsg = "編集は停止中（attach 中）のみ"; render(); return; }
+  g_bpEditMsg.clear();
+  switch (c) {
+    case 'd': case 'x': bpActDelete(); break;
+    case 'e': case ' ': bpActToggleEnabled(); break;
+    case 'h':           bpActToggleSoftHard(); break;
+    case 's':           bpActCycleWatchSize(); break;
+    case 'r':           bpActCycleWatchAccess(); break;
+    case 'a': {         bool ok; bpSelectedCopy(ok); if (ok) { g_bpInput = true; g_bpInputBuf.clear(); } break; }
+    default: break;
+  }
+  int n = (int)g_session.breaks().list().size();
+  if (g_bpSel >= n) g_bpSel = std::max(0, n - 1);
+  render();
+}
+
 // ----- 描画 -----
 void render() {
   g_term.querySize();
@@ -860,8 +1076,8 @@ void render() {
   {
     static std::string prevShape;
     char sh[128];
-    snprintf(sh, sizeof(sh), "%d/%d/%d/%d/%d%d%d/%dx%d",
-             (int)g_state, g_layout, g_pickerMode ? 1 : 0, g_output.empty() ? 0 : 1,
+    snprintf(sh, sizeof(sh), "%d/%d/%d%d/%d/%d%d%d/%dx%d",
+             (int)g_state, g_layout, g_pickerMode ? 1 : 0, g_bpEditMode ? 1 : 0, g_output.empty() ? 0 : 1,
              g_showReg, g_showBt, g_showTh, cols, rows);
     if (prevShape != sh) { g_term.clear(); prevShape = sh; }
     else g_term.home();
@@ -869,6 +1085,13 @@ void render() {
 
   if (g_pickerMode) {
     drawPicker(rows, cols);
+    g_term.drawSelectionOverlay();
+    g_term.flush();
+    return;
+  }
+
+  if (g_bpEditMode) {
+    drawBpEditor(rows, cols);
     g_term.drawSelectionOverlay();
     g_term.flush();
     return;
@@ -1374,6 +1597,8 @@ void runCommand(const std::string& line) {
       s += one;
     }
     g_message = s;
+  } else if (cmd == "be" || cmd == "bedit") {
+    openBpEditor(); // 対話編集オーバレイ（一覧＋選択して削除/有効無効/Soft⇄Hard/条件編集）
   } else if (cmd == "bd") {
     if (arg.empty()) { g_message = "使い方: bd <#番号 | 式>"; return; }
     withBreakId(arg, [](int id) { // #番号 は即時、式は非同期評価のあと
@@ -1805,6 +2030,7 @@ void runCommand(const std::string& line) {
       "  c 継続    s ステップイン    n ステップオーバ    a auto（call/syscall/ret の手前まで自動継続）    R 再起動    Ctrl+C 割り込み停止",
       "  w 今のブレイクを永続化（次回 :run 時に同じアドレスへ自動復元。無操作の終了では保存済みを維持＝勝手に消さない）",
       "    dlopen で後から読むライブラリのブレイクも、そのライブラリがロードされた瞬間に自動装着する（止まって見えない）",
+      "  e ブレイク編集オーバレイを開く（:be と同じ。一覧→選択→削除/有効無効/Soft⇄Hard/条件編集）",
       "  :auto [call|syscall|ret|all]  興味のある命令の手前まで自動継続（省略で all、Ctrl+C で中断）",
       "  : コマンド入力    l / L レイアウト切替    1 / 2 / 3 レジスタ/バックトレース/スレッド表示切替    0 全表示",
       "  ↑ / ↓ 選択カーソル(▸)を 1 命令移動    Ctrl+F / Ctrl+B カーソルを 1 ページ移動（どちらも表示はカーソルに追従。s/n/c で現在位置へ）",
@@ -1825,6 +2051,7 @@ void runCommand(const std::string& line) {
       "  :bh <式>                   ハードウェア実行ブレイク（デバッグレジスタ）",
       "  :w  <式> [1/2/4/8] [r|w|rw] ウォッチポイント（データ監視・既定 8 バイト書込）",
       "  :bl                        一覧（● SW / ◆ HW / [W] ウォッチ, [無効] / (Nhit)）",
+      "  :be / :bedit（e キー）      ブレイク編集オーバレイ: 一覧→選択→d 削除 / e 有効無効 / h Soft⇄Hard / a アドレス / s サイズ / r アクセス",
       "  :bd <#番号|式>             削除       :bt <#番号|式>  ブレイクの有効⇄無効を切替",
       "\x1b[36m― 参照 ―\x1b[0m",
       "  :reg [名前]                レジスタ一覧／1 本（停止中）",
@@ -1886,7 +2113,7 @@ void runCommand(const std::string& line) {
 // コマンド名の TAB 補完（最初の語のみ。引数部では何もしない）。
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
-  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "bd", "bt",
+  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "be", "bedit", "bd", "bt",
                                "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch", "scstop", "mouse"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
@@ -2246,6 +2473,7 @@ void onKey(int c) {
     g_jobCancel.store(true); g_message = "中止しています…"; render(); return;
   }
   if (g_pickerMode) { handlePickerKey(c); return; }
+  if (g_bpEditMode) { handleBpEditorKey(c); return; }
   if (!g_output.empty()) { // オーバレイ（ページャ）: スクロール／ページ送り、ESC・q で閉じる
     int avail = std::max(1, g_term.rows() - 3);
     int maxTop = std::max(0, (int)g_output.size() - avail);
@@ -2304,6 +2532,7 @@ void onKey(int c) {
     case 'R': if (!g_launchArgs.empty()) doRestart(); break; // 対象を同じアドレスで起動し直す（ブレイク復元）
     case 'a': if (g_state == UiState::Stopped && g_session.isAttached()) { runCommand("auto"); render(); } break; // auto（既定=call/syscall/ret すべて）
     case 'w': saveBreakpoints(); break; // 現在のブレイクを永続化（次回 :run で自動復元。無操作終了では維持）
+    case 'e': openBpEditor(); render(); break; // ブレイクポイント編集オーバレイを開く
     case 3:   // Ctrl+C
       if (g_autoMask) { g_autoMask = 0; g_message = "auto 中断"; render(); } // 実行中の step が次に止まる
       else if (g_state == UiState::Running) { g_session.interrupt(); }
