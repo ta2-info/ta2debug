@@ -153,6 +153,14 @@ add_custom_command(
 )
 add_custom_target(arch_arm64_check ALL DEPENDS ${CMAKE_BINARY_DIR}/ArchArm64.arm64.o)
 
+# v2（リファクタリング後の新ツリー。設計書 design/REFACTORING.md）。v1 とは別ディレクトリ・
+# 別ターゲット（ta2base / ta2platform 静的ライブラリ）で、上の v1 ターゲットには一切触れない。
+# 切り離したいときは -DTA2_BUILD_V2=OFF。
+option(TA2_BUILD_V2 "Build the v2 skeleton libraries (v2/)" ON)
+if(TA2_BUILD_V2)
+  add_subdirectory(v2)
+endif()
+
 # arm64 実機（ネイティブ、またはクロスで arm64 を狙うビルド）では、アーキ依存コードが
 # x86_64 で未実行なことを忘れないよう、実機テスト手順への案内を出す。手順は ARM64_TESTING.md。
 # configure 時（STATUS）とビルド時（echo）の両方で見えるようにする（build dir 再利用でも気づける）。

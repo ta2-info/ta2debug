@@ -1,0 +1,36 @@
+// メッセージ定義の唯一の出所（X マクロ）。設計書 design/REFACTORING.md §8.2。
+//   TA2_MSG(ID, "キー", "既定の日本語文")
+// ・ID は enum class MsgId の列挙子になる（存在しない ID の参照はコンパイルエラー）。
+// ・キー体系は <領域>.<対象>[.<詳細>]。AI フロントエンドの安定したエラー識別子にもなる。
+// ・第 3 引数（既定の日本語文）は L3 の Catalog / Translator（未作成）だけが読む。
+//   ta2base 自身は ID とキー（msgKey）しか使わない。{name} は名前付きプレースホルダ。
+// ・include ガードは付けない（include する側が TA2_MSG を定義して複数回取り込むため）。
+//
+// いまは L0（ta2platform）が返すエラーだけを置く。L1 以上の移植に合わせて追記していく。
+// 日本語文は v1 の該当リテラル（src/core/Target.cpp / DtraceCatch.cpp / ExceptionServer.cpp）
+// を写したもの。v1 に無い文（★）は仮置きで、i18n 工程（§8.8 i-1）で確定する。
+// {detail} には strerror / mach_error_string / dtrace_errmsg の文字列（翻訳対象外）が入る。
+
+TA2_MSG(None,                     "",                              "")
+
+// --- err.target.*（Target） ---
+TA2_MSG(ErrTargetAlreadyAttached, "err.target.already_attached",   "すでにアタッチしている")
+TA2_MSG(ErrTaskForPid,            "err.target.task_for_pid",       "task_for_pid 失敗: {detail}（root 実行か、SIP 無効か、対象が自作バイナリかを確認）")
+TA2_MSG(ErrTaskForPidLaunch,      "err.target.task_for_pid_launch", "task_for_pid 失敗: {detail}") // launch 直後（v1 は確認ヒント無しの文）
+TA2_MSG(ErrPosixSpawn,            "err.target.posix_spawn",        "posix_spawn 失敗: {detail}")
+TA2_MSG(ErrTargetArchMismatch,    "err.target.arch_mismatch",      "対象のアーキがホストと違う（{target} / ホスト {host}）") // ★ §9.1
+
+// --- err.exc.*（ExceptionServer） ---
+// ErrExcMachCall の {call} は失敗した Mach 呼び出し名（mach_port_allocate /
+// mach_port_insert_right / task_swap_exception_ports）。
+TA2_MSG(ErrExcAlreadyInstalled,   "err.exc.already_installed",     "すでに install 済み")
+TA2_MSG(ErrExcMachCall,           "err.exc.mach_call",             "{call}: {detail}")
+
+// --- err.dtrace.*（DtraceCatch） ---
+TA2_MSG(ErrDtraceBusy,            "err.dtrace.busy",               "既に監視中")
+TA2_MSG(ErrDtraceOpen,            "err.dtrace.open",               "dtrace_open 失敗: {detail}")
+TA2_MSG(ErrDtraceCompile,         "err.dtrace.compile",            "D コンパイル失敗: {detail}")
+TA2_MSG(ErrDtraceExec,            "err.dtrace.exec",               "program_exec 失敗: {detail}")
+TA2_MSG(ErrDtraceGo,              "err.dtrace.go",                 "dtrace_go 失敗: {detail}")
+TA2_MSG(ErrDtraceNoProbe,         "err.dtrace.no_probe",           "該当する probe がありません（syscall/トラップ名を確認。例: write / mach:mach_msg_trap）")
+TA2_MSG(ErrDtraceNameRequired,    "err.dtrace.name_required",      "引数つき観測には syscall 名が必要（all は集計のみ）")
