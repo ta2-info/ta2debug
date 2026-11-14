@@ -43,7 +43,9 @@ std::vector<Insn> Disassembler::disasm(const uint8_t* code, size_t size, uint64_
 
     bool isCall = cs_insn_group(h, insn, CS_GRP_CALL);
     bool isRet = cs_insn_group(h, insn, CS_GRP_RET);
+    bool isJump = cs_insn_group(h, insn, CS_GRP_JUMP);
     ins.kind = arch_.classify(insn->mnemonic, isCall, isRet);
+    ins.isBranch = (isCall || isJump) && !isRet; // call / jmp（ret は除く）
 
     // 直値 call/branch の飛び先（アーキ別に operand を見る）
     if (ins.kind == InsnKind::Call && insn->detail) {
@@ -56,6 +58,33 @@ std::vector<Insn> Disassembler::disasm(const uint8_t* code, size_t size, uint64_
         auto& a = insn->detail->arm64;
         if (a.op_count > 0 && a.operands[0].type == ARM64_OP_IMM) {
           ins.hasCallTarget = true; ins.callTarget = (uint64_t)a.operands[0].imm;
+        }
+      }
+    }
+
+    // 間接 call/jmp のオペランド情報（レジスタ状況から飛び先を解くのは UI 側）。
+    // x86: *%reg / *disp(base,index,scale) / *disp(%rip)。arm64: blr/br Xn（レジスタのみ）。
+    if (ins.isBranch && insn->detail) {
+      if (arch_.csArch() == CS_ARCH_X86) {
+        auto& x = insn->detail->x86;
+        if (x.op_count > 0) {
+          const auto& op = x.operands[0];
+          if (op.type == X86_OP_REG) {
+            ins.indirect = true; ins.branchOp = BranchOp::Reg;
+            ins.baseReg = cs_reg_name(h, op.reg);
+          } else if (op.type == X86_OP_MEM) {
+            ins.indirect = true; ins.branchOp = BranchOp::Mem;
+            if (op.mem.base  != X86_REG_INVALID) ins.baseReg  = cs_reg_name(h, op.mem.base);
+            if (op.mem.index != X86_REG_INVALID) ins.indexReg = cs_reg_name(h, op.mem.index);
+            ins.branchScale = op.mem.scale ? op.mem.scale : 1;
+            ins.branchDisp  = op.mem.disp;
+          }
+        }
+      } else if (arch_.csArch() == CS_ARCH_ARM64) {
+        auto& a = insn->detail->arm64;
+        if (a.op_count > 0 && a.operands[0].type == ARM64_OP_REG) {
+          ins.indirect = true; ins.branchOp = BranchOp::Reg;
+          ins.baseReg = cs_reg_name(h, a.operands[0].reg);
         }
       }
     }
