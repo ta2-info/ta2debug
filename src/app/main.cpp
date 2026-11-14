@@ -73,6 +73,11 @@ std::atomic<int> g_jobTotal{0};         // 探索対象イメージ総数
 bool g_jobOk = false; uint64_t g_jobAddr = 0; std::string g_jobErr;
 std::function<void(bool, uint64_t, const std::string&)> g_jobApply; // 結果適用（メインで実行）
 
+// 入力スレッドが矢印キー（ESC[A など）を 1 つの合成コードに畳んで流す。これによりハンドラ側は
+// ESC 列を自前で組み立てる必要が無くなり、ESC 単独は即座に 27 として届く（反応が遅れない）。
+// 値はバイト（0..255）・マウスボタンコードと衝突しない範囲にする。
+enum { KEY_UP = 0x1000, KEY_DOWN = 0x1001, KEY_LEFT = 0x1002, KEY_RIGHT = 0x1003 };
+
 // 参照コマンド（reg/x/img など）の複数行出力オーバレイ。空でなければ本体の上に重ねて表示する。
 // ページャ風にスクロール／ページ送りでき、ESC・q で閉じる。
 std::vector<std::string> g_output;
@@ -1039,12 +1044,9 @@ void handleBpEditorKey(int c) {
       g_bpInputBuf.push_back((char)c);
     render(); return;
   }
-  if (g_bpEsc == 1) { g_bpEsc = (c == '[') ? 2 : 0; if (c != '[') { closeBpEditor(); render(); } return; }
-  if (g_bpEsc == 2) { g_bpEsc = 0;
-    if (c == 'A') bpEditorMove(-1); else if (c == 'B') bpEditorMove(+1);
-    render(); return;
-  }
-  if (c == 27) { g_bpEsc = 1; return; }
+  if (c == 27) { closeBpEditor(); render(); return; }   // ESC 即閉じる
+  if (c == KEY_UP)   { bpEditorMove(-1); render(); return; }
+  if (c == KEY_DOWN) { bpEditorMove(+1); render(); return; }
   if (c == 'q') { closeBpEditor(); render(); return; }
   if (c == 16) { bpEditorMove(-1); render(); return; } // Ctrl-P
   if (c == 14) { bpEditorMove(+1); render(); return; } // Ctrl-N
@@ -1202,21 +1204,11 @@ void renderCmdline() {
 
 // ----- プロセス選択のキー処理 -----
 void handlePickerKey(int c) {
-  if (g_escState == 1) {           // 直前が ESC
-    g_escState = 0;
-    if (c == '[') { g_escState = 2; return; }  // 矢印などの CSI
-    closePicker(); render(); return;            // 単独 ESC → 取消
-  }
-  if (g_escState == 2) {           // ESC [ の続き
-    g_escState = 0;
-    if (c == 'A') pickerMove(-1);       // ↑
-    else if (c == 'B') pickerMove(+1);  // ↓
-    else if (c == 'C') pickerScrollH(+1); // → 選択行の引数を右へスクロール
-    else if (c == 'D') pickerScrollH(-1); // ← 戻す
-    render();
-    return;
-  }
-  if (c == 27) { g_escState = 1; return; }       // ESC 列の可能性
+  if (c == 27) { closePicker(); render(); return; }     // ESC 即取消
+  if (c == KEY_UP)    { pickerMove(-1); render(); return; }
+  if (c == KEY_DOWN)  { pickerMove(+1); render(); return; }
+  if (c == KEY_RIGHT) { pickerScrollH(+1); render(); return; } // 選択行の引数を右へスクロール
+  if (c == KEY_LEFT)  { pickerScrollH(-1); render(); return; }
   if (c == '\r' || c == '\n') {
     auto f = pickerFiltered();
     if (!f.empty() && g_pickSel >= 0 && g_pickSel < (int)f.size()) {
@@ -2478,13 +2470,9 @@ void onKey(int c) {
     int avail = std::max(1, g_term.rows() - 3);
     int maxTop = std::max(0, (int)g_output.size() - avail);
     auto closeOv = []() { g_output.clear(); g_outputTitle.clear(); g_xActive = false; g_outputTop = 0; g_ovEsc = 0; };
-    if (g_ovEsc == 1) { if (c == '[') { g_ovEsc = 2; return; } g_ovEsc = 0; closeOv(); render(); return; } // 単独 ESC → 閉じる
-    if (g_ovEsc == 2) { g_ovEsc = 0;                                                                        // ESC[ の続き（矢印）
-      if (c == 'A') g_outputTop = std::max(0, g_outputTop - 1);
-      else if (c == 'B') g_outputTop = std::min(maxTop, g_outputTop + 1);
-      render(); return;
-    }
-    if (c == 27) { g_ovEsc = 1; return; }                                            // ESC 列の可能性
+    if (c == 27) { closeOv(); render(); return; }                                    // ESC 即閉じる
+    if (c == KEY_UP)   { g_outputTop = std::max(0, g_outputTop - 1); render(); return; }
+    if (c == KEY_DOWN) { g_outputTop = std::min(maxTop, g_outputTop + 1); render(); return; }
     if (c == 'q') { closeOv(); render(); return; }
     if (c == ':') { closeOv(); g_cmdMode = true; g_cmdline.clear(); g_message.clear(); render(); return; } // 閉じてコマンド入力へ
     if (c == '\r' || c == '\n') { if (g_xActive) xContinue(); else g_outputTop = std::min(maxTop, g_outputTop + avail); render(); return; }
@@ -2510,13 +2498,8 @@ void onKey(int c) {
 
   // ブレイク中のナビゲーション: 矢印(ESC[A/B)・Tab(フォーカス切替)・Ctrl+F/Ctrl+B(ページ)。
   if (g_state == UiState::Stopped) {
-    if (g_mainEsc == 1) { g_mainEsc = (c == '[') ? 2 : 0; return; }       // ESC の続き
-    if (g_mainEsc == 2) { g_mainEsc = 0;                                  // ESC [ の続き
-      if (c == 'A') { (g_focus == Focus::Threads) ? selectThread(-1) : moveCursor(-1); render(); }
-      else if (c == 'B') { (g_focus == Focus::Threads) ? selectThread(+1) : moveCursor(+1); render(); }
-      return;
-    }
-    if (c == 27) { g_mainEsc = 1; return; }                              // ESC 列の可能性
+    if (c == KEY_UP)   { (g_focus == Focus::Threads) ? selectThread(-1) : moveCursor(-1); render(); return; }
+    if (c == KEY_DOWN) { (g_focus == Focus::Threads) ? selectThread(+1) : moveCursor(+1); render(); return; }
     if (c == '\t') { g_focus = (g_focus == Focus::Disasm) ? Focus::Threads : Focus::Disasm; render(); return; }
     if (c == 6 && g_focus == Focus::Disasm) { pageCursor(+1); render(); return; } // Ctrl+F
     if (c == 2 && g_focus == Focus::Disasm) { pageCursor(-1); render(); return; } // Ctrl+B
@@ -2843,7 +2826,12 @@ int main(int argc, char** argv) {
         case 1: if (ch == '[') { mstate = 2; return; }
                 emitKey(0x1b); mstate = 0; feed(ch); return;  // ESC 単独 → そのまま流して再処理
         case 2: if (ch == '<') { mstate = 3; mbuf.clear(); return; } // SGR マウス開始
-                emitKey(0x1b); emitKey('['); mstate = 0; feed(ch); return; // 矢印等 → ESC [ を復元して再処理
+                mstate = 0; // 矢印は 1 つの合成コードに畳む（ハンドラは ESC 列を組み立てない＝ESC が遅れない）
+                if (ch == 'A') { emitKey(KEY_UP); return; }
+                if (ch == 'B') { emitKey(KEY_DOWN); return; }
+                if (ch == 'C') { emitKey(KEY_RIGHT); return; }
+                if (ch == 'D') { emitKey(KEY_LEFT); return; }
+                emitKey(0x1b); emitKey('['); feed(ch); return; // その他 CSI は ESC [ を復元して再処理
         case 3: if (ch == 'M' || ch == 'm') { emitMouse(mbuf, ch == 'M'); mstate = 0; return; }
                 if (mbuf.size() < 30) mbuf.push_back((char)ch);         // 数字 / ';'
                 else mstate = 0;                                        // 異常に長い → 破棄
@@ -2851,8 +2839,17 @@ int main(int argc, char** argv) {
       }
     };
     for (;;) {
-      int pr = poll(fds, nfds, -1);
+      // ESC を受けて続き（[…）を待っている間だけ短いタイムアウトにする。続きが来なければ ESC 単独と確定。
+      // これをしないと「ESC 単独か矢印の先頭か」を次のバイトが来るまで判別できず、ESC の反応が遅れる。
+      int timeout = (mstate == 1 || mstate == 2) ? 40 : -1;
+      int pr = poll(fds, nfds, timeout);
       if (pr < 0) { if (errno == EINTR) continue; break; }
+      if (pr == 0) { // タイムアウト: 続きが来なかった → 保留中の ESC（/ESC[）を単独キーとして確定
+        if (mstate == 2) { emitKey(0x1b); emitKey('['); }
+        else if (mstate == 1) emitKey(0x1b);
+        mstate = 0;
+        continue;
+      }
       if (nfds == 2 && (fds[1].revents & POLLIN)) {            // リサイズ通知
         char buf[64]; while (read(g_winchPipe[0], buf, sizeof(buf)) > 0) {} // まとめて排出（coalesce）
         g_queue.push({Event::Resize, 0});
