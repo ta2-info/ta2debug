@@ -188,6 +188,11 @@ private:
       case UiAction::GotoDisasm:
         if (res.value) cursor_ = *res.value;
         break;
+      case UiAction::ShowSymbol: {
+        std::string w = (res.where && res.where->hasImage) ? formatDescribe(*res.where) : std::string();
+        status_ = w.empty() ? tr_.tr(Msg::of(MsgId::UiSymNoneAt)) : w;
+        break;
+      }
       default: break;
     }
   }
@@ -197,6 +202,14 @@ private:
       case UiAction::Quit: quit_ = true; break;
       case UiAction::ShowRegisters: openOverlay(tr_.tr(Msg::of(MsgId::UiRegsTitle)), report_.registers(dbg_.registers())); break;
       case UiAction::ShowRegister: { uint64_t v = 0; if (dbg_.readRegister(a.text, v)) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v); status_ = a.text + " = " + b; } else status_ = tr_.tr(Msg::of(MsgId::UiUnknownRegister).str("name", a.text)); break; }
+      case UiAction::ShowVectorRegisters: openOverlay(tr_.tr(Msg::of(MsgId::UiVecTitle)), report_.vectorRegisters(dbg_.vectorRegisters(), a.text)); break;
+      case UiAction::ShowDebugRegisters: openOverlay(tr_.tr(Msg::of(MsgId::UiDrTitle)), report_.debugRegisters(dbg_.debugRegisters())); break;
+      case UiAction::ShowSyscallWatch: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSyscall)), report_.syscallWatch(dbg_.syscallWatch())); break;
+      case UiAction::ShowSyscallStop: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSyscall)), report_.syscallStop(dbg_.syscallWatch())); break;
+      case UiAction::ShowSyscallNames: { SyscallNameList ns; Msg err;
+        if (Debugger::syscallNames(a.text, ns, err)) openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSyscallNames)), report_.syscallNames(ns));
+        else status_ = tr_.tr(err); break; }
+      case UiAction::SetBaseRelative: baseRel_ = a.flag; status_ = tr_.tr(Msg::of(a.flag ? MsgId::UiBaseoffOn : MsgId::UiBaseoffOff)); break;
       case UiAction::ShowBreakpoints: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleBreakpoints)), report_.breakpoints(dbg_.breakpoints())); break;
       case UiAction::ShowImages: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleImages)), report_.images(dbg_.images())); break;
       case UiAction::ShowSegments: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSegments)), report_.segments(dbg_.segments(a.text))); break;
@@ -258,7 +271,8 @@ private:
       if (y >= h) break;
       std::string mark = l.bp.kind != BpMark::None ? (l.bp.kind == BpMark::Soft ? "\x1b[31m●\x1b[0m" : "\x1b[33m◆\x1b[0m") : " ";
       std::string cur = l.isPc ? "\x1b[1m▸\x1b[0m" : " ";
-      char ab[24]; snprintf(ab, sizeof(ab), "0x%012llx", (unsigned long long)l.addr);
+      uint64_t disp = (baseRel_ && dr.imageBase) ? (l.addr - dr.imageBase) : l.addr;
+      char ab[24]; snprintf(ab, sizeof(ab), "0x%012llx", (unsigned long long)disp);
       std::string line = mark + cur + " " + ab + "  " + l.mnemonic + (l.opStr.empty() ? "" : (" " + l.opStr));
       term_.putAt(0, top + y, ui::fitWidth(line, cols));
       y++;
@@ -319,6 +333,7 @@ private:
   std::string cmdline_, status_;
   std::vector<std::string> overlay_; int overlayTop_ = 0;
   uint64_t cursor_ = 0; // 0 = PC 追従
+  bool baseRel_ = false; // 逆アセンブルのアドレスをイメージ先頭相対で表示（:baseoff）
   std::unordered_map<RequestId, UiAction> pending_;
 };
 

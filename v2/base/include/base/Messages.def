@@ -348,6 +348,39 @@ TA2_MSG(UiTitleSegments,          "ui.title.segments",             "セグメン
 TA2_MSG(UiTitleSymbols,           "ui.title.symbols",              "シンボル")
 TA2_MSG(UiTitleAnnotations,       "ui.title.annotations",          "注釈")
 TA2_MSG(UiTitleHelp,              "ui.title.help",                 "ヘルプ")
+TA2_MSG(UiTitleSyscall,           "ui.title.syscall",              "syscall")
+TA2_MSG(UiTitleSyscallNames,      "ui.title.syscall_names",        "syscall 名一覧")
 TA2_MSG(UiRunningHint,            "ui.running_hint",               "(実行中。ブレイクに当たると停止します)")
 TA2_MSG(UiIdleHint,               "ui.idle_hint",                  ":run <パス> / :attach <pid> で開始   :help   :q で終了")
 TA2_MSG(UiPagerHint,              "ui.pager_hint",                 "(↑↓ Space/b ページ  g/G 端  ESC/q 閉じる)")
+
+// --- ベクタ／デバッグレジスタ（:reg vN / xmm / :dr） ---
+TA2_MSG(UiVecTitle,               "ui.vec.title",                  "ベクタレジスタ")
+TA2_MSG(UiVecUnavailable,         "ui.vec.unavailable",            "ベクタレジスタを取得できない")
+TA2_MSG(UiVecArchUnsupported,     "ui.vec.arch_unsupported",       "このアーキはベクタレジスタ未対応")
+TA2_MSG(UiVecUnknown,             "ui.vec.unknown",                "不明なベクタレジスタ: {name}")
+TA2_MSG(UiDrTitle,                "ui.dr.title",                   "デバッグレジスタ")
+TA2_MSG(UiDrUnavailable,          "ui.dr.unavailable",             "デバッグレジスタを取得できない")
+TA2_MSG(UiDrArchUnsupported,      "ui.dr.arch_unsupported",        "このアーキはデバッグレジスタ表示未対応")
+
+// --- 逆アセンブルのアドレス表示切替（:baseoff / :baseon） ---
+TA2_MSG(UiBaseoffOn,              "ui.baseoff.on",                 "逆アセンブルのアドレス表示: イメージ先頭からの相対値")
+TA2_MSG(UiBaseoffOff,             "ui.baseoff.off",                "逆アセンブルのアドレス表示: 実アドレス")
+
+// --- :sym（アドレスのシンボル） ---
+TA2_MSG(UiSymNoneAt,              "ui.sym.none_at",                "そのアドレスにシンボルはありません")
+
+// --- syscall 観測／停止キャッチ（:scwatch / :scstop / list） ---
+TA2_MSG(UiScIdle,                 "ui.sc.idle",                    "syscall 監視: 停止中（:scwatch <名前|all> で開始）")
+TA2_MSG(UiScWatchButStop,         "ui.sc.watch_but_stop",          "syscall 監視は稼働していません（稼働中なのは :scstop の停止キャッチポイント。状況は :scstop）")
+TA2_MSG(UiScWatchRunning,         "ui.sc.watch_running",           "syscall 監視 [稼働中 {filter}]  総計 {n} 回（:scwatch off で停止）")
+TA2_MSG(UiScWatchStopped,         "ui.sc.watch_stopped",           "syscall 監視 [停止 {filter}]  総計 {n} 回")
+TA2_MSG(UiScTraceRunning,         "ui.sc.trace_running",           "syscall トレース [稼働中 {filter}]  総計 {n} 回（:scwatch off で停止）")
+TA2_MSG(UiScTraceStopped,         "ui.sc.trace_stopped",           "syscall トレース [停止 {filter}]  総計 {n} 回")
+TA2_MSG(UiScNoneYet,              "ui.sc.none_yet",                "(まだ発火なし)")
+TA2_MSG(UiScStopIdle,             "ui.sc.stop_idle",               "syscall 停止キャッチ: 未設定（:scstop <名前> で設定）")
+TA2_MSG(UiScStopRunning,          "ui.sc.stop_running",            "syscall 停止キャッチ [稼働中 {filter}]  発火 {n} 回（c で次の発火まで）")
+TA2_MSG(UiScStopStopped,          "ui.sc.stop_stopped",            "syscall 停止キャッチ [停止 {filter}]  発火 {n} 回")
+TA2_MSG(UiScNamesBsd,             "ui.sc.names_bsd",               "BSD syscall（{n} 件）")
+TA2_MSG(UiScNamesMach,            "ui.sc.names_mach",              "Mach トラップ（{n} 件）")
+TA2_MSG(UiScNamesNone,            "ui.sc.names_none",              "(該当なし)")

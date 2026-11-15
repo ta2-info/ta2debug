@@ -11,6 +11,7 @@
 
 #include <unistd.h>
 
+#include "core/SymbolRef.h" // formatDescribe（:sym の記述）
 #include "engine/CommandInterpreter.h"
 #include "engine/Debugger.h"
 #include "engine/Event.h"
@@ -116,12 +117,11 @@ private:
         emit1(a.text + " = " + b);
         break;
       }
-      case UiAction::ShowSymbol: {
-        if (res.where) { std::string w = tr_.tr(Msg()); (void)w; }
-        if (res.value) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)*res.value); std::string s = b;
-          emit1(s); }
+      case UiAction::ShowSymbol:
+        // 記述（image off func+0xNN）は commandResult が res.where から既に出す。
+        // シンボルが無いときだけ補う。
+        if (!(res.where && res.where->hasImage)) emit1(tr_.tr(Msg::of(MsgId::UiSymNoneAt)));
         break;
-      }
       case UiAction::ShowExamine: {
         if (auto ex = std::get_if<ExamineResult>(&res.payload)) emit(report_.examine(*ex));
         break;
@@ -141,6 +141,17 @@ private:
         else emit1(tr_.tr(Msg::of(MsgId::UiUnknownRegister).str("name", a.text)));
         break;
       }
+      case UiAction::ShowVectorRegisters: emit(report_.vectorRegisters(dbg_.vectorRegisters(), a.text)); break;
+      case UiAction::ShowDebugRegisters: emit(report_.debugRegisters(dbg_.debugRegisters())); break;
+      case UiAction::ShowSyscallWatch: emit(report_.syscallWatch(dbg_.syscallWatch())); break;
+      case UiAction::ShowSyscallStop: emit(report_.syscallStop(dbg_.syscallWatch())); break;
+      case UiAction::ShowSyscallNames: {
+        SyscallNameList ns; Msg err;
+        if (Debugger::syscallNames(a.text, ns, err)) emit(report_.syscallNames(ns));
+        else emit1(tr_.tr(err));
+        break;
+      }
+      case UiAction::SetBaseRelative: emit1(tr_.tr(Msg::of(a.flag ? MsgId::UiBaseoffOn : MsgId::UiBaseoffOff))); break;
       case UiAction::ShowBreakpoints: emit(report_.breakpoints(dbg_.breakpoints())); break;
       case UiAction::ShowImages: emit(report_.images(dbg_.images())); break;
       case UiAction::ShowSegments: emit(report_.segments(dbg_.segments(a.text))); break;

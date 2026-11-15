@@ -96,6 +96,77 @@ std::vector<std::string> TextReport::registers(const RegistersSnapshot& rs) cons
   return out;
 }
 
+std::vector<std::string> TextReport::vectorRegisters(const VectorRegisters& vr, const std::string& want) const {
+  std::vector<std::string> out;
+  if (!vr.fetched) { out.push_back(tr_.tr(Msg::of(MsgId::UiVecUnavailable))); return out; }
+  if (vr.regs.empty()) { out.push_back(tr_.tr(Msg::of(MsgId::UiVecArchUnsupported))); return out; }
+  out.push_back(tr_.tr(Msg::of(MsgId::UiVecTitle)));
+  size_t before = out.size();
+  for (const auto& v : vr.regs) {
+    if (!want.empty() && v.name != want) continue;
+    std::string hex = "0x"; // 上位→下位で読める向き（v1 と同じ）
+    for (int k = 15; k >= 0; k--) { char hb[3]; snprintf(hb, sizeof(hb), "%02x", k < (int)v.bytes.size() ? v.bytes[k] : 0); hex += hb; }
+    char b[96]; snprintf(b, sizeof(b), "%-6s = %s", v.name.c_str(), hex.c_str());
+    out.push_back(b);
+  }
+  if (out.size() == before) { out.clear(); out.push_back(tr_.tr(Msg::of(MsgId::UiVecUnknown).str("name", want))); }
+  return out;
+}
+
+std::vector<std::string> TextReport::debugRegisters(const DebugRegisters& dr) const {
+  std::vector<std::string> out;
+  if (!dr.fetched) { out.push_back(tr_.tr(Msg::of(MsgId::UiDrUnavailable))); return out; }
+  if (dr.regs.empty()) { out.push_back(tr_.tr(Msg::of(MsgId::UiDrArchUnsupported))); return out; }
+  out.push_back(tr_.tr(Msg::of(MsgId::UiDrTitle)));
+  for (const auto& r : dr.regs) {
+    char b[80]; snprintf(b, sizeof(b), "%-9s = 0x%016llx", r.name.c_str(), (unsigned long long)r.value);
+    out.push_back(b);
+  }
+  return out;
+}
+
+std::vector<std::string> TextReport::syscallWatch(const SyscallWatchStatus& st) const {
+  std::vector<std::string> out;
+  if (st.active && st.stopMode) { out.push_back(tr_.tr(Msg::of(MsgId::UiScWatchButStop))); return out; }
+  if (!st.active && st.total == 0) { out.push_back(tr_.tr(Msg::of(MsgId::UiScIdle))); return out; }
+  std::string filter = st.filter.empty() ? "all" : st.filter;
+  MsgId head = st.traceMode ? (st.active ? MsgId::UiScTraceRunning : MsgId::UiScTraceStopped)
+                            : (st.active ? MsgId::UiScWatchRunning : MsgId::UiScWatchStopped);
+  out.push_back(tr_.tr(Msg::of(head).str("filter", filter).num("n", (int64_t)st.total)));
+  if (st.traceMode) {
+    for (const auto& line : st.trace) out.push_back(line); // 既に新しい順
+  } else {
+    for (const auto& c : st.counts) { char b[288]; snprintf(b, sizeof(b), "%-28s %llu", c.first.c_str(), (unsigned long long)c.second); out.push_back(b); }
+  }
+  if (out.size() == 1) out.push_back(tr_.tr(Msg::of(MsgId::UiScNoneYet)));
+  return out;
+}
+
+std::vector<std::string> TextReport::syscallStop(const SyscallWatchStatus& st) const {
+  std::vector<std::string> out;
+  if (!st.stopMode || (!st.active && st.total == 0)) { out.push_back(tr_.tr(Msg::of(MsgId::UiScStopIdle))); return out; }
+  std::string filter = st.filter.empty() ? "all" : st.filter;
+  out.push_back(tr_.tr(Msg::of(st.active ? MsgId::UiScStopRunning : MsgId::UiScStopStopped)
+                           .str("filter", filter).num("n", (int64_t)st.total)));
+  for (const auto& c : st.counts) { char b[288]; snprintf(b, sizeof(b), "%-28s %llu", c.first.c_str(), (unsigned long long)c.second); out.push_back(b); }
+  if (out.size() == 1) out.push_back(tr_.tr(Msg::of(MsgId::UiScNoneYet)));
+  return out;
+}
+
+std::vector<std::string> TextReport::syscallNames(const SyscallNameList& ns) const {
+  std::vector<std::string> out;
+  if (ns.bsd.empty() && ns.mach.empty()) { out.push_back(tr_.tr(Msg::of(MsgId::UiScNamesNone))); return out; }
+  if (!ns.bsd.empty()) {
+    out.push_back(tr_.tr(Msg::of(MsgId::UiScNamesBsd).num("n", (int64_t)ns.bsd.size())));
+    for (const auto& n : ns.bsd) out.push_back("  " + n);
+  }
+  if (!ns.mach.empty()) {
+    out.push_back(tr_.tr(Msg::of(MsgId::UiScNamesMach).num("n", (int64_t)ns.mach.size())));
+    for (const auto& n : ns.mach) out.push_back("  " + n);
+  }
+  return out;
+}
+
 std::vector<std::string> TextReport::breakpoints(const std::vector<BreakpointInfo>& bps) const {
   std::vector<std::string> out;
   out.push_back(tr_.tr(Msg::of(MsgId::UiBpCount).num("n", (int64_t)bps.size())));

@@ -37,6 +37,13 @@ public:
 
   // 参照系
   std::vector<std::string> registers(const engine::RegistersSnapshot& rs) const;
+  // ベクタレジスタ（want: 1 本の名前。空なら全部。未対応／取得不可／該当なしも行で返す）。
+  std::vector<std::string> vectorRegisters(const engine::VectorRegisters& vr, const std::string& want) const;
+  std::vector<std::string> debugRegisters(const engine::DebugRegisters& dr) const;
+  // syscall 観測（:scwatch）／停止キャッチ（:scstop）の状況。同じ status を視点で出し分ける。
+  std::vector<std::string> syscallWatch(const engine::SyscallWatchStatus& st) const;
+  std::vector<std::string> syscallStop(const engine::SyscallWatchStatus& st) const;
+  std::vector<std::string> syscallNames(const engine::SyscallNameList& ns) const;
   std::vector<std::string> breakpoints(const std::vector<engine::BreakpointInfo>& bps) const;
   std::vector<std::string> images(const std::vector<engine::ImageInfo>& imgs) const;
   std::vector<std::string> segments(const engine::SegmentList& sl) const;
