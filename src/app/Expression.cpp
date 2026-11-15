@@ -75,6 +75,22 @@ bool Expression::parseTerm(uint64_t& v) {
 
 bool Expression::parseUnary(uint64_t& v) {
   skipSpaces();
+  // C 風ポインタ参照（デリファレンス）: オペランド先頭の '*' は「そのアドレスが指す値」。
+  // 2 項の乗算（a*b）は parseTerm が parseUnary の後ろで拾うので、ここに来る '*' は前置＝参照で曖昧なし。
+  // 右結合なので **p（二重参照）や *(p+8) も可。括弧は parsePrimary が従来どおり扱う。
+  if (pos_ < input_.size() && input_[pos_] == '*') {
+    pos_++;
+    uint64_t addr;
+    if (!parseUnary(addr)) return false;
+    if (!session_.isAttached()) return fail("'*'（ポインタ参照）は attach 中のみ使えます");
+    uint64_t val = 0; // ポインタ幅（8 バイト・リトルエンディアン）で読む
+    if (!session_.target().readMemory(addr, &val, sizeof(val))) {
+      char b[56]; snprintf(b, sizeof(b), "0x%llx は読めません（'*' 参照）", (unsigned long long)addr);
+      return fail(b);
+    }
+    v = val;
+    return true;
+  }
   if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-')) {
     char op = input_[pos_];
     pos_++;
