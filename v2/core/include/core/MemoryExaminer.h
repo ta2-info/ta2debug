@@ -35,7 +35,8 @@ enum class ExamineKind {
 
 struct ExamineValue {
   uint64_t value = 0;   // リトルエンディアンで size バイトを組んだ生値
-  std::string text;     // formatExamineValue(value, fmt, size) の結果
+  std::string text;     // formatExamineValue(value, fmt, size) の結果（ok=false のときは空）
+  bool ok = true;       // この値を構成する全バイトが読めたか。false なら表示側は "**"（未マップ等）
 };
 
 struct ExamineLine {
@@ -44,6 +45,7 @@ struct ExamineLine {
   std::string str;                   // Strings: 文字列（非表示文字は '.' に置換済み）
   Insn insn;                         // Insns: 1 命令（ブレイク命令は元命令に戻してある）
   std::vector<uint8_t> bytes;        // Classic: その行の生バイト（最大 16）
+  std::vector<char> byteOk;          // Classic: bytes と同じ長さ。各バイトが読めたか（false=表示側は "**"）
 };
 
 struct ExamineResult {

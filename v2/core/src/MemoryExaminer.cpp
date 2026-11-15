@@ -4,7 +4,27 @@
 #include <cstdio>
 #include <cstring>
 
+#include <unistd.h>
+
 namespace ta2 {
+
+// addr から len バイトを「読めない範囲があってもエラーにせず」読む。ページ境界ごとにプローブし、
+// 読めたバイトは readable[i]=1、読めないページは 0（buf はゼロ）。mach_vm_read_overwrite は
+// ページ単位で全か無なので、ページを跨がないチャンクに割って読む。穴があっても表示を続けるため。
+static void readTolerant(Target& target, uint64_t addr, uint8_t* buf, std::vector<char>& readable, size_t len) {
+  readable.assign(len, 0);
+  int ps = getpagesize(); if (ps <= 0) ps = 4096;
+  size_t i = 0;
+  while (i < len) {
+    uint64_t a = addr + i;
+    size_t toEnd = (size_t)ps - (size_t)(a % (uint64_t)ps);
+    size_t chunk = toEnd < (len - i) ? toEnd : (len - i);
+    size_t got = 0;
+    if (target.readMemory(a, buf + i, chunk, &got) && got == chunk)
+      for (size_t k = 0; k < chunk; k++) readable[i + k] = 1;
+    i += chunk;
+  }
+}
 
 // 1 個の値を書式 fmt・サイズ size で整形（x:16進 d:符号付 u:符号無 o:8進 t:2進 c:文字 a:アドレス f:浮動小数）
 std::string formatExamineValue(uint64_t v, char fmt, int size) {
@@ -94,26 +114,26 @@ bool MemoryExaminer::examine(const ExamineSpec& spec, uint64_t addr, ExamineResu
     return true;
   }
 
-  // 数値 / 文字
+  // 数値 / 文字（読めないバイトを含む値は ok=false。エラーにせずスクロールを止めない）
   res.kind = ExamineKind::Values;
   size_t total = (size_t)count * size;
-  std::vector<uint8_t> buf(total, 0); size_t got = 0;
-  if (!target_.readMemory(addr, buf.data(), total, &got) || got == 0) {
-    err = Msg::of(MsgId::ErrMemUnreadable).hex("addr", addr);
-    return false;
-  }
-  bps_.maskInto(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（Insns と同じ）
-  int avail = (int)(got / (size_t)size); if (avail < count) count = avail;
+  std::vector<uint8_t> buf(total, 0); std::vector<char> ok;
+  readTolerant(target_, addr, buf.data(), ok, total);
+  bps_.maskInto(addr, buf.data(), total); // ソフトブレイクの INT3/BRK を元バイトへ戻す（Insns と同じ）
   res.count = count;
   int perLine = (fmt=='a') ? 1 : size>=8 ? 2 : size>=4 ? 4 : size>=2 ? 8 : 8;
   for (int idx = 0; idx < count; ) {
     ExamineLine l;
     l.addr = addr + (size_t)idx*size;
     for (int j = 0; j < perLine && idx < count; j++, idx++) {
-      uint64_t v = 0; for (int bb = 0; bb < size; bb++) v |= (uint64_t)buf[(size_t)idx*size + bb] << (8*bb);
+      bool allok = true; for (int bb = 0; bb < size; bb++) if (!ok[(size_t)idx*size + bb]) { allok = false; break; }
       ExamineValue ev;
-      ev.value = v;
-      ev.text = formatExamineValue(v, fmt, size);
+      ev.ok = allok;
+      if (allok) {
+        uint64_t v = 0; for (int bb = 0; bb < size; bb++) v |= (uint64_t)buf[(size_t)idx*size + bb] << (8*bb);
+        ev.value = v;
+        ev.text = formatExamineValue(v, fmt, size);
+      }
       l.values.push_back(std::move(ev));
     }
     res.lines.push_back(std::move(l));
@@ -127,22 +147,20 @@ bool MemoryExaminer::examine(const ExamineSpec& spec, uint64_t addr, ExamineResu
 bool MemoryExaminer::classicDump(uint64_t addr, int bytes, ExamineResult& out, Msg& err) {
   if (bytes < 1) bytes = 1;
   if (bytes > 4096) bytes = 4096;
-  std::vector<uint8_t> buf(bytes, 0); size_t got = 0;
-  if (!target_.readMemory(addr, buf.data(), bytes, &got) || got == 0) {
-    err = Msg::of(MsgId::ErrMemUnreadable).hex("addr", addr);
-    return false;
-  }
-  bps_.maskInto(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（Insns と同じ）
+  // 読めない範囲があってもエラーにせず読む（未マップのバイトは byteOk=0 → 表示側は "**"）。
+  std::vector<uint8_t> buf(bytes, 0); std::vector<char> ok;
+  readTolerant(target_, addr, buf.data(), ok, (size_t)bytes);
+  bps_.maskInto(addr, buf.data(), (size_t)bytes); // ソフトブレイクの INT3/BRK を元バイトへ戻す（Insns と同じ）
   ExamineResult res;
   res.kind = ExamineKind::Classic;
-  res.addr = addr; res.fmt = 'x'; res.size = 1; res.count = (int)got; res.bytesRead = got;
-  for (size_t i = 0; i < got; i += 16) {
+  res.addr = addr; res.fmt = 'x'; res.size = 1; res.count = bytes; res.bytesRead = (size_t)bytes;
+  for (int i = 0; i < bytes; i += 16) {
     ExamineLine l;
-    l.addr = addr + i;
-    for (size_t j = 0; j < 16 && i + j < got; j++) l.bytes.push_back(buf[i + j]);
+    l.addr = addr + (size_t)i;
+    for (int j = 0; j < 16 && i + j < bytes; j++) { l.bytes.push_back(buf[i + j]); l.byteOk.push_back(ok[i + j]); }
     res.lines.push_back(std::move(l));
   }
-  res.nextAddr = addr + got; // 継続先
+  res.nextAddr = addr + (size_t)bytes; // 継続先
   out = std::move(res);
   return true;
 }
