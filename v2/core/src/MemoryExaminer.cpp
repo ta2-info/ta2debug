@@ -102,6 +102,7 @@ bool MemoryExaminer::examine(const ExamineSpec& spec, uint64_t addr, ExamineResu
     err = Msg::of(MsgId::ErrMemUnreadable).hex("addr", addr);
     return false;
   }
+  bps_.maskInto(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（Insns と同じ）
   int avail = (int)(got / (size_t)size); if (avail < count) count = avail;
   res.count = count;
   int perLine = (fmt=='a') ? 1 : size>=8 ? 2 : size>=4 ? 4 : size>=2 ? 8 : 8;
@@ -131,6 +132,7 @@ bool MemoryExaminer::classicDump(uint64_t addr, int bytes, ExamineResult& out, M
     err = Msg::of(MsgId::ErrMemUnreadable).hex("addr", addr);
     return false;
   }
+  bps_.maskInto(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（Insns と同じ）
   ExamineResult res;
   res.kind = ExamineKind::Classic;
   res.addr = addr; res.fmt = 'x'; res.size = 1; res.count = (int)got; res.bytesRead = got;
