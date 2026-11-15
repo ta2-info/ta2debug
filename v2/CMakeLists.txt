@@ -2,13 +2,15 @@
 # ルート CMakeLists.txt から option(TA2_BUILD_V2) で add_subdirectory される。
 # v1（ルートの src/ inc/）とは混ぜない: v1 のターゲット・include パス（ta2opts）は使わない。
 #
-# いまあるのは下 2 層（v1 から実ロジックを移植済み）:
+# いまあるのは L0〜L2（v1 から実ロジックを移植済み）:
 #   ta2base     … 横断値型（Msg / MsgId）。何にも依存しない
 #   ta2platform … L0 Platform/Arch（Arch / Target / ExceptionServer / DtraceCatch / ProcessList / MIG）
 #   ta2core     … L1 Core Engine（Breakpoints / ImageList / Symbols / Annotations / BreakpointStore /
 #                 Disassembler / Unwinder / DwarfLines / SyscallTables / SyscallDecoder / Expression /
 #                 Backtracer / BranchResolver / MemoryExaminer / SymbolRef / Stepper / DyldNotifier /
 #                 SyscallMonitor / SymbolWarmer / ExitMonitor / TargetSession）
+#   ta2engine   … L2 Facade/API（Debugger / Command / DebugEvent / EngineInbox / StopProcessor /
+#                 BreakpointService / AutoRunner / JobRunner / CommandInterpreter）
 # 層の依存方向はライブラリ分割で強制する（下位は上位のヘッダを include パスに持たない）。
 
 # v2 共通のコンパイル設定（v1 の ta2opts 相当。ただし inc/ と capstone は入れない）。
@@ -80,6 +82,25 @@ target_include_directories(ta2core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/core/inclu
 # capstone は利用側のリンクへ伝播させる（静的ライブラリなのでリンクは最終実行ファイルで起きる）。
 target_link_libraries(ta2core PUBLIC ta2platform ta2base ${CAPSTONE_LIBRARY} PRIVATE ta2v2opts)
 
+# ---- ta2engine ----
+# L2 Facade/API（ヘッドレスなデバッガ本体）。ta2core / ta2platform / ta2base の上に積む。
+# ui/ のヘッダは include パスに入れない（＝UI・端末・言語カタログに依存できない）。capstone / dtrace の
+# ヘッダも見えない（リンクだけ下位から伝播する）。
+set(TA2ENGINE_SOURCES
+  engine/src/EngineInbox.cpp
+  engine/src/AutoRunner.cpp
+  engine/src/BreakpointService.cpp
+  engine/src/JobRunner.cpp
+  engine/src/StopProcessor.cpp
+  engine/src/Debugger.cpp
+  engine/src/DebuggerCommands.cpp
+  engine/src/DebuggerQueries.cpp
+  engine/src/CommandInterpreter.cpp
+)
+add_library(ta2engine STATIC ${TA2ENGINE_SOURCES})
+target_include_directories(ta2engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
+target_link_libraries(ta2engine PUBLIC ta2core ta2platform ta2base PRIVATE ta2v2opts)
+
 # ---- 非ホストアーキのコンパイル検査（リンクなし。設計書 §9.3） ----
 # x86_64 ホストでは -arch arm64、arm64 ホストでは -arch x86_64 で ta2base / ta2platform / ta2core の
 # C++ ソースをすべてコンパイルし、非ホスト側の Arch 実装が SDK ヘッダに対して壊れていない
@@ -97,9 +118,10 @@ file(GLOB_RECURSE _ta2v2_headers CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/base/include/*
   ${CMAKE_CURRENT_SOURCE_DIR}/platform/include/*
   ${CMAKE_CURRENT_SOURCE_DIR}/core/include/*
-  ${CMAKE_CURRENT_SOURCE_DIR}/core/src/*.inc)
+  ${CMAKE_CURRENT_SOURCE_DIR}/core/src/*.inc
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine/include/*)
 set(_ta2v2_cross_objs "")
-foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES})
+foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES} ${TA2ENGINE_SOURCES})
   string(REPLACE "/" "_" _obj ${_src})
   set(_obj ${CMAKE_CURRENT_BINARY_DIR}/cross_${_ta2v2_cross_arch}/${_obj}.o)
   add_custom_command(
@@ -109,6 +131,7 @@ foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES})
             -I${CMAKE_CURRENT_SOURCE_DIR}/base/include
             -I${CMAKE_CURRENT_SOURCE_DIR}/platform/include
             -I${CMAKE_CURRENT_SOURCE_DIR}/core/include
+            -I${CMAKE_CURRENT_SOURCE_DIR}/engine/include
             -I${CAPSTONE_INCLUDE_DIR}
             -c ${CMAKE_CURRENT_SOURCE_DIR}/${_src} -o ${_obj}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${_src} ${_ta2v2_headers}
