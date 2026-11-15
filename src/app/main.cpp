@@ -99,6 +99,20 @@ int g_xRowBytes = 16;          // 1 行ぶんのバイト数（矢印の移動�
 int g_xPageBytes = 64;         // 1 画面ぶんのバイト数（Ctrl+F/B・Enter の移動量）
 bool g_xNavByAddr = false;     // アドレスナビが有効な表示か
 
+// :syms の対話オーバレイ。キーワードを打つとその場で曖昧（部分列）フィルタし、Tab で並び順
+// （アドレス順 ↔ 名前順）を切り替える。全シンボルは一度だけ取り出して（遅延デマングル込み）
+// キャッシュし、打鍵ごとは文字列照合＋並べ替えだけにして固まらないようにする。バッチ(非対話)は
+// 従来どおり一括出力なのでこのモードには入らない。
+// name=表示名（デマングル済み）。lname/lmangled=照合用に小文字化した表示名とマングル名。
+// 曖昧（部分列）照合はこの 2 つを「連結せず別々に」当てる（連結すると境界をまたいで同じ文字が
+// 二重に現れ、"appl" が p を 1 つしか持たない名前にも誤ってヒットするため）。
+struct SymEntry { uint64_t addr; std::string name; std::string lname; std::string lmangled; };
+bool g_symsActive = false;             // いま表示中のオーバレイが :syms の対話一覧か
+std::vector<SymEntry> g_symsAll;       // 対象イメージの全シンボル（表示名はデマングル済み・照合用に小文字化）
+std::string g_symsFilter;              // 現在の絞り込みキーワード（編集可能）
+int g_symsSort = 0;                    // 0=アドレス順, 1=名前順（昇順）
+std::string g_symsImgName;             // 見出し用の対象イメージ名
+
 // auto（興味のある命令まで自動継続）。g_autoMask のビット: 1=call, 2=syscall, 4=ret。0 で無効。
 // 停止のたびに、現命令が該当すれば止め、そうでなければ自動で単一ステップを続ける。
 int g_autoMask = 0;
@@ -1153,13 +1167,18 @@ void render() {
     if (g_outputTop > maxTop) g_outputTop = maxTop;
     if (g_outputTop < 0) g_outputTop = 0;
     std::string hint;
-    if (g_xActive && g_xNavByAddr)  // :x のアドレスナビ（表示アドレスを前後に動かす）
+    if (g_symsActive)               // :syms の対話一覧（打鍵で曖昧フィルタ・Tab で並び替え）
+      hint = "文字=絞込  Tab=並び替え  ↑↓ Ctrl+F/B スクロール  Ctrl+U クリア  ESC 閉じる";
+    else if (g_xActive && g_xNavByAddr)  // :x のアドレスナビ（表示アドレスを前後に動かす）
       hint = "↑↓ 1 行  Ctrl+F/Ctrl+B・Space/b 1 画面  Enter 次画面  ESC・q 閉じる";
     else {
       hint = g_xActive ? "Enter 続き / " : "";
       hint += "↑↓ Space/b ページ  g/G 先頭/末尾  ESC・q 閉じる";
     }
-    g_term.putAt(0, 1, "\x1b[33m" + g_outputTitle + "\x1b[0m \x1b[2m（" + hint + "）\x1b[0m\x1b[K");
+    // syms のときは現在の絞り込み語を見出しに添えて、打鍵が即反映されるのを見せる（末尾に入力位置の ▊）。
+    std::string titleLine = g_outputTitle;
+    if (g_symsActive) titleLine += "  絞込: " + g_symsFilter + "█";
+    g_term.putAt(0, 1, "\x1b[33m" + titleLine + "\x1b[0m \x1b[2m（" + hint + "）\x1b[0m\x1b[K");
     for (int y = 0; y < avail; y++) {
       int idx = g_outputTop + y;
       std::string t = (idx < total) ? g_output[idx] : "";
@@ -1418,6 +1437,57 @@ void pushWrapped(std::vector<std::string>& out, const std::string& line, int wid
   out.push_back((first ? std::string() : indent) + cur);
 }
 
+// 曖昧（部分列）照合: pat の各文字が hay の中に順序を保って現れれば真（fzf 風）。両方小文字前提。
+// 部分一致（連続）より緩く、"prf" で "printf" を拾える。空パターンは常に真。
+static bool fuzzySubseq(const std::string& hay, const std::string& pat) {
+  if (pat.empty()) return true;
+  size_t j = 0;
+  for (size_t i = 0; i < hay.size() && j < pat.size(); i++)
+    if (hay[i] == pat[j]) j++;
+  return j == pat.size();
+}
+
+// 絞り込みキーワードを空白区切りの語に分け、各語が表示名かマングル名のどちらかの部分列であれば一致
+//（AND）。語が無ければ全件。名前とマングル名は別々に当てる（連結しない）。
+static bool symsFilterMatch(const SymEntry& e, const std::string& filterLower) {
+  size_t i = 0, n = filterLower.size();
+  while (i < n) {
+    while (i < n && filterLower[i] == ' ') i++;
+    size_t s = i; while (i < n && filterLower[i] != ' ') i++;
+    if (i > s) {
+      std::string tok = filterLower.substr(s, i - s);
+      if (!fuzzySubseq(e.lname, tok) && !fuzzySubseq(e.lmangled, tok)) return false;
+    }
+  }
+  return true;
+}
+
+// g_symsAll（キャッシュ済み）から現在の g_symsFilter / g_symsSort で g_output を組み直す。
+// アドレス順はキャッシュの並び（元のアドレス順）そのまま、名前順は表示名で昇順に並べ替える。
+// 打鍵・Tab のたびに呼ぶ。新しい結果なので先頭から表示する。
+void symsRebuild() {
+  std::string lf = g_symsFilter;
+  std::transform(lf.begin(), lf.end(), lf.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+  std::vector<const SymEntry*> hits;
+  hits.reserve(g_symsAll.size());
+  for (const auto& e : g_symsAll) if (symsFilterMatch(e, lf)) hits.push_back(&e);
+  if (g_symsSort == 1) // 名前順（表示名で昇順。同名はアドレス順で安定化）
+    std::stable_sort(hits.begin(), hits.end(), [](const SymEntry* a, const SymEntry* b){
+      if (a->name != b->name) return a->name < b->name; return a->addr < b->addr; });
+  g_output.clear();
+  for (const auto* e : hits) {
+    char b[384]; snprintf(b, sizeof(b), "0x%012llx  %s", (unsigned long long)e->addr, e->name.c_str());
+    pushWrapped(g_output, b, g_term.cols(), 16); // 長い名前も折り返して全部見せる（2 行目以降は 16 桁字下げ）
+  }
+  const char* sortName = g_symsSort == 1 ? "名前順" : "アドレス順";
+  char th[160];
+  snprintf(th, sizeof(th), "%s のシンボル %zu/%zu 個  [並び: %s]",
+           g_symsImgName.c_str(), hits.size(), g_symsAll.size(), sortName);
+  g_outputTitle = th;
+  if (g_output.empty()) g_output.push_back(g_symsFilter.empty() ? "(シンボルなし)" : "(一致なし)");
+  g_outputTop = 0;
+}
+
 // 直近の examine（書式/バイト数）を g_xNextAddr から続けて表示する。
 void xContinue() {
   if (g_xSpec.empty()) classicDump(g_xNextAddr, g_xClassicBytes);
@@ -1546,6 +1616,7 @@ void runCommand(const std::string& line) {
   if (g_jobRunning.load()) { g_message = "処理中です（ESC で中止してください）"; return; }
   g_message.clear();
   g_outputTop = 0; // 新しいコマンド出力は先頭から表示
+  g_symsActive = false; g_symsAll.clear(); // 直前の :syms 対話一覧があれば畳む（新コマンドの出力に置き換わる）
   // コマンド実行前のこの境界で、イメージ一覧とユーザ注釈を最新化する。
   //  - refreshImages: dlopen で後から読み込まれたライブラリにも :b / :sym が効くように
   //    （dyld の変更タイムスタンプを見て、変化時だけ再読込するので走行中でも安価）。
@@ -1801,27 +1872,38 @@ void runCommand(const std::string& line) {
     if (toks.empty()) im = g_session.defaultLibImage();
     else { im = g_session.images().byName(toks[0]); for (size_t i = 1; i < toks.size(); i++) filt += (i>1?" ":"") + toks[i]; }
     if (!im) { g_message = toks.empty() ? "対象ライブラリが不明" : ("ライブラリが見つからない: " + toks[0]); return; }
-    std::string lf = filt; std::transform(lf.begin(), lf.end(), lf.begin(), [](unsigned char c){ return (char)std::tolower(c); });
     const auto& syms = g_session.symbols().forImage(*im);
-    g_output.clear();
-    int shown = 0;
-    for (const auto& s : syms) {
-      const std::string& dn = g_session.symbols().displayName(s); // 遅延デマングル（この一覧ぶんだけ）
-      if (!lf.empty()) {
-        std::string hay = dn + " " + s.mangled;
-        std::transform(hay.begin(), hay.end(), hay.begin(), [](unsigned char c){ return (char)std::tolower(c); });
-        if (hay.find(lf) == std::string::npos) continue;
+    if (g_interactive) {
+      // 対話(TUI): 全シンボルを一度だけ取り出して（表示名のデマングル込み・照合用に小文字化）キャッシュし、
+      // 曖昧フィルタ＋並び替えオーバレイを開く。以降の打鍵・Tab は symsRebuild だけで固まらない。
+      g_symsAll.clear(); g_symsAll.reserve(syms.size());
+      auto lower = [](std::string v){ std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c){ return (char)std::tolower(c); }); return v; };
+      for (const auto& s : syms) {
+        const std::string& dn = g_session.symbols().displayName(s); // 遅延デマングル（このイメージぶん）
+        g_symsAll.push_back(SymEntry{ s.addr, dn, lower(dn), lower(s.mangled) });
       }
-      char b[384]; snprintf(b, sizeof(b), "0x%012llx  %s", (unsigned long long)s.addr, dn.c_str());
-      // 対話(TUI)では長い名前が右端で切れて違いが分からないので、画面幅で折り返して全部見せる
-      //（2 行目以降はアドレス幅 16 桁ぶん字下げ）。バッチは 1 行のまま（出力安定・切り捨てない）。
-      if (g_interactive) pushWrapped(g_output, b, g_term.cols(), 16);
-      else g_output.push_back(b);
-      shown++;
+      g_symsImgName = im->name; g_symsFilter = filt; g_symsSort = 0; g_symsActive = true;
+      symsRebuild();
+    } else {
+      // バッチ(非対話): 従来どおり一括出力（部分一致・大小無視・アドレス順・1 行のまま＝出力安定）。
+      std::string lf = filt; std::transform(lf.begin(), lf.end(), lf.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+      g_output.clear();
+      int shown = 0;
+      for (const auto& s : syms) {
+        const std::string& dn = g_session.symbols().displayName(s); // 遅延デマングル（この一覧ぶんだけ）
+        if (!lf.empty()) {
+          std::string hay = dn + " " + s.mangled;
+          std::transform(hay.begin(), hay.end(), hay.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+          if (hay.find(lf) == std::string::npos) continue;
+        }
+        char b[384]; snprintf(b, sizeof(b), "0x%012llx  %s", (unsigned long long)s.addr, dn.c_str());
+        g_output.push_back(b);
+        shown++;
+      }
+      g_outputTitle = im->name + " のシンボル " + std::to_string(shown) + " 個"
+                    + (filt.empty() ? "" : ("（絞込: " + filt + "）"));
+      if (g_output.empty()) g_output.push_back(filt.empty() ? "(シンボルなし)" : "(一致なし)");
     }
-    g_outputTitle = im->name + " のシンボル " + std::to_string(shown) + " 個"
-                  + (filt.empty() ? "" : ("（絞込: " + filt + "）"));
-    if (g_output.empty()) g_output.push_back(filt.empty() ? "(シンボルなし)" : "(一致なし)");
   } else if (cmd == "uselib") {
     std::string a = trimStr(arg);
     if (a.empty()) {
@@ -2133,6 +2215,7 @@ void runCommand(const std::string& line) {
       "    q        終了",
       "    出力オーバレイ（help/img/syms/reg 等）: ↑↓・Space/b ページ   g/G 先頭末尾   Enter 続き(dis)   ESC・q 閉じる",
       "    :x のオーバレイは↑↓で 1 行・Ctrl+F/Ctrl+B で 1 画面ぶん表示アドレスを前後（メモリを辿る）。Enter で次画面",
+      "    :syms のオーバレイは文字入力でその場で曖昧（部分列）フィルタ、Tab で並び替え（アドレス順↔名前順）、Ctrl+U で絞込クリア",
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
       "  :attach [pid]              pid 省略でプロセス一覧から選択",
       "  :run <パス> [引数...]      バイナリを起動してデバッグ（エントリ手前で停止）",
@@ -2158,7 +2241,7 @@ void runCommand(const std::string& line) {
       "  :x/<個数><書式><サイズ> <式>  書式付き（書式 x d u o t c i s f a / サイズ b h w g。個数は書式内）",
       "  :x                         前回の続き（オーバレイ表示中は Enter でも）",
       "  :sym <式>                  アドレスのシンボル    :img / :libs  読込イメージ（ライブラリ）一覧    :seg [名前]  セグメント一覧",
-      "  :syms <ライブラリ> [絞込]   そのライブラリのシンボル一覧（省略で既定ライブラリ・絞込は部分一致）",
+      "  :syms <ライブラリ> [絞込]   そのライブラリのシンボル一覧（省略で既定ライブラリ）。対話では文字入力で曖昧フィルタ・Tab で並び替え",
       "  :uselib [<名前>|-]          式でライブラリ名省略時に先に探す既定ライブラリを 表示 / 設定 / 解除",
       "\x1b[36m― 注釈（自分で付ける名前・メモ） ―\x1b[0m",
       "  :ann <式>,<名前>[,<メモ>]   そのアドレスに名前を付ける（以降 :b <名前> / 式で引ける・表示にも出る）",
@@ -2569,8 +2652,22 @@ void onKey(int c) {
   if (!g_output.empty()) { // オーバレイ（ページャ）: スクロール／ページ送り、ESC・q で閉じる
     int avail = std::max(1, g_term.rows() - 3);
     int maxTop = std::max(0, (int)g_output.size() - avail);
-    auto closeOv = []() { g_output.clear(); g_outputTitle.clear(); g_xActive = false; g_outputTop = 0; g_ovEsc = 0; };
+    auto closeOv = []() { g_output.clear(); g_outputTitle.clear(); g_xActive = false; g_symsActive = false; g_symsAll.clear(); g_outputTop = 0; g_ovEsc = 0; };
     if (c == 27) { closeOv(); render(); return; }                                    // ESC 即閉じる
+    // :syms の対話一覧: 文字入力＝その場で曖昧フィルタ、Tab＝並び替え（アドレス順↔名前順）、
+    // 矢印・Ctrl+F/B＝スクロール、ESC で閉じる。文字が絞り込みに吸われるので下の汎用キーより先に拾う。
+    if (g_symsActive) {
+      if (c == '\t') { g_symsSort ^= 1; symsRebuild(); render(); return; }                 // Tab: 並び替え
+      if (c == 127 || c == 8) { if (!g_symsFilter.empty()) { g_symsFilter.pop_back(); symsRebuild(); } render(); return; } // BS
+      if (c == 21) { if (!g_symsFilter.empty()) { g_symsFilter.clear(); symsRebuild(); } render(); return; } // Ctrl+U: 絞込クリア
+      if (c == KEY_UP)   { g_outputTop = std::max(0, g_outputTop - 1); render(); return; }
+      if (c == KEY_DOWN) { g_outputTop = std::min(maxTop, g_outputTop + 1); render(); return; }
+      if (c == 6) { g_outputTop = std::min(maxTop, g_outputTop + avail); render(); return; } // Ctrl+F: 1 ページ下
+      if (c == 2) { g_outputTop = std::max(0, g_outputTop - avail); render(); return; }       // Ctrl+B: 1 ページ上
+      if (c == ':') { closeOv(); g_cmdMode = true; g_cmdline.clear(); g_message.clear(); render(); return; } // 閉じてコマンドへ
+      if (c >= 0x20 && c < 0x7f) { g_symsFilter.push_back((char)c); symsRebuild(); render(); return; } // 絞り込みに追記
+      return;                                                                               // その他は無視（閉じない）
+    }
     // :x のアドレスナビ（16進/数値表示）: 矢印=1 行・Ctrl+F/B/Space=1 画面ぶん表示アドレスを前後。
     // 画面いっぱい表示だとバッファ内スクロールは無反応なので、ここでアドレス自体を動かして読み直す。
     if (g_xActive && g_xNavByAddr) {
