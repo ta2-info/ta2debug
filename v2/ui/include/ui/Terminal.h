@@ -31,8 +31,13 @@ public:
   void putAt(int col, int row, const std::string& s);      // 位置指定でバッファへ
   void flush();                                            // バッファを端末へ一括出力
 
+  // マウス報告（SGR 1006＋ボタン 1000＋ドラッグ 1002）の ON/OFF。OFF で端末側の選択に戻す。
+  void setMouse(bool on);
+  bool mouseOn() const { return mouseOn_; }
+
 private:
   bool entered_ = false;
+  bool mouseOn_ = false;
   int rows_ = 24, cols_ = 80;
   std::string buf_;
   // 元 termios をバイト列で控える（.cpp で struct termios に復元）。macOS の termios は 72 バイト。

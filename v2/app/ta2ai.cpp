@@ -65,6 +65,7 @@ public:
       case ParseResult::Ui:
         return handleUi(pr.action, pr.spec);
       case ParseResult::Posted: {
+        if (pr.action.kind == UiAction::ShowExamine) lastExSpec_ = parseExSpec(pr.line); // :x の書式を覚える
         CommandResult res = waitFinished(pr.request);
         emit(report_.commandResult(res));
         handleFollowup(pr.action, res);
@@ -123,7 +124,7 @@ private:
         if (!(res.where && res.where->hasImage)) emit1(tr_.tr(Msg::of(MsgId::UiSymNoneAt)));
         break;
       case UiAction::ShowExamine: {
-        if (auto ex = std::get_if<ExamineResult>(&res.payload)) emit(report_.examine(*ex));
+        if (auto ex = std::get_if<ExamineResult>(&res.payload)) { lastExAddr_ = ex->nextAddr; haveLastEx_ = true; emit(report_.examine(*ex)); }
         break;
       }
       default: break;
@@ -152,6 +153,7 @@ private:
         break;
       }
       case UiAction::SetBaseRelative: emit1(tr_.tr(Msg::of(a.flag ? MsgId::UiBaseoffOn : MsgId::UiBaseoffOff))); break;
+      case UiAction::ContinueExamine: continueExamine(a.text); break;
       case UiAction::ShowBreakpoints: emit(report_.breakpoints(dbg_.breakpoints())); break;
       case UiAction::ShowImages: emit(report_.images(dbg_.images())); break;
       case UiAction::ShowSegments: emit(report_.segments(dbg_.segments(a.text))); break;
@@ -182,12 +184,33 @@ private:
     return true;
   }
 
+  // "x/8xb 式" / "x /8xb 式" → 書式 "8xb"（hExamine と同じ規則）。無ければ空。
+  static std::string parseExSpec(const std::string& line) {
+    size_t i = line.find_first_not_of(" \t"); if (i == std::string::npos) return "";
+    size_t j = line.find_first_of(" \t", i); std::string cmd = line.substr(i, j == std::string::npos ? std::string::npos : j - i);
+    if (cmd.size() > 2 && cmd[0] == 'x' && cmd[1] == '/') return cmd.substr(2);
+    if (j == std::string::npos) return "";
+    size_t k = line.find_first_not_of(" \t", j); if (k == std::string::npos) return "";
+    size_t l = line.find_first_of(" \t", k); std::string t = line.substr(k, l == std::string::npos ? std::string::npos : l - k);
+    return (!t.empty() && t[0] == '/') ? t.substr(1) : std::string();
+  }
+  void continueExamine(const std::string& override) {
+    if (!haveLastEx_) { emit1(tr_.tr(Msg::of(MsgId::UiExamineNoPrev))); return; }
+    std::string spec = override.empty() ? lastExSpec_ : override;
+    ExamineResult ex; Msg err;
+    bool ok = spec.empty() ? dbg_.classicDump(lastExAddr_, 64, ex, err) : dbg_.examine(spec, lastExAddr_, ex, err);
+    if (!ok) { emit1(tr_.tr(err)); return; }
+    lastExAddr_ = ex.nextAddr; lastExSpec_ = spec; haveLastEx_ = true;
+    emit(report_.examine(ex));
+  }
+
   Debugger dbg_;
   Translator tr_;
   CommandInterpreter interp_;
   BatchSink sink_;
   ui::TextReport report_;
   SubscriptionId sub_ = 0;
+  std::string lastExSpec_; uint64_t lastExAddr_ = 0; bool haveLastEx_ = false; // :x 継続
 };
 
 void printUsage() {

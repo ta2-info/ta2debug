@@ -91,9 +91,16 @@ void Terminal::enter() {
   entered_ = true;
 }
 
+void Terminal::setMouse(bool on) {
+  mouseOn_ = on;
+  buf_ += on ? "\x1b[?1000;1002;1006h" : "\x1b[?1000;1002;1006l";
+  flush();
+}
+
 void Terminal::leave() {
   if (!entered_) return;
-  buf_ = "\x1b[?25h\x1b[?1049l"; // カーソル表示・通常画面へ
+  if (mouseOn_) { buf_ += "\x1b[?1000;1002;1006l"; mouseOn_ = false; } // マウス報告を戻す
+  buf_ += "\x1b[?25h\x1b[?1049l"; // カーソル表示・通常画面へ
   flush();
   if (savedValid_) { struct termios t; memcpy(&t, saved_, sizeof(t)); tcsetattr(STDIN_FILENO, TCSANOW, &t); }
   entered_ = false;

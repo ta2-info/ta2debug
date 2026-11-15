@@ -384,3 +384,23 @@ TA2_MSG(UiScStopStopped,          "ui.sc.stop_stopped",            "syscall 停�
 TA2_MSG(UiScNamesBsd,             "ui.sc.names_bsd",               "BSD syscall（{n} 件）")
 TA2_MSG(UiScNamesMach,            "ui.sc.names_mach",              "Mach トラップ（{n} 件）")
 TA2_MSG(UiScNamesNone,            "ui.sc.names_none",              "(該当なし)")
+
+// --- レイアウト切替・非同期探索（l キー / ESC 中止） ---
+TA2_MSG(UiLayoutChanged,          "ui.layout.changed",             "レイアウト {n}")
+TA2_MSG(UiSearchCancelled,        "ui.search.cancelled",           "探索を中止しました")
+TA2_MSG(UiSearchProgress,         "ui.search.progress",            "シンボル探索中… {done}/{total}（ESC で中止）")
+TA2_MSG(UiMouseOn,                "ui.mouse.on",                   "マウス: ON（クリックでカーソル／ドラッグ選択は端末）")
+TA2_MSG(UiMouseOff,               "ui.mouse.off",                  "マウス: OFF（端末側の選択に戻す）")
+TA2_MSG(UiExamineNoPrev,          "ui.examine.no_prev",            "まだ x を実行していません（x <式> から）")
+
+// --- プロセスピッカ（:attach 無引数） ---
+TA2_MSG(UiPickerTitle,            "ui.picker.title",               "アタッチするプロセスを選択（自作プログラムのみ）")
+TA2_MSG(UiPickerFilter,           "ui.picker.filter",              "フィルタ: ")
+TA2_MSG(UiPickerHint,             "ui.picker.hint",                "↑↓/C-p,C-n 行   Enter アタッチ   文字でフィルタ   ESC 取消")
+TA2_MSG(UiPickerEmpty,            "ui.picker.empty",               "（該当プロセスなし）")
+TA2_MSG(UiPickerNotAttachable,    "ui.picker.not_attachable",      "（アタッチ不可）")
+
+// --- ブレイク編集（:be） ---
+TA2_MSG(UiBpEditTitle,            "ui.bpedit.title",               "ブレイク編集")
+TA2_MSG(UiBpEditHint,             "ui.bpedit.hint",                "↑↓ 選択   Space 有効⇄無効   d/Del 削除   ESC/q 閉じる")
+TA2_MSG(UiBpEditEmpty,            "ui.bpedit.empty",               "（ブレイクなし。:b <式> などで設定してから）")
