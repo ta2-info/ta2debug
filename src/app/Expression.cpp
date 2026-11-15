@@ -153,7 +153,9 @@ bool Expression::parseRegister(uint64_t& v) {
     name += (char)std::tolower((unsigned char)input_[pos_++]);
   if (name.empty()) { pos_ = start; return fail("レジスタ名がない"); }
   if (!session_.stopped()) { pos_ = start; return fail("レジスタは停止中のみ参照できる"); }
-  if (session_.arch().readRegisterByName(session_.stopState().data(), name, v)) return true;
+  // 表示中スレッドの状態が指定されていればそれを、無ければ停止スレッドを見る（TUI のスレッド切替に追従）。
+  const uint8_t* rs = regState_.empty() ? session_.stopState().data() : regState_.data();
+  if (session_.arch().readRegisterByName(rs, name, v)) return true;
   pos_ = start;
   return fail("不明なレジスタ '" + name + "'");
 }
