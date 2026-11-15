@@ -106,11 +106,13 @@ bool g_xNavByAddr = false;     // アドレスナビが有効な表示か
 // name=表示名（デマングル済み）。lname/lmangled=照合用に小文字化した表示名とマングル名。
 // 曖昧（部分列）照合はこの 2 つを「連結せず別々に」当てる（連結すると境界をまたいで同じ文字が
 // 二重に現れ、"appl" が p を 1 つしか持たない名前にも誤ってヒットするため）。
-struct SymEntry { uint64_t addr; std::string name; std::string lname; std::string lmangled; };
+// custom=ユーザ自身が付けた注釈（独自定義シンボル）。元からあるシンボル表のものと区別して印を付ける。
+struct SymEntry { uint64_t addr; std::string name; std::string lname; std::string lmangled; bool custom; };
 bool g_symsActive = false;             // いま表示中のオーバレイが :syms の対話一覧か
 std::vector<SymEntry> g_symsAll;       // 対象イメージの全シンボル（表示名はデマングル済み・照合用に小文字化）
 std::string g_symsFilter;              // 現在の絞り込みキーワード（編集可能）
 int g_symsSort = 0;                    // 0=アドレス順, 1=名前順（昇順）
+bool g_symsShowCustom = true;          // 独自定義（注釈）を一覧に含めるか（Ctrl+E で切替）
 std::string g_symsImgName;             // 見出し用の対象イメージ名
 
 // auto（興味のある命令まで自動継続）。g_autoMask のビット: 1=call, 2=syscall, 4=ret。0 で無効。
@@ -1168,7 +1170,7 @@ void render() {
     if (g_outputTop < 0) g_outputTop = 0;
     std::string hint;
     if (g_symsActive)               // :syms の対話一覧（打鍵で曖昧フィルタ・Tab で並び替え）
-      hint = "文字=絞込  Tab=並び替え  ↑↓ Ctrl+F/B スクロール  Ctrl+U クリア  ESC 閉じる";
+      hint = "文字=絞込  Tab=並び替え  Ctrl+E=独自定義 表示/除外  ↑↓ Ctrl+F/B スクロール  Ctrl+U クリア  ESC 閉じる";
     else if (g_xActive && g_xNavByAddr)  // :x のアドレスナビ（表示アドレスを前後に動かす）
       hint = "↑↓ 1 行  Ctrl+F/Ctrl+B・Space/b 1 画面  Enter 次画面  ESC・q 閉じる";
     else {
@@ -1470,19 +1472,31 @@ void symsRebuild() {
   std::transform(lf.begin(), lf.end(), lf.begin(), [](unsigned char c){ return (char)std::tolower(c); });
   std::vector<const SymEntry*> hits;
   hits.reserve(g_symsAll.size());
-  for (const auto& e : g_symsAll) if (symsFilterMatch(e, lf)) hits.push_back(&e);
+  size_t customAll = 0;
+  for (const auto& e : g_symsAll) {
+    if (e.custom) customAll++;
+    if (e.custom && !g_symsShowCustom) continue;      // 独自定義を除外中
+    if (symsFilterMatch(e, lf)) hits.push_back(&e);
+  }
   if (g_symsSort == 1) // 名前順（表示名で昇順。同名はアドレス順で安定化）
     std::stable_sort(hits.begin(), hits.end(), [](const SymEntry* a, const SymEntry* b){
       if (a->name != b->name) return a->name < b->name; return a->addr < b->addr; });
   g_output.clear();
   for (const auto* e : hits) {
-    char b[384]; snprintf(b, sizeof(b), "0x%012llx  %s", (unsigned long long)e->addr, e->name.c_str());
+    // 印の桁: 独自定義（注釈）は '*'、元からあるシンボルは ' '。見た目で区別できるように。
+    char b[384]; snprintf(b, sizeof(b), "0x%012llx %c %s",
+                          (unsigned long long)e->addr, e->custom ? '*' : ' ', e->name.c_str());
     pushWrapped(g_output, b, g_term.cols(), 16); // 長い名前も折り返して全部見せる（2 行目以降は 16 桁字下げ）
   }
   const char* sortName = g_symsSort == 1 ? "名前順" : "アドレス順";
-  char th[160];
-  snprintf(th, sizeof(th), "%s のシンボル %zu/%zu 個  [並び: %s]",
-           g_symsImgName.c_str(), hits.size(), g_symsAll.size(), sortName);
+  char th[224];
+  if (customAll > 0)
+    snprintf(th, sizeof(th), "%s のシンボル %zu/%zu 個  [並び: %s]  [* 独自定義 %zu 個: %s]",
+             g_symsImgName.c_str(), hits.size(), g_symsAll.size(), sortName,
+             customAll, g_symsShowCustom ? "表示" : "除外");
+  else
+    snprintf(th, sizeof(th), "%s のシンボル %zu/%zu 個  [並び: %s]",
+             g_symsImgName.c_str(), hits.size(), g_symsAll.size(), sortName);
   g_outputTitle = th;
   if (g_output.empty()) g_output.push_back(g_symsFilter.empty() ? "(シンボルなし)" : "(一致なし)");
   g_outputTop = 0;
@@ -1873,22 +1887,30 @@ void runCommand(const std::string& line) {
     else { im = g_session.images().byName(toks[0]); for (size_t i = 1; i < toks.size(); i++) filt += (i>1?" ":"") + toks[i]; }
     if (!im) { g_message = toks.empty() ? "対象ライブラリが不明" : ("ライブラリが見つからない: " + toks[0]); return; }
     const auto& syms = g_session.symbols().forImage(*im);
+    // 独自定義シンボル（ユーザ注釈）も一緒に出す。元からあるシンボルと混ぜて並べ、印（*）で区別する。
+    g_session.annotations().refresh(*im); // 外部編集を取り込んでから一覧化
+    auto annList = g_session.annotations().list(*im);
     if (g_interactive) {
       // 対話(TUI): 全シンボルを一度だけ取り出して（表示名のデマングル込み・照合用に小文字化）キャッシュし、
       // 曖昧フィルタ＋並び替えオーバレイを開く。以降の打鍵・Tab は symsRebuild だけで固まらない。
-      g_symsAll.clear(); g_symsAll.reserve(syms.size());
+      g_symsAll.clear(); g_symsAll.reserve(syms.size() + annList.size());
       auto lower = [](std::string v){ std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c){ return (char)std::tolower(c); }); return v; };
       for (const auto& s : syms) {
         const std::string& dn = g_session.symbols().displayName(s); // 遅延デマングル（このイメージぶん）
-        g_symsAll.push_back(SymEntry{ s.addr, dn, lower(dn), lower(s.mangled) });
+        g_symsAll.push_back(SymEntry{ s.addr, dn, lower(dn), lower(s.mangled), false });
       }
-      g_symsImgName = im->name; g_symsFilter = filt; g_symsSort = 0; g_symsActive = true;
+      for (const auto& a : annList) {               // 独自定義（名前付き注釈のみ）
+        if (a.name.empty()) continue;
+        std::string ln = lower(a.name);
+        g_symsAll.push_back(SymEntry{ a.unslid + im->slide, a.name, ln, ln, true });
+      }
+      g_symsImgName = im->name; g_symsFilter = filt; g_symsSort = 0; g_symsShowCustom = true; g_symsActive = true;
       symsRebuild();
     } else {
-      // バッチ(非対話): 従来どおり一括出力（部分一致・大小無視・アドレス順・1 行のまま＝出力安定）。
+      // バッチ(非対話): 一括出力（部分一致・大小無視・アドレス順・1 行＝出力安定）。印の桁で独自定義(*)を区別。
       std::string lf = filt; std::transform(lf.begin(), lf.end(), lf.begin(), [](unsigned char c){ return (char)std::tolower(c); });
-      g_output.clear();
-      int shown = 0;
+      struct Row { uint64_t addr; std::string name; bool custom; };
+      std::vector<Row> rows;
       for (const auto& s : syms) {
         const std::string& dn = g_session.symbols().displayName(s); // 遅延デマングル（この一覧ぶんだけ）
         if (!lf.empty()) {
@@ -1896,11 +1918,19 @@ void runCommand(const std::string& line) {
           std::transform(hay.begin(), hay.end(), hay.begin(), [](unsigned char c){ return (char)std::tolower(c); });
           if (hay.find(lf) == std::string::npos) continue;
         }
-        char b[384]; snprintf(b, sizeof(b), "0x%012llx  %s", (unsigned long long)s.addr, dn.c_str());
-        g_output.push_back(b);
-        shown++;
+        rows.push_back(Row{ s.addr, dn, false });
       }
-      g_outputTitle = im->name + " のシンボル " + std::to_string(shown) + " 個"
+      size_t customShown = 0;
+      for (const auto& a : annList) {
+        if (a.name.empty()) continue;
+        if (!lf.empty()) { std::string h = a.name; std::transform(h.begin(),h.end(),h.begin(),[](unsigned char c){return (char)std::tolower(c);}); if (h.find(lf)==std::string::npos) continue; }
+        rows.push_back(Row{ a.unslid + im->slide, a.name, true }); customShown++;
+      }
+      std::stable_sort(rows.begin(), rows.end(), [](const Row& x, const Row& y){ return x.addr < y.addr; }); // アドレス順
+      g_output.clear();
+      for (const auto& r : rows) { char b[384]; snprintf(b, sizeof(b), "0x%012llx %c %s", (unsigned long long)r.addr, r.custom?'*':' ', r.name.c_str()); g_output.push_back(b); }
+      g_outputTitle = im->name + " のシンボル " + std::to_string(rows.size()) + " 個"
+                    + (customShown ? ("（* 独自定義 " + std::to_string(customShown) + " 個）") : "")
                     + (filt.empty() ? "" : ("（絞込: " + filt + "）"));
       if (g_output.empty()) g_output.push_back(filt.empty() ? "(シンボルなし)" : "(一致なし)");
     }
@@ -2216,6 +2246,7 @@ void runCommand(const std::string& line) {
       "    出力オーバレイ（help/img/syms/reg 等）: ↑↓・Space/b ページ   g/G 先頭末尾   Enter 続き(dis)   ESC・q 閉じる",
       "    :x のオーバレイは↑↓で 1 行・Ctrl+F/Ctrl+B で 1 画面ぶん表示アドレスを前後（メモリを辿る）。Enter で次画面",
       "    :syms のオーバレイは文字入力でその場で曖昧（部分列）フィルタ、Tab で並び替え（アドレス順↔名前順）、Ctrl+U で絞込クリア",
+      "      独自定義シンボル（注釈）も一覧に混ぜて * 印で表示。Ctrl+E でその表示／除外を切替",
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
       "  :attach [pid]              pid 省略でプロセス一覧から選択",
       "  :run <パス> [引数...]      バイナリを起動してデバッグ（エントリ手前で停止）",
@@ -2241,7 +2272,7 @@ void runCommand(const std::string& line) {
       "  :x/<個数><書式><サイズ> <式>  書式付き（書式 x d u o t c i s f a / サイズ b h w g。個数は書式内）",
       "  :x                         前回の続き（オーバレイ表示中は Enter でも）",
       "  :sym <式>                  アドレスのシンボル    :img / :libs  読込イメージ（ライブラリ）一覧    :seg [名前]  セグメント一覧",
-      "  :syms <ライブラリ> [絞込]   そのライブラリのシンボル一覧（省略で既定ライブラリ）。対話では文字入力で曖昧フィルタ・Tab で並び替え",
+      "  :syms <ライブラリ> [絞込]   そのライブラリのシンボル一覧（省略で既定ライブラリ）。独自定義(注釈)も * 印で混在。対話は曖昧フィルタ・Tab 並び替え・Ctrl+E 独自定義の表示切替",
       "  :uselib [<名前>|-]          式でライブラリ名省略時に先に探す既定ライブラリを 表示 / 設定 / 解除",
       "\x1b[36m― 注釈（自分で付ける名前・メモ） ―\x1b[0m",
       "  :ann <式>,<名前>[,<メモ>]   そのアドレスに名前を付ける（以降 :b <名前> / 式で引ける・表示にも出る）",
@@ -2658,6 +2689,7 @@ void onKey(int c) {
     // 矢印・Ctrl+F/B＝スクロール、ESC で閉じる。文字が絞り込みに吸われるので下の汎用キーより先に拾う。
     if (g_symsActive) {
       if (c == '\t') { g_symsSort ^= 1; symsRebuild(); render(); return; }                 // Tab: 並び替え
+      if (c == 5) { g_symsShowCustom = !g_symsShowCustom; symsRebuild(); render(); return; } // Ctrl+E: 独自定義(注釈)の表示/除外
       if (c == 127 || c == 8) { if (!g_symsFilter.empty()) { g_symsFilter.pop_back(); symsRebuild(); } render(); return; } // BS
       if (c == 21) { if (!g_symsFilter.empty()) { g_symsFilter.clear(); symsRebuild(); } render(); return; } // Ctrl+U: 絞込クリア
       if (c == KEY_UP)   { g_outputTop = std::max(0, g_outputTop - 1); render(); return; }
