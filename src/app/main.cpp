@@ -91,6 +91,13 @@ bool g_xHasLast = false;       // 一度でも :x を実行したか（引数な
 std::string g_xSpec;           // 書式指定（空なら従来の 16 進ダンプ）
 int g_xClassicBytes = 64;      // 従来ダンプのバイト数
 uint64_t g_xNextAddr = 0;      // 次に表示する開始アドレス
+// :x オーバレイの「アドレスナビ」: 矢印で 1 行ぶん・Ctrl+F/B で 1 画面ぶん表示アドレスを前後させ、
+// その都度メモリを読み直す（画面いっぱい表示だとバッファ内スクロールは無反応になるため）。
+// 16進ダンプ・数値書式のときだけ有効。文字列(s)・逆アセンブル(i)は従来どおり Enter で続き。
+uint64_t g_xCurAddr = 0;       // いま表示している先頭アドレス（ナビの基準）
+int g_xRowBytes = 16;          // 1 行ぶんのバイト数（矢印の移動量）
+int g_xPageBytes = 64;         // 1 画面ぶんのバイト数（Ctrl+F/B・Enter の移動量）
+bool g_xNavByAddr = false;     // アドレスナビが有効な表示か
 
 // auto（興味のある命令まで自動継続）。g_autoMask のビット: 1=call, 2=syscall, 4=ret。0 で無効。
 // 停止のたびに、現命令が該当すれば止め、そうでなければ自動で単一ステップを続ける。
@@ -1145,8 +1152,13 @@ void render() {
     int maxTop = std::max(0, total - avail);
     if (g_outputTop > maxTop) g_outputTop = maxTop;
     if (g_outputTop < 0) g_outputTop = 0;
-    std::string hint = g_xActive ? "Enter 続き / " : "";
-    hint += "↑↓ Space/b ページ  g/G 先頭/末尾  ESC・q 閉じる";
+    std::string hint;
+    if (g_xActive && g_xNavByAddr)  // :x のアドレスナビ（表示アドレスを前後に動かす）
+      hint = "↑↓ 1 行  Ctrl+F/Ctrl+B・Space/b 1 画面  Enter 次画面  ESC・q 閉じる";
+    else {
+      hint = g_xActive ? "Enter 続き / " : "";
+      hint += "↑↓ Space/b ページ  g/G 先頭/末尾  ESC・q 閉じる";
+    }
     g_term.putAt(0, 1, "\x1b[33m" + g_outputTitle + "\x1b[0m \x1b[2m（" + hint + "）\x1b[0m\x1b[K");
     for (int y = 0; y < avail; y++) {
       int idx = g_outputTop + y;
@@ -1292,6 +1304,7 @@ void examineMemory(const std::string& spec, uint64_t addr) {
       g_output.push_back(s);
     }
     g_xNextAddr = insns.empty() ? addr : (insns.back().address + insns.back().size); // 継続先
+    g_xNavByAddr = false; // 逆アセンブルはアドレスナビ対象外（Enter で続き）
     return;
   }
 
@@ -1306,6 +1319,7 @@ void examineMemory(const std::string& spec, uint64_t addr) {
       addr = a + n + 1;
     }
     g_xNextAddr = addr; // 最後の文字列の次（継続先）
+    g_xNavByAddr = false; // 文字列はアドレスナビ対象外（Enter で続き）
     return;
   }
 
@@ -1330,6 +1344,7 @@ void examineMemory(const std::string& spec, uint64_t addr) {
     g_output.push_back(s);
   }
   g_xNextAddr = addr + (size_t)count * size; // 継続先
+  g_xCurAddr = addr; g_xRowBytes = std::max(1, perLine * size); g_xPageBytes = std::max(1, (int)total); g_xNavByAddr = true; // アドレスナビ有効
 }
 
 // サイズ無指定の :x で使う既定バイト数。対話(TUI)では出力オーバレイの可視行数ぶん
@@ -1360,6 +1375,7 @@ void classicDump(uint64_t addr, int bytes) {
     g_output.push_back(s + " |" + asc + "|");
   }
   g_xNextAddr = addr + got; // 継続先
+  g_xCurAddr = addr; g_xRowBytes = 16; g_xPageBytes = std::max(16, bytes); g_xNavByAddr = true; // アドレスナビ有効
 }
 
 // 直近の examine（書式/バイト数）を g_xNextAddr から続けて表示する。
@@ -1367,6 +1383,15 @@ void xContinue() {
   if (g_xSpec.empty()) classicDump(g_xNextAddr, g_xClassicBytes);
   else examineMemory(g_xSpec, g_xNextAddr);
   g_outputTop = 0; // 新しいチャンクは先頭から
+  if (!g_output.empty()) g_xActive = true;
+}
+
+// :x オーバレイのアドレスナビ: 指定アドレスで同じ書式/サイズで読み直す（画面はそのアドレス先頭から）。
+// 読めないアドレス（境界越え等）なら classicDump/examineMemory が g_message を立てて現状維持する。
+void xShowAt(uint64_t addr) {
+  if (g_xSpec.empty()) classicDump(addr, g_xClassicBytes);
+  else examineMemory(g_xSpec, addr);
+  g_outputTop = 0;
   if (!g_output.empty()) g_xActive = true;
 }
 
@@ -2062,7 +2087,8 @@ void runCommand(const std::string& line) {
       "  \x1b[2m[その他]\x1b[0m",
       "    :        コマンド入力",
       "    q        終了",
-      "    出力オーバレイ（help/img/syms/reg/dis/x 等）: ↑↓・Space/b ページ   g/G 先頭末尾   Enter 続き(x/dis)   ESC・q 閉じる",
+      "    出力オーバレイ（help/img/syms/reg 等）: ↑↓・Space/b ページ   g/G 先頭末尾   Enter 続き(dis)   ESC・q 閉じる",
+      "    :x のオーバレイは↑↓で 1 行・Ctrl+F/Ctrl+B で 1 画面ぶん表示アドレスを前後（メモリを辿る）。Enter で次画面",
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
       "  :attach [pid]              pid 省略でプロセス一覧から選択",
       "  :run <パス> [引数...]      バイナリを起動してデバッグ（エントリ手前で停止）",
@@ -2501,6 +2527,16 @@ void onKey(int c) {
     int maxTop = std::max(0, (int)g_output.size() - avail);
     auto closeOv = []() { g_output.clear(); g_outputTitle.clear(); g_xActive = false; g_outputTop = 0; g_ovEsc = 0; };
     if (c == 27) { closeOv(); render(); return; }                                    // ESC 即閉じる
+    // :x のアドレスナビ（16進/数値表示）: 矢印=1 行・Ctrl+F/B/Space=1 画面ぶん表示アドレスを前後。
+    // 画面いっぱい表示だとバッファ内スクロールは無反応なので、ここでアドレス自体を動かして読み直す。
+    if (g_xActive && g_xNavByAddr) {
+      if (c == KEY_UP   || c == 'k') { xShowAt(g_xCurAddr - (uint64_t)g_xRowBytes);  render(); return; }
+      if (c == KEY_DOWN || c == 'j') { xShowAt(g_xCurAddr + (uint64_t)g_xRowBytes);  render(); return; }
+      if (c == 2 || c == 'b')        { xShowAt(g_xCurAddr - (uint64_t)g_xPageBytes); render(); return; } // Ctrl+B / b: 1 画面戻る
+      if (c == 6 || c == ' ')        { xShowAt(g_xCurAddr + (uint64_t)g_xPageBytes); render(); return; } // Ctrl+F / Space: 1 画面進む
+      if (c == '\r' || c == '\n')    { xShowAt(g_xCurAddr + (uint64_t)g_xPageBytes); render(); return; } // Enter: 次の画面
+      // q / : / g / G は下の共通処理へ
+    }
     if (c == KEY_UP)   { g_outputTop = std::max(0, g_outputTop - 1); render(); return; }
     if (c == KEY_DOWN) { g_outputTop = std::min(maxTop, g_outputTop + 1); render(); return; }
     if (c == 'q') { closeOv(); render(); return; }
