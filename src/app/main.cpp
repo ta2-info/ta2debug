@@ -1400,6 +1400,24 @@ void classicDump(uint64_t addr, int bytes) {
   g_xCurAddr = addr; g_xRowBytes = 16; g_xPageBytes = std::max(16, bytes); g_xNavByAddr = true; // アドレスナビ有効
 }
 
+// 1 行を表示幅 width ごとに折り返して out へ積む（オーバレイが fitWidth で右端を切るのを防ぐ）。
+// 2 行目以降は contIndent 桁ぶん字下げ（アドレス幅に揃える）。全角も表示幅で正しく折る（layout::glyphs 利用）。
+void pushWrapped(std::vector<std::string>& out, const std::string& line, int width, int contIndent) {
+  if (width < 8) width = 8;
+  if (contIndent < 0 || contIndent > width - 4) contIndent = 0;
+  auto gl = layout::glyphs(line);
+  std::string indent(contIndent, ' ');
+  std::string cur; int w = 0; bool first = true; int budget = width; // 1 行目は全幅、以降は字下げぶん引く
+  for (const auto& g : gl) {
+    if (w + g.second > budget && !cur.empty()) {
+      out.push_back((first ? std::string() : indent) + cur);
+      first = false; cur.clear(); w = 0; budget = width - contIndent;
+    }
+    cur += g.first; w += g.second;
+  }
+  out.push_back((first ? std::string() : indent) + cur);
+}
+
 // 直近の examine（書式/バイト数）を g_xNextAddr から続けて表示する。
 void xContinue() {
   if (g_xSpec.empty()) classicDump(g_xNextAddr, g_xClassicBytes);
@@ -1795,7 +1813,11 @@ void runCommand(const std::string& line) {
         if (hay.find(lf) == std::string::npos) continue;
       }
       char b[384]; snprintf(b, sizeof(b), "0x%012llx  %s", (unsigned long long)s.addr, dn.c_str());
-      g_output.push_back(b); shown++;
+      // 対話(TUI)では長い名前が右端で切れて違いが分からないので、画面幅で折り返して全部見せる
+      //（2 行目以降はアドレス幅 16 桁ぶん字下げ）。バッチは 1 行のまま（出力安定・切り捨てない）。
+      if (g_interactive) pushWrapped(g_output, b, g_term.cols(), 16);
+      else g_output.push_back(b);
+      shown++;
     }
     g_outputTitle = im->name + " のシンボル " + std::to_string(shown) + " 個"
                   + (filt.empty() ? "" : ("（絞込: " + filt + "）"));
