@@ -1465,7 +1465,7 @@ static bool symsFilterMatch(const SymEntry& e, const std::string& filterLower) {
 }
 
 // g_symsAll（キャッシュ済み）から現在の g_symsFilter / g_symsSort で g_output を組み直す。
-// アドレス順はキャッシュの並び（元のアドレス順）そのまま、名前順は表示名で昇順に並べ替える。
+// アドレス順は（独自定義＝注釈を含めて）アドレス昇順に並べ替え、名前順は表示名で昇順に並べ替える。
 // 打鍵・Tab のたびに呼ぶ。新しい結果なので先頭から表示する。
 void symsRebuild() {
   std::string lf = g_symsFilter;
@@ -1481,6 +1481,8 @@ void symsRebuild() {
   if (g_symsSort == 1) // 名前順（表示名で昇順。同名はアドレス順で安定化）
     std::stable_sort(hits.begin(), hits.end(), [](const SymEntry* a, const SymEntry* b){
       if (a->name != b->name) return a->name < b->name; return a->addr < b->addr; });
+  else                 // アドレス順（独自定義と元シンボルを混ぜて正しく昇順に。注釈が末尾に残らないよう明示整列）
+    std::stable_sort(hits.begin(), hits.end(), [](const SymEntry* a, const SymEntry* b){ return a->addr < b->addr; });
   g_output.clear();
   for (const auto* e : hits) {
     // 印の桁: 独自定義（注釈）は '*'、元からあるシンボルは ' '。見た目で区別できるように。
