@@ -72,6 +72,7 @@ set(CORE_SOURCES
   src/core/BreakpointStore.cpp
   src/core/DtraceCatch.cpp
   src/core/DwarfLines.cpp
+  src/core/DwarfTypes.cpp
   src/core/ProcessList.cpp
   src/core/Session.cpp
   src/core/mach_excServer.c

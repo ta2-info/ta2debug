@@ -199,6 +199,46 @@ bool Session::sourceLineFor(uint64_t addr, SourceLoc& out) {
   return true;
 }
 
+const DwType* Session::findType(const std::string& name, const DwarfTypes*& owner, uint64_t addrHint) {
+  owner = nullptr;
+  // 探す順: 既定ライブラリ（未設定なら主実行ファイル）→ addrHint のイメージ → 全イメージ。
+  auto tryImg = [&](const Image* im) -> const DwType* {
+    if (!im) return nullptr;
+    DwarfLines* dl = linesForImage(*im);
+    if (!dl) return nullptr;
+    const DwType* t = dl->types().byName(name);
+    if (t) { owner = &dl->types(); return t; }
+    return nullptr;
+  };
+  const Image* defImg = defaultLibImage();
+  const Image* mainImg = images_.mainExecutable();
+  if (const DwType* t = tryImg(defImg ? defImg : mainImg)) return t;
+  if (addrHint) if (const DwType* t = tryImg(images_.byAddress(addrHint))) return t;
+  for (const auto& im : images_.images()) if (const DwType* t = tryImg(&im)) return t;
+  return nullptr;
+}
+
+std::vector<std::string> Session::typeNames(const Image* img, const std::string& filter) {
+  std::vector<std::string> out;
+  const Image* im = img ? img : images_.mainExecutable();
+  if (!im) return out;
+  DwarfLines* dl = linesForImage(*im);
+  if (!dl) return out;
+  std::vector<std::string> all;
+  dl->types().names(all);
+  std::string lf = filter;
+  std::transform(lf.begin(), lf.end(), lf.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+  for (auto& n : all) {
+    if (!lf.empty()) {
+      std::string h = n; std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c){ return (char)std::tolower(c); });
+      if (h.find(lf) == std::string::npos) continue;
+    }
+    out.push_back(n);
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
 void Session::warmSymbols() {
   if (!warmingEnabled_.load()) return;     // バッチ等では先読みしない
   if (!target_.isAttached()) return;

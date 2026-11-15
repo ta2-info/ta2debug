@@ -111,6 +111,13 @@ public:
   // 実行時アドレスのソース位置（dSYM の DWARF 行情報）。見つかれば true（out.text にソース行も）。
   bool sourceLineFor(uint64_t addr, SourceLoc& out);
 
+  // ---- DWARF 型情報（構造体レイアウト等。-g ビルド／dSYM が要る） ----
+  // 型名から型を引く。既定=主実行ファイル、無ければ addrHint を含むイメージ、さらに全イメージを横断。
+  // 見つかれば型を返し、owner に参照解決用の DwarfTypes を入れる。見つからなければ nullptr。
+  const DwType* findType(const std::string& name, const DwarfTypes*& owner, uint64_t addrHint = 0);
+  // 型名の一覧（集約型/enum/typedef）。img 省略時は主実行ファイル。filter で部分一致（小文字化）。
+  std::vector<std::string> typeNames(const Image* img, const std::string& filter);
+
   // ---- syscall 監視（libdtrace 相乗り。観測モード） ----
   // filter 空/"all" で全 syscall、"write" 等で特定。カーネル計測なので単一ステップ不要。
   // 発火ごとに名前別カウントを貯める（高頻度でも UI を溢れさせない集計方式）。要 attach。

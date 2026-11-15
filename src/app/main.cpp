@@ -1328,6 +1328,144 @@ void readMemoryTolerant(uint64_t addr, uint8_t* buf, std::vector<char>& readable
   }
 }
 
+// ===== DWARF 型による構造体ダンプ（:struct） =====
+// typedef/const/volatile を剥がして実体の型へ。循環防止にガード付き。
+static const DwType* dwStrip(const DwarfTypes* tt, const DwType* t) {
+  for (int g = 0; t && g < 64; g++) {
+    if (t->kind == DwType::Typedef || t->kind == DwType::Const || t->kind == DwType::Volatile)
+      t = tt->at(t->ref);
+    else break;
+  }
+  return t;
+}
+// 型の表示名（int / unsigned int / char * / struct Foo / Foo[8] など）。
+static std::string dwTypeName(const DwarfTypes* tt, const DwType* t, int depth = 0) {
+  if (!t) return "void";
+  if (depth > 16) return "...";
+  switch (t->kind) {
+    case DwType::Base: return t->name.empty() ? "?" : t->name;
+    case DwType::Typedef: return t->name.empty() ? dwTypeName(tt, tt->at(t->ref), depth + 1) : t->name;
+    case DwType::Const: return "const " + dwTypeName(tt, tt->at(t->ref), depth + 1);
+    case DwType::Volatile: return "volatile " + dwTypeName(tt, tt->at(t->ref), depth + 1);
+    case DwType::Pointer: return dwTypeName(tt, tt->at(t->ref), depth + 1) + " *";
+    case DwType::Struct: return "struct " + (t->name.empty() ? std::string("{…}") : t->name);
+    case DwType::Union: return "union " + (t->name.empty() ? std::string("{…}") : t->name);
+    case DwType::Class: return t->name.empty() ? std::string("class{…}") : t->name;
+    case DwType::Enum: return "enum " + (t->name.empty() ? std::string("{…}") : t->name);
+    case DwType::Array: { std::string e = dwTypeName(tt, tt->at(t->ref), depth + 1);
+      return e + "[" + (t->arrayCount ? std::to_string(t->arrayCount) : std::string()) + "]"; }
+    default: return "?";
+  }
+}
+// 型のバイトサイズ（配列は要素サイズ×個数）。
+static uint64_t dwSizeOf(const DwarfTypes* tt, const DwType* t) {
+  const DwType* s = dwStrip(tt, t);
+  if (!s) return 0;
+  if (s->kind == DwType::Array) { uint64_t es = dwSizeOf(tt, tt->at(s->ref)); return es * s->arrayCount; }
+  return s->byteSize;
+}
+static uint64_t dwReadUInt(const uint8_t* p, int n) { uint64_t v = 0; for (int i = 0; i < n && i < 8; i++) v |= (uint64_t)p[i] << (8*i); return v; }
+// 基本型/ポインタ/enum のスカラ値を整形。addr は（ポインタ注記 describe 用の）この値の所在。
+static std::string dwFormatScalar(const DwarfTypes* tt, const DwType* s, const uint8_t* p, uint64_t addr) {
+  char b[160];
+  if (s->kind == DwType::Pointer) {
+    uint64_t v = dwReadUInt(p, s->byteSize ? (int)s->byteSize : 8);
+    std::string w = v ? g_session.describe(v) : std::string();
+    snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v);
+    return std::string(b) + (w.empty() ? "" : ("  " + w));
+  }
+  if (s->kind == DwType::Enum) {
+    int n = s->byteSize ? (int)s->byteSize : 4;
+    uint64_t u = dwReadUInt(p, n); int64_t sv = u;
+    if (n < 8 && (u & (1ULL << (n*8 - 1)))) sv = u | ~((1ULL << (n*8)) - 1); // 符号拡張
+    for (const auto& e : s->enums) if (e.value == sv) return e.name + " (" + std::to_string(sv) + ")";
+    return std::to_string(sv);
+  }
+  // Base
+  int n = s->byteSize ? (int)s->byteSize : 4;
+  uint64_t u = dwReadUInt(p, n);
+  switch (s->encoding) {
+    case 0x02: return u ? "true" : "false";                          // boolean
+    case 0x04: { if (n == 4) { float f; uint32_t x=(uint32_t)u; memcpy(&f,&x,4); snprintf(b,sizeof(b),"%g",(double)f); } // float
+                 else { double d; memcpy(&d,&u,8); snprintf(b,sizeof(b),"%g",d); } return b; }
+    case 0x06: case 0x08: { uint8_t c=(uint8_t)u;                    // signed/unsigned char
+                 if (c>=0x20 && c<0x7f) snprintf(b,sizeof(b),"0x%02x '%c'",c,(char)c); else snprintf(b,sizeof(b),"0x%02x",c); return b; }
+    case 0x05: { int64_t sv=u; if (n<8 && (u & (1ULL<<(n*8-1)))) sv = u | ~((1ULL<<(n*8))-1);  // signed
+                 snprintf(b,sizeof(b),"%lld (0x%llx)",(long long)sv,(unsigned long long)u); return b; }
+    case 0x07: snprintf(b,sizeof(b),"%llu (0x%llx)",(unsigned long long)u,(unsigned long long)u); return b; // unsigned
+    case 0x01: snprintf(b,sizeof(b),"0x%llx",(unsigned long long)u); return b;                   // address
+    default:   snprintf(b,sizeof(b),"0x%llx",(unsigned long long)u); return b;
+  }
+}
+// 文字型か（char 配列を文字列表示する判定）。
+static bool dwIsCharBase(const DwType* s) {
+  return s && s->kind == DwType::Base && (s->encoding == 0x06 || s->encoding == 0x08 ||
+         (s->byteSize == 1 && (s->name == "char" || s->name == "signed char" || s->name == "unsigned char")));
+}
+static const int kDwMaxDepth = 6, kDwArrayCap = 32, kDwLineCap = 4000;
+// 1 つの値（スカラ/構造体/共用体/配列）を off から整形して out へ。label は見出し（メンバ行頭）。
+static void dwEmit(std::vector<std::string>& out, const DwarfTypes* tt, const DwType* t,
+                   const uint8_t* buf, const std::vector<char>& ok, size_t off, uint64_t baseAddr,
+                   const std::string& label, int indent, int depth) {
+  if ((int)out.size() >= kDwLineCap) return;
+  std::string pad(indent, ' ');
+  const DwType* s = dwStrip(tt, t);
+  if (!s) { out.push_back(pad + label + " = <型不明>"); return; }
+  if (s->kind == DwType::Struct || s->kind == DwType::Union || s->kind == DwType::Class) {
+    out.push_back(pad + label + " {");
+    if (depth >= kDwMaxDepth) { out.push_back(pad + "  …（深さ上限）"); out.push_back(pad + "}"); return; }
+    for (const auto& m : s->members) {
+      std::string nm = m.name.empty() ? std::string("(無名)") : m.name;
+      char hb[96]; snprintf(hb, sizeof(hb), "+0x%llx %s", (unsigned long long)m.offset, dwTypeName(tt, tt->at(m.type)).c_str());
+      std::string mlabel = std::string(hb) + " " + nm;
+      if (m.isBit) { // ビットフィールド: データからビット抽出
+        // data_bit_offset は構造体先頭からの絶対ビット位置（DWARF4+。data_member_location は 0 が多い）。
+        uint64_t bitpos = (uint64_t)m.offset * 8 + (uint64_t)m.bitOffset;
+        uint64_t val = 0; bool rdok = true;
+        for (int i = 0; i < m.bitSize; i++) { uint64_t bp = bitpos + i; size_t byi = off + bp/8;
+          if (byi >= ok.size() || !ok[byi]) { rdok = false; break; }
+          if (buf[byi] >> (bp%8) & 1) val |= (1ULL << i); }
+        char bl[96]; snprintf(bl, sizeof(bl), "+0x%llx %s %s", (unsigned long long)(bitpos/8),
+                              dwTypeName(tt, tt->at(m.type)).c_str(), nm.c_str());
+        out.push_back(pad + "  " + std::string(bl) + " : " + std::to_string(m.bitSize) + "ビット = "
+                      + (rdok ? std::to_string(val) : std::string("<読めない>")));
+        continue;
+      }
+      dwEmit(out, tt, tt->at(m.type), buf, ok, off + m.offset, baseAddr, mlabel, indent + 2, depth + 1);
+      if ((int)out.size() >= kDwLineCap) { out.push_back(pad + "  …（出力上限）"); break; }
+    }
+    out.push_back(pad + "}");
+    return;
+  }
+  if (s->kind == DwType::Array) {
+    const DwType* elem = tt->at(s->ref);
+    const DwType* es = dwStrip(tt, elem);
+    uint64_t esz = dwSizeOf(tt, elem);
+    uint64_t cnt = s->arrayCount;
+    if (dwIsCharBase(es)) { // char 配列 → 文字列
+      std::string str; bool rdok = true;
+      for (uint64_t i = 0; i < cnt && i < 4096; i++) { size_t bi = off + i; if (bi >= ok.size() || !ok[bi]) { rdok = false; break; }
+        uint8_t c = buf[bi]; if (c == 0) break; str += (c >= 0x20 && c < 0x7f) ? (char)c : '.'; }
+      out.push_back(pad + label + " = \"" + str + "\"" + (rdok ? "" : " …<一部読めない>"));
+      return;
+    }
+    out.push_back(pad + label + " {");
+    if (depth >= kDwMaxDepth || esz == 0) { out.push_back(pad + "  …"); out.push_back(pad + "}"); return; }
+    for (uint64_t i = 0; i < cnt && i < kDwArrayCap; i++) {
+      dwEmit(out, tt, elem, buf, ok, off + (size_t)(i*esz), baseAddr, "[" + std::to_string(i) + "]", indent + 2, depth + 1);
+      if ((int)out.size() >= kDwLineCap) break;
+    }
+    if (cnt > kDwArrayCap) out.push_back(pad + "  …（" + std::to_string(cnt) + " 要素中 " + std::to_string(kDwArrayCap) + " まで）");
+    out.push_back(pad + "}");
+    return;
+  }
+  // スカラ（基本型/ポインタ/enum）
+  uint64_t sz = s->byteSize ? s->byteSize : (s->kind == DwType::Pointer ? 8 : 4);
+  bool rdok = true;
+  for (uint64_t i = 0; i < sz; i++) { size_t bi = off + i; if (bi >= ok.size() || !ok[bi]) { rdok = false; break; } }
+  out.push_back(pad + label + " = " + (rdok ? dwFormatScalar(tt, s, buf + off, baseAddr + off) : std::string("<読めない>")));
+}
+
 // gdb 風メモリ検査。spec = "[個数][書式][サイズ]"（例: 4xg / 8c / 10i / s）。結果を g_output へ。
 void examineMemory(const std::string& spec, uint64_t addr) {
   int count = 0; char fmt = 'x'; int size = 0; size_t i = 0;
@@ -1986,6 +2124,48 @@ void runCommand(const std::string& line) {
                     + (filt.empty() ? "" : ("（絞込: " + filt + "）"));
       if (g_output.empty()) g_output.push_back(filt.empty() ? "(シンボルなし)" : "(一致なし)");
     }
+  } else if (cmd == "struct" || cmd == "pt") {
+    // :struct <型名>,<式>  指定アドレスのメモリを DWARF の型として展開して表示（-g/dSYM が要る）。
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    auto parts = splitComma(arg, 2);
+    if (parts.size() < 2) { g_message = "使い方: struct <型名>,<式>（例: struct Point,$rsp / :types で型名一覧）"; return; }
+    std::string tname = trimStr(parts[0]);
+    // "struct Foo" / "union Foo" / "enum Foo" の接頭辞は外す（DWARF は素の名前で持つ）
+    for (const char* pre : {"struct ", "union ", "enum ", "class "}) {
+      size_t n = strlen(pre); if (tname.rfind(pre, 0) == 0) { tname = trimStr(tname.substr(n)); break; }
+    }
+    if (tname.empty()) { g_message = "型名が空です"; return; }
+    std::string expr = trimStr(parts[1]);
+    evalAsync(expr, [tname](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) { g_message = "式エラー: " + eerr; return; }
+      const DwarfTypes* tt = nullptr;
+      const DwType* root = g_session.findType(tname, tt, addr);
+      if (!root || !tt) { g_message = "型が見つからない: " + tname + "（-g/dSYM 付きビルド？ :types で一覧）"; return; }
+      uint64_t sz = dwSizeOf(tt, root);
+      if (sz == 0) sz = 8;
+      if (sz > (1u << 16)) sz = (1u << 16); // 読みすぎ防止（64KB 上限）
+      std::vector<uint8_t> buf((size_t)sz, 0); std::vector<char> okr;
+      readMemoryTolerant(addr, buf.data(), okr, (size_t)sz);
+      g_output.clear();
+      char th[224]; snprintf(th, sizeof(th), "型 %s @ 0x%llx （%llu バイト）",
+                             dwTypeName(tt, root).c_str(), (unsigned long long)addr, (unsigned long long)sz);
+      g_outputTitle = th;
+      dwEmit(g_output, tt, root, buf.data(), okr, 0, addr, dwTypeName(tt, root), 0, 0);
+      if (g_output.empty()) g_output.push_back("(表示するものがありません)");
+      g_outputTop = 0;
+    });
+  } else if (cmd == "types") {
+    // :types [絞込]  既定ライブラリ（無ければ主実行ファイル）の DWARF 型名を一覧（構造体/共用体/enum/typedef）。
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    const Image* im = g_session.defaultLibImage();
+    if (!im) im = g_session.images().mainExecutable();
+    auto names = g_session.typeNames(im, trimStr(arg));
+    g_output.clear();
+    for (const auto& n : names) { if (n.rfind("__", 0) == 0) continue; g_output.push_back(n); } // __ 始まりの内部型は除く
+    g_outputTitle = (im ? im->name : std::string("?")) + " の型 " + std::to_string(g_output.size()) + " 個"
+                  + (trimStr(arg).empty() ? "" : ("（絞込: " + trimStr(arg) + "）")) + "  — :struct <型名>,<式> で展開";
+    if (g_output.empty()) g_output.push_back(trimStr(arg).empty() ? "(型情報なし。-g/dSYM 付きでビルド？)" : "(一致なし)");
+    g_outputTop = 0;
   } else if (cmd == "uselib") {
     std::string a = trimStr(arg);
     if (a.empty()) {
@@ -2326,6 +2506,8 @@ void runCommand(const std::string& line) {
       "  :x                         前回の続き（オーバレイ表示中は Enter でも）",
       "  :sym <式>                  アドレスのシンボル    :img / :libs  読込イメージ（ライブラリ）一覧    :seg [名前]  セグメント一覧",
       "  :syms <ライブラリ> [絞込]   そのライブラリのシンボル一覧（省略で既定ライブラリ）。独自定義(注釈)も * 印で混在。対話は曖昧フィルタ・Tab 並び替え・Ctrl+E 独自定義の表示切替",
+      "  :struct <型名>,<式>        指定アドレスのメモリを DWARF の型として展開表示（-g/dSYM 要。例: struct Point,$rsp）",
+      "  :types [絞込]              DWARF の型名一覧（構造体/共用体/enum/typedef）。:struct と併用",
       "  :uselib [<名前>|-]          式でライブラリ名省略時に先に探す既定ライブラリを 表示 / 設定 / 解除",
       "\x1b[36m― 注釈（自分で付ける名前・メモ） ―\x1b[0m",
       "  :ann <式>,<名前>[,<メモ>]   そのアドレスに名前を付ける（以降 :b <名前> / 式で引ける・表示にも出る）",
@@ -2373,7 +2555,7 @@ void runCommand(const std::string& line) {
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
   static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "be", "bedit", "bd", "bt",
-                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "scwatch", "scstop", "mouse"};
+                               "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "struct", "types", "scwatch", "scstop", "mouse"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
     if (std::string(c).rfind(g_cmdline, 0) == 0) cands.push_back(c); // 接頭辞一致
