@@ -205,6 +205,16 @@ const uint8_t* viewStateData() {
 uint64_t viewPc() { return g_session.arch().pc(viewStateData()); }
 bool viewingStopThread() { return !g_viewThread || g_viewThread == g_session.stopThread(); }
 
+// 表示中スレッドのレジスタ状態をコピーして返す（Expression::setRegState 用）。$reg 評価が
+// 表示中スレッドに追従するように。別スレッド評価に渡せるよう「値」で持つ。停止していなければ空
+//（式側は停止中のみ $reg を読むので、その場合は未設定＝停止スレッドにフォールバックで無害）。
+std::vector<uint8_t> viewRegSnapshot() {
+  if (!g_session.isAttached() || !g_session.stopped()) return {};
+  const uint8_t* p = viewStateData();
+  size_t n = g_session.arch().threadStateCount() * sizeof(natural_t);
+  return std::vector<uint8_t>(p, p + n);
+}
+
 // top の直前の命令の先頭アドレス（x86 可変長のための後方探索）。見つからなければ top-1。
 // top の n 命令前のアドレスを返す。x86 は可変長で後方デコードが曖昧なので、
 // 手前から前方デコードして top にちょうど揃う命令列を探し、その n 個前を返す
@@ -1585,8 +1595,12 @@ bool parseHexBytes(const std::string& in, std::vector<uint8_t>& out) {
 // バッチではイベントループが無いのでその場で同期評価して即 apply する。
 void evalAsync(const std::string& expr,
                std::function<void(bool, uint64_t, const std::string&)> apply) {
+  // 表示中スレッドのレジスタ状態をメインスレッドで取っておく（$reg がそのスレッドを見るように）。
+  // 別スレッド評価に渡すのでコピー（値）で保持する。
+  std::vector<uint8_t> regSnap = viewRegSnapshot();
   if (!g_interactive) { // バッチ: 同期
     Expression ex(g_session);
+    ex.setRegState(regSnap);
     uint64_t a = 0; std::string e;
     bool ok = ex.eval(expr, a, e);
     apply(ok, a, e);
@@ -1596,8 +1610,9 @@ void evalAsync(const std::string& expr,
   g_jobCancel = false; g_jobShowing = false; g_jobDone = 0; g_jobTotal = 0;
   g_jobApply = std::move(apply);
   g_jobRunning = true;
-  g_jobThread = std::thread([expr]() {
+  g_jobThread = std::thread([expr, regSnap]() {
     Expression ex(g_session);
+    ex.setRegState(regSnap);
     ex.setAsync(&g_jobCancel, [](int done, int total) {
       g_jobDone.store(done); g_jobTotal.store(total);
       g_jobShowing.store(true);          // 重い探索に入った → 進捗表示を有効化
@@ -2130,7 +2145,7 @@ void runCommand(const std::string& line) {
       if (!parseHexBytes(parts[1], bytes)) { g_message = "HEX 列が不正（偶数桁の 16 進で。例: setmem $rsp,9090CC）"; return; }
     } else {              // N バイトの値を書く（リトルエンディアン）
       int size = cmd[6] - '0';
-      Expression ex(g_session); uint64_t val = 0; std::string eerr;
+      Expression ex(g_session); ex.setRegState(viewRegSnapshot()); uint64_t val = 0; std::string eerr;
       if (!ex.eval(trimStr(parts[1]), val, eerr)) { g_message = "式エラー: " + eerr; return; }
       for (int i = 0; i < size; i++) bytes.push_back((uint8_t)((val >> (8*i)) & 0xff));
     }
@@ -2145,7 +2160,7 @@ void runCommand(const std::string& line) {
     auto parts = splitComma(arg, 3);
     if (parts.size() < 3) { g_message = "使い方: memset <式>,<値>,<サイズ>"; return; }
     // 値・サイズは先にその場で解釈し、アドレス式だけ非同期評価する。
-    Expression ex(g_session); uint64_t val = 0, size = 0; std::string eerr;
+    Expression ex(g_session); ex.setRegState(viewRegSnapshot()); uint64_t val = 0, size = 0; std::string eerr;
     if (!ex.eval(trimStr(parts[1]), val, eerr) || !ex.eval(trimStr(parts[2]), size, eerr)) {
       g_message = "式エラー: " + eerr; return;
     }
@@ -2162,7 +2177,7 @@ void runCommand(const std::string& line) {
     auto parts = splitComma(arg, 3); // addr, size, path（path は残り全部）
     if (parts.size() < 3) { g_message = std::string("使い方: ") + cmd + " <式>,<サイズ>,<パス>"; return; }
     // サイズ・パスは先にその場で解釈し、アドレス式だけ非同期評価する。
-    Expression ex(g_session); uint64_t size = 0; std::string eerr;
+    Expression ex(g_session); ex.setRegState(viewRegSnapshot()); uint64_t size = 0; std::string eerr;
     if (!ex.eval(trimStr(parts[1]), size, eerr)) { g_message = "式エラー: " + eerr; return; }
     std::string path = trimStr(parts[2]);
     if (path.empty() || size == 0 || size > (1u << 28)) { g_message = "パス必須・サイズは 1〜256MB"; return; }
@@ -2892,7 +2907,7 @@ bool disToOutput(const std::string& arg) {
     if (g_state != UiState::Stopped) { g_message = "使い方: dis <式> [個数]"; return false; }
     addr = g_session.stopPc();
   } else {
-    Expression ex(g_session); std::string eerr;
+    Expression ex(g_session); ex.setRegState(viewRegSnapshot()); std::string eerr;
     if (!ex.eval(toks[0], addr, eerr)) { g_message = "式エラー: " + eerr; return false; }
     if (toks.size() > 1) { int n = (int)parseNum(toks[1]); if (n > 0) count = n; }
   }

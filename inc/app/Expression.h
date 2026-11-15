@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace ta2 {
 
@@ -32,6 +33,11 @@ public:
     cancel_ = cancel; progress_ = std::move(progress);
   }
 
+  // $reg を読むときのスレッド状態を明示指定する（TUI で表示中スレッドを切り替えたとき用）。
+  // 空なら従来どおり停止スレッド（session.stopState）を見る。別スレッド評価に備え、呼び出し側が
+  // メインスレッドで取った状態バイト列のコピーを渡す（レイアウトは Arch のスレッド状態と同じ）。
+  void setRegState(std::vector<uint8_t> state) { regState_ = std::move(state); }
+
 private:
   bool parseExpr(uint64_t& v);
   bool parseTerm(uint64_t& v);
@@ -49,6 +55,7 @@ private:
   std::string error_;
   std::atomic<bool>* cancel_ = nullptr;          // 非 null で探索中断要求を監視
   std::function<void(int, int)> progress_;       // 全イメージ探索の進捗通知（省略可）
+  std::vector<uint8_t> regState_;                // $reg 用のスレッド状態（空=停止スレッドを見る）
 };
 
 } // namespace ta2
