@@ -114,6 +114,10 @@ std::string g_symsFilter;              // 現在の絞り込みキーワード�
 int g_symsSort = 0;                    // 0=アドレス順, 1=名前順（昇順）
 bool g_symsShowCustom = true;          // 独自定義（注釈）を一覧に含めるか（Ctrl+E で切替）
 std::string g_symsImgName;             // 見出し用の対象イメージ名
+std::vector<const SymEntry*> g_symsHits; // 現在の絞り込み・並び替え後に表示しているシンボル（選択・ブレイク用）
+std::vector<int> g_symsSymLine;        // g_symsHits[i] の先頭が g_output の何行目か（スクロール追従用）
+std::vector<int> g_symsLineSym;        // g_output の各行が g_symsHits の何番か（-1=該当なし。選択ハイライト用）
+int g_symsSel = 0;                     // 選択中シンボル（g_symsHits の索引）。Enter でここにブレイク
 
 // auto（興味のある命令まで自動継続）。g_autoMask のビット: 1=call, 2=syscall, 4=ret。0 で無効。
 // 停止のたびに、現命令が該当すれば止め、そうでなければ自動で単一ステップを続ける。
@@ -1179,8 +1183,8 @@ void render() {
     if (g_outputTop > maxTop) g_outputTop = maxTop;
     if (g_outputTop < 0) g_outputTop = 0;
     std::string hint;
-    if (g_symsActive)               // :syms の対話一覧（打鍵で曖昧フィルタ・Tab で並び替え）
-      hint = "文字=絞込  Tab=並び替え  Ctrl+E=独自定義 表示/除外  ↑↓ Ctrl+F/B スクロール  Ctrl+U クリア  ESC 閉じる";
+    if (g_symsActive)               // :syms の対話一覧（打鍵で曖昧フィルタ・↑↓で選択・Enter でブレイク）
+      hint = "文字=絞込  ↑↓/Ctrl+F/B=選択  Enter=ブレイク(●)  Tab=並び替え  Ctrl+E=独自定義  Ctrl+U クリア  ESC 閉じる";
     else if (g_xActive && g_xNavByAddr)  // :x のアドレスナビ（表示アドレスを前後に動かす）
       hint = "↑↓ 1 行  Ctrl+F/Ctrl+B・Space/b 1 画面  Enter 次画面  ESC・q 閉じる";
     else {
@@ -1194,7 +1198,11 @@ void render() {
     for (int y = 0; y < avail; y++) {
       int idx = g_outputTop + y;
       std::string t = (idx < total) ? g_output[idx] : "";
-      g_term.putAt(0, top + y, layout::fitWidth(t, cols));
+      // :syms で選択中シンボルの行は反転表示（どれが選ばれているか・Enter の対象を示す）。
+      bool sel = g_symsActive && idx < (int)g_symsLineSym.size() && g_symsLineSym[idx] == g_symsSel
+                 && !g_symsHits.empty();
+      if (sel) g_term.putAt(0, top + y, "\x1b[7m" + layout::fitWidth(t, cols) + "\x1b[0m");
+      else     g_term.putAt(0, top + y, layout::fitWidth(t, cols));
     }
     g_term.clearLine(rows - 1);
     std::string foot;
@@ -1476,42 +1484,68 @@ static bool symsFilterMatch(const SymEntry& e, const std::string& filterLower) {
 
 // g_symsAll（キャッシュ済み）から現在の g_symsFilter / g_symsSort で g_output を組み直す。
 // アドレス順は（独自定義＝注釈を含めて）アドレス昇順に並べ替え、名前順は表示名で昇順に並べ替える。
-// 打鍵・Tab のたびに呼ぶ。新しい結果なので先頭から表示する。
+// 各行には選択・ブレイクのため、行頭にブレイク印（●）と独自定義印（*）の桁を付ける。
+// g_symsHits/g_symsSymLine/g_symsLineSym に選択・スクロール用の対応を記録する。選択位置は保つ
+//（範囲外なら丸める）。スクロール（g_outputTop）はここでは触らない＝呼び出し側が制御する。
 void symsRebuild() {
   std::string lf = g_symsFilter;
   std::transform(lf.begin(), lf.end(), lf.begin(), [](unsigned char c){ return (char)std::tolower(c); });
-  std::vector<const SymEntry*> hits;
-  hits.reserve(g_symsAll.size());
+  g_symsHits.clear(); g_symsHits.reserve(g_symsAll.size());
   size_t customAll = 0;
   for (const auto& e : g_symsAll) {
     if (e.custom) customAll++;
     if (e.custom && !g_symsShowCustom) continue;      // 独自定義を除外中
-    if (symsFilterMatch(e, lf)) hits.push_back(&e);
+    if (symsFilterMatch(e, lf)) g_symsHits.push_back(&e);
   }
   if (g_symsSort == 1) // 名前順（表示名で昇順。同名はアドレス順で安定化）
-    std::stable_sort(hits.begin(), hits.end(), [](const SymEntry* a, const SymEntry* b){
+    std::stable_sort(g_symsHits.begin(), g_symsHits.end(), [](const SymEntry* a, const SymEntry* b){
       if (a->name != b->name) return a->name < b->name; return a->addr < b->addr; });
   else                 // アドレス順（独自定義と元シンボルを混ぜて正しく昇順に。注釈が末尾に残らないよう明示整列）
-    std::stable_sort(hits.begin(), hits.end(), [](const SymEntry* a, const SymEntry* b){ return a->addr < b->addr; });
-  g_output.clear();
-  for (const auto* e : hits) {
-    // 印の桁: 独自定義（注釈）は '*'、元からあるシンボルは ' '。見た目で区別できるように。
-    char b[384]; snprintf(b, sizeof(b), "0x%012llx %c %s",
-                          (unsigned long long)e->addr, e->custom ? '*' : ' ', e->name.c_str());
-    pushWrapped(g_output, b, g_term.cols(), 16); // 長い名前も折り返して全部見せる（2 行目以降は 16 桁字下げ）
+    std::stable_sort(g_symsHits.begin(), g_symsHits.end(), [](const SymEntry* a, const SymEntry* b){ return a->addr < b->addr; });
+  // 選択位置を有効範囲に丸める
+  if (g_symsHits.empty()) g_symsSel = 0;
+  else if (g_symsSel >= (int)g_symsHits.size()) g_symsSel = (int)g_symsHits.size() - 1;
+  if (g_symsSel < 0) g_symsSel = 0;
+  g_output.clear(); g_symsLineSym.clear();
+  g_symsSymLine.assign(g_symsHits.size(), 0);
+  for (size_t i = 0; i < g_symsHits.size(); i++) {
+    const SymEntry* e = g_symsHits[i];
+    const Breakpoint* ub = g_session.breaks().userAt(e->addr); // 既にブレイクがあるか（印で表す）
+    // 行頭の印: 無=空 / SW 有効=● / HW 有効=◆ / 無効=○(SW)・◇(HW)。色は付けない（選択の反転表示と
+    // 幅計算を乱さないため。種類は字形で分かる）。その後に独自定義印（*/空）・アドレス・名前。
+    const char* bpm = " ";
+    if (ub) bpm = !ub->enabled ? (ub->hw ? "◇" : "○") : (ub->hw ? "◆" : "●");
+    char b[400]; snprintf(b, sizeof(b), "%s 0x%012llx %c %s",
+                          bpm, (unsigned long long)e->addr, e->custom ? '*' : ' ', e->name.c_str());
+    g_symsSymLine[i] = (int)g_output.size();
+    size_t before = g_output.size();
+    pushWrapped(g_output, b, g_term.cols(), 18); // 長い名前も折り返して全部見せる（2 行目以降は字下げ）
+    for (size_t L = before; L < g_output.size(); L++) g_symsLineSym.push_back((int)i); // 各行→シンボル索引
   }
   const char* sortName = g_symsSort == 1 ? "名前順" : "アドレス順";
-  char th[224];
+  char th[256];
   if (customAll > 0)
     snprintf(th, sizeof(th), "%s のシンボル %zu/%zu 個  [並び: %s]  [* 独自定義 %zu 個: %s]",
-             g_symsImgName.c_str(), hits.size(), g_symsAll.size(), sortName,
+             g_symsImgName.c_str(), g_symsHits.size(), g_symsAll.size(), sortName,
              customAll, g_symsShowCustom ? "表示" : "除外");
   else
     snprintf(th, sizeof(th), "%s のシンボル %zu/%zu 個  [並び: %s]",
-             g_symsImgName.c_str(), hits.size(), g_symsAll.size(), sortName);
+             g_symsImgName.c_str(), g_symsHits.size(), g_symsAll.size(), sortName);
   g_outputTitle = th;
-  if (g_output.empty()) g_output.push_back(g_symsFilter.empty() ? "(シンボルなし)" : "(一致なし)");
-  g_outputTop = 0;
+  if (g_output.empty()) { g_output.push_back(g_symsFilter.empty() ? "(シンボルなし)" : "(一致なし)"); g_symsLineSym.push_back(-1); }
+}
+
+// 選択中シンボルの行が画面に入るよう g_outputTop を調整する（avail=本文の表示可能行数）。
+void symsEnsureVisible(int avail) {
+  if (g_symsHits.empty() || g_symsSel < 0 || g_symsSel >= (int)g_symsSymLine.size()) return;
+  int start = g_symsSymLine[g_symsSel];
+  int end = (g_symsSel + 1 < (int)g_symsSymLine.size()) ? g_symsSymLine[g_symsSel + 1] - 1
+                                                        : (int)g_output.size() - 1;
+  if (g_outputTop > start) g_outputTop = start;        // 上に隠れている → 上へ
+  if (end >= g_outputTop + avail) g_outputTop = end - avail + 1; // 下に隠れている → 下へ
+  int maxTop = std::max(0, (int)g_output.size() - avail);
+  if (g_outputTop > maxTop) g_outputTop = maxTop;
+  if (g_outputTop < 0) g_outputTop = 0;
 }
 
 // 直近の examine（書式/バイト数）を g_xNextAddr から続けて表示する。
@@ -1647,7 +1681,7 @@ void runCommand(const std::string& line) {
   if (g_jobRunning.load()) { g_message = "処理中です（ESC で中止してください）"; return; }
   g_message.clear();
   g_outputTop = 0; // 新しいコマンド出力は先頭から表示
-  g_symsActive = false; g_symsAll.clear(); // 直前の :syms 対話一覧があれば畳む（新コマンドの出力に置き換わる）
+  g_symsActive = false; g_symsAll.clear(); g_symsHits.clear(); g_symsLineSym.clear(); g_symsSymLine.clear(); g_symsSel = 0; // 直前の :syms 一覧を畳む
   // コマンド実行前のこの境界で、イメージ一覧とユーザ注釈を最新化する。
   //  - refreshImages: dlopen で後から読み込まれたライブラリにも :b / :sym が効くように
   //    （dyld の変更タイムスタンプを見て、変化時だけ再読込するので走行中でも安価）。
@@ -1922,6 +1956,7 @@ void runCommand(const std::string& line) {
         g_symsAll.push_back(SymEntry{ a.unslid + im->slide, a.name, ln, ln, true });
       }
       g_symsImgName = im->name; g_symsFilter = filt; g_symsSort = 0; g_symsShowCustom = true; g_symsActive = true;
+      g_symsSel = 0; g_outputTop = 0;
       symsRebuild();
     } else {
       // バッチ(非対話): 一括出力（部分一致・大小無視・アドレス順・1 行＝出力安定）。印の桁で独自定義(*)を区別。
@@ -2263,6 +2298,7 @@ void runCommand(const std::string& line) {
       "    出力オーバレイ（help/img/syms/reg 等）: ↑↓・Space/b ページ   g/G 先頭末尾   Enter 続き(dis)   ESC・q 閉じる",
       "    :x のオーバレイは↑↓で 1 行・Ctrl+F/Ctrl+B で 1 画面ぶん表示アドレスを前後（メモリを辿る）。Enter で次画面",
       "    :syms のオーバレイは文字入力でその場で曖昧（部分列）フィルタ、Tab で並び替え（アドレス順↔名前順）、Ctrl+U で絞込クリア",
+      "      ↑↓/Ctrl+F/B で選択（反転）、Enter で選択シンボルにブレイクをトグル（● 印）",
       "      独自定義シンボル（注釈）も一覧に混ぜて * 印で表示。Ctrl+E でその表示／除外を切替",
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
       "  :attach [pid]              pid 省略でプロセス一覧から選択",
@@ -2507,8 +2543,8 @@ void pageCursor(int dir) {
 }
 
 // b キー: カーソル行（未選択なら PC）のブレイクを即時にトグル（有れば解除 / 無ければ SW ブレイク設定）。
-void toggleBreakAtCursor() {
-  uint64_t a = g_curAddr ? g_curAddr : viewPc();
+// アドレス a のソフトブレイクをトグルする（設定⇔解除）。g_message を設定するだけで描画はしない。
+void toggleBreakAt(uint64_t a) {
   const Breakpoint* ex = g_session.breaks().userAt(a);
   if (ex) {
     int id = ex->id; bool hw = ex->hw;
@@ -2522,6 +2558,11 @@ void toggleBreakAtCursor() {
       g_message = std::string(m) + (w.empty() ? "" : ("  " + w)); }
     else g_message = "ブレイク設定失敗（メモリに書けない？）";
   }
+}
+
+void toggleBreakAtCursor() {
+  uint64_t a = g_curAddr ? g_curAddr : viewPc();
+  toggleBreakAt(a);
   render();
 }
 
@@ -2700,21 +2741,29 @@ void onKey(int c) {
   if (!g_output.empty()) { // オーバレイ（ページャ）: スクロール／ページ送り、ESC・q で閉じる
     int avail = std::max(1, g_term.rows() - 3);
     int maxTop = std::max(0, (int)g_output.size() - avail);
-    auto closeOv = []() { g_output.clear(); g_outputTitle.clear(); g_xActive = false; g_symsActive = false; g_symsAll.clear(); g_outputTop = 0; g_ovEsc = 0; };
+    auto closeOv = []() { g_output.clear(); g_outputTitle.clear(); g_xActive = false; g_symsActive = false;
+                          g_symsAll.clear(); g_symsHits.clear(); g_symsLineSym.clear(); g_symsSymLine.clear(); g_symsSel = 0;
+                          g_outputTop = 0; g_ovEsc = 0; };
     if (c == 27) { closeOv(); render(); return; }                                    // ESC 即閉じる
-    // :syms の対話一覧: 文字入力＝その場で曖昧フィルタ、Tab＝並び替え（アドレス順↔名前順）、
-    // 矢印・Ctrl+F/B＝スクロール、ESC で閉じる。文字が絞り込みに吸われるので下の汎用キーより先に拾う。
+    // :syms の対話一覧: 文字入力＝その場で曖昧フィルタ、Tab＝並び替え、Ctrl+E＝独自定義の表示/除外、
+    // 矢印/Ctrl+F/B＝選択移動、Enter＝選択シンボルにブレイク、ESC で閉じる。
+    // 文字が絞り込みに吸われるので下の汎用キーより先に拾う。
     if (g_symsActive) {
-      if (c == '\t') { g_symsSort ^= 1; symsRebuild(); render(); return; }                 // Tab: 並び替え
-      if (c == 5) { g_symsShowCustom = !g_symsShowCustom; symsRebuild(); render(); return; } // Ctrl+E: 独自定義(注釈)の表示/除外
-      if (c == 127 || c == 8) { if (!g_symsFilter.empty()) { g_symsFilter.pop_back(); symsRebuild(); } render(); return; } // BS
-      if (c == 21) { if (!g_symsFilter.empty()) { g_symsFilter.clear(); symsRebuild(); } render(); return; } // Ctrl+U: 絞込クリア
-      if (c == KEY_UP)   { g_outputTop = std::max(0, g_outputTop - 1); render(); return; }
-      if (c == KEY_DOWN) { g_outputTop = std::min(maxTop, g_outputTop + 1); render(); return; }
-      if (c == 6) { g_outputTop = std::min(maxTop, g_outputTop + avail); render(); return; } // Ctrl+F: 1 ページ下
-      if (c == 2) { g_outputTop = std::max(0, g_outputTop - avail); render(); return; }       // Ctrl+B: 1 ページ上
+      int nhit = (int)g_symsHits.size();
+      if (c == '\t') { g_symsSort ^= 1; g_symsSel = 0; g_outputTop = 0; symsRebuild(); render(); return; } // Tab: 並び替え
+      if (c == 5) { g_symsShowCustom = !g_symsShowCustom; g_symsSel = 0; g_outputTop = 0; symsRebuild(); render(); return; } // Ctrl+E
+      if (c == 127 || c == 8) { if (!g_symsFilter.empty()) { g_symsFilter.pop_back(); g_symsSel = 0; g_outputTop = 0; symsRebuild(); } render(); return; } // BS
+      if (c == 21) { if (!g_symsFilter.empty()) { g_symsFilter.clear(); g_symsSel = 0; g_outputTop = 0; symsRebuild(); } render(); return; } // Ctrl+U
+      if (c == KEY_UP)   { if (nhit) { g_symsSel = std::max(0, g_symsSel - 1); symsEnsureVisible(avail); } render(); return; }
+      if (c == KEY_DOWN) { if (nhit) { g_symsSel = std::min(nhit - 1, g_symsSel + 1); symsEnsureVisible(avail); } render(); return; }
+      if (c == 6) { if (nhit) { g_symsSel = std::min(nhit - 1, g_symsSel + std::max(1, avail - 1)); symsEnsureVisible(avail); } render(); return; } // Ctrl+F: 1 ページ下
+      if (c == 2) { if (nhit) { g_symsSel = std::max(0, g_symsSel - std::max(1, avail - 1)); symsEnsureVisible(avail); } render(); return; } // Ctrl+B: 1 ページ上
+      if (c == '\r' || c == '\n') { // Enter: 選択シンボルのアドレスにブレイクをトグル
+        if (nhit && g_symsSel >= 0 && g_symsSel < nhit) { toggleBreakAt(g_symsHits[g_symsSel]->addr); symsRebuild(); symsEnsureVisible(avail); }
+        render(); return;
+      }
       if (c == ':') { closeOv(); g_cmdMode = true; g_cmdline.clear(); g_message.clear(); render(); return; } // 閉じてコマンドへ
-      if (c >= 0x20 && c < 0x7f) { g_symsFilter.push_back((char)c); symsRebuild(); render(); return; } // 絞り込みに追記
+      if (c >= 0x20 && c < 0x7f) { g_symsFilter.push_back((char)c); g_symsSel = 0; g_outputTop = 0; symsRebuild(); render(); return; } // 絞り込みに追記
       return;                                                                               // その他は無視（閉じない）
     }
     // :x のアドレスナビ（16進/数値表示）: 矢印=1 行・Ctrl+F/B/Space=1 画面ぶん表示アドレスを前後。
