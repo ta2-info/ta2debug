@@ -12,9 +12,9 @@
 #include <unordered_map>
 #include <vector>
 
-namespace ta2 {
+#include "core/DwarfTypes.h" // DwarfSections（__DWARF セクション群）と型モデル DwarfTypes
 
-struct DwarfSections; // __DWARF セクション群（実体は .cpp）。dSYM / .o 双方で使う。
+namespace ta2 {
 
 struct SourceLoc {
   std::string file;   // 表示用の名前（多くは basename、例 "dsp.c"）
@@ -34,6 +34,9 @@ public:
 
   // path のソース line 行目（1 始まり）を返す。読めなければ空。結果はキャッシュ。
   const std::string& sourceText(const std::string& path, int line);
+
+  // DWARF 型情報（構造体レイアウト等）。loadForImage で行番号と一緒に取り込む。
+  const DwarfTypes& types() const { return types_; }
 
 private:
   struct Row { uint64_t addr; int fileIdx; int line; bool endSeq; };
@@ -55,6 +58,8 @@ private:
   // ソースファイルの行キャッシュ: path → 行配列（1 始まりを 0 始まりで保持）
   std::unordered_map<std::string, std::vector<std::string>> srcCache_;
   std::string empty_;
+
+  DwarfTypes types_; // 同じ __DWARF セクションから集めた型情報
 };
 
 } // namespace ta2

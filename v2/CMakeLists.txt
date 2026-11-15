@@ -62,6 +62,7 @@ set(TA2CORE_SOURCES
   core/src/Disassembler.cpp
   core/src/Unwinder.cpp
   core/src/DwarfLines.cpp
+  core/src/DwarfTypes.cpp
   core/src/SymbolRef.cpp
   core/src/SyscallTables.cpp
   core/src/SyscallDecoder.cpp
