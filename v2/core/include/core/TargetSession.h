@@ -108,6 +108,7 @@ public:
   // ---- EvalContext（Expression 用） ----
   bool evalStopped() override { return stepper_.stopped(); }
   bool evalReadRegister(const std::string& loweredName, uint64_t& out) override;
+  bool evalReadMemory(uint64_t addr, void* buf, size_t len) override { return target_.readMemory(addr, buf, len); }
   ImageList& evalImages() override { return images_; }
   Symbols& evalSymbols() override { return symbols_; }
   const Image* evalDefaultLibImage() override { return defaultLibImage(); }

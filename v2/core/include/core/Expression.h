@@ -34,6 +34,8 @@ public:
   virtual bool evalStopped() = 0;
   // 停止スレッドのレジスタを名前（小文字）で読む。名前集合は Arch が決める。不明な名前は false。
   virtual bool evalReadRegister(const std::string& loweredName, uint64_t& out) = 0;
+  // 対象メモリを読む（C 風ポインタ参照 '*<式>' 用）。成功で true。未アタッチ/未マップは false。
+  virtual bool evalReadMemory(uint64_t addr, void* buf, size_t len) = 0;
   virtual ImageList& evalImages() = 0;
   virtual Symbols& evalSymbols() = 0;
   // 既定ライブラリ（uselib。未設定／見つからなければ主実行ファイル）。無ければ nullptr。

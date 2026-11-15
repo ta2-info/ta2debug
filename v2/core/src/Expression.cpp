@@ -88,6 +88,19 @@ bool Expression::parseTerm(uint64_t& v) {
 
 bool Expression::parseUnary(uint64_t& v) {
   skipSpaces();
+  // C 風ポインタ参照（デリファレンス）: オペランド先頭の '*' は「そのアドレスが指す 8 バイト値」。
+  // 二項の乗算 a*b は parseTerm が parseUnary の後ろで拾うので、前置の '*' とは位置で曖昧なく区別。
+  // 右結合なので **p（二重参照）や *(p+8) も可。
+  if (pos_ < input_.size() && input_[pos_] == '*') {
+    pos_++;
+    uint64_t addr;
+    if (!parseUnary(addr)) return false;
+    uint64_t val = 0; // ポインタ幅（8 バイト・リトルエンディアン）
+    if (!ctx_.evalReadMemory(addr, &val, sizeof(val)))
+      return fail(Msg::of(MsgId::ErrMemUnreadable).hex("addr", addr));
+    v = val;
+    return true;
+  }
   if (pos_ < input_.size() && (input_[pos_] == '+' || input_[pos_] == '-')) {
     char op = input_[pos_];
     pos_++;
