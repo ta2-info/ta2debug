@@ -1270,6 +1270,25 @@ std::string formatValue(uint64_t v, char fmt, int size) {
   return b;
 }
 
+// addr から len バイトを「読めない範囲があってもエラーにせず」読む。ページ境界ごとにプローブし、
+// 読めたバイトは readable[i]=1、読めない（未マップ等の）ページは 0 のまま（buf はゼロ）。
+// mach_vm_read_overwrite はページ単位で全か無なので、ページを跨がないチャンクに割って読む。
+// 1 バイトでも読めれば（穴があっても）表示を続けられるようにするための下請け。
+void readMemoryTolerant(uint64_t addr, uint8_t* buf, std::vector<char>& readable, size_t len) {
+  readable.assign(len, 0);
+  int ps = getpagesize(); if (ps <= 0) ps = 4096;
+  size_t i = 0;
+  while (i < len) {
+    uint64_t a = addr + i;
+    size_t toEnd = (size_t)ps - (size_t)(a % (uint64_t)ps); // 次のページ境界まで（チャンクはページを跨がない）
+    size_t chunk = std::min(len - i, toEnd);
+    size_t got = 0;
+    if (g_session.target().readMemory(a, buf + i, chunk, &got) && got == chunk)
+      for (size_t k = 0; k < chunk; k++) readable[i + k] = 1;
+    i += chunk;
+  }
+}
+
 // gdb 風メモリ検査。spec = "[個数][書式][サイズ]"（例: 4xg / 8c / 10i / s）。結果を g_output へ。
 void examineMemory(const std::string& spec, uint64_t addr) {
   int count = 0; char fmt = 'x'; int size = 0; size_t i = 0;
@@ -1323,14 +1342,11 @@ void examineMemory(const std::string& spec, uint64_t addr) {
     return;
   }
 
-  // 数値 / 文字
+  // 数値 / 文字（読めないバイトを含む値は ** で示す。エラーにせずスクロールを止めない）
   size_t total = (size_t)count * size;
-  std::vector<uint8_t> buf(total, 0); size_t got = 0;
-  if (!g_session.target().readMemory(addr, buf.data(), total, &got) || got == 0) {
-    char m[64]; snprintf(m, sizeof(m), "0x%llx は読めません", (unsigned long long)addr); g_message = m; return;
-  }
-  g_session.maskBreakpoints(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（x/i と同じ）
-  int avail = (int)(got / (size_t)size); if (avail < count) count = avail;
+  std::vector<uint8_t> buf(total, 0); std::vector<char> ok;
+  readMemoryTolerant(addr, buf.data(), ok, total);
+  g_session.maskBreakpoints(addr, buf.data(), total); // ソフトブレイクの INT3/BRK を元バイトへ戻す（x/i と同じ）
   snprintf(th, sizeof(th), "メモリ 0x%llx  /%d%c%c", (unsigned long long)addr, count, fmt,
            size==1?'b':size==2?'h':size==4?'w':'g'); g_outputTitle = th;
   int perLine = (fmt=='a') ? 1 : size>=8 ? 2 : size>=4 ? 4 : size>=2 ? 8 : 8;
@@ -1338,8 +1354,13 @@ void examineMemory(const std::string& spec, uint64_t addr) {
     char head[32]; snprintf(head, sizeof(head), "0x%012llx  ", (unsigned long long)(addr + (size_t)idx*size));
     std::string s(head);
     for (int j = 0; j < perLine && idx < count; j++, idx++) {
-      uint64_t v = 0; for (int bb = 0; bb < size; bb++) v |= (uint64_t)buf[(size_t)idx*size + bb] << (8*bb);
-      s += formatValue(v, fmt, size) + "  ";
+      bool allok = true; for (int bb = 0; bb < size; bb++) if (!ok[(size_t)idx*size + bb]) { allok = false; break; }
+      if (allok) {
+        uint64_t v = 0; for (int bb = 0; bb < size; bb++) v |= (uint64_t)buf[(size_t)idx*size + bb] << (8*bb);
+        s += formatValue(v, fmt, size) + "  ";
+      } else {
+        s += "**  "; // 読めないバイトを含む値
+      }
     }
     g_output.push_back(s);
   }
@@ -1358,23 +1379,24 @@ int defaultDumpBytes() {
 // 従来の 16 進＋ASCII ダンプ。bytes バイト表示し、継続先アドレスを覚える。
 void classicDump(uint64_t addr, int bytes) {
   if (bytes < 1) bytes = 1; if (bytes > 4096) bytes = 4096;
-  std::vector<uint8_t> buf(bytes, 0); size_t got = 0;
-  if (!g_session.target().readMemory(addr, buf.data(), bytes, &got) || got == 0) {
-    char m[64]; snprintf(m, sizeof(m), "0x%llx は読めません", (unsigned long long)addr); g_message = m; return;
-  }
-  g_session.maskBreakpoints(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（x/i と同じ）
-  g_output.clear(); char th[64]; snprintf(th, sizeof(th), "メモリ 0x%llx (%zu バイト)", (unsigned long long)addr, got); g_outputTitle = th;
-  for (size_t i = 0; i < got; i += 16) {
-    char line[160]; int n = snprintf(line, sizeof(line), "0x%012llx  ", (unsigned long long)(addr + i));
+  // 読めない範囲があってもエラーにせず読む（未マップのバイトは ** で示す）。スクロールを止めない。
+  std::vector<uint8_t> buf(bytes, 0); std::vector<char> ok;
+  readMemoryTolerant(addr, buf.data(), ok, (size_t)bytes);
+  g_session.maskBreakpoints(addr, buf.data(), (size_t)bytes); // ソフトブレイクの INT3/BRK を元バイトへ戻す（x/i と同じ）
+  g_output.clear(); char th[64]; snprintf(th, sizeof(th), "メモリ 0x%llx (%d バイト)", (unsigned long long)addr, bytes); g_outputTitle = th;
+  for (int i = 0; i < bytes; i += 16) {
+    char line[160]; int n = snprintf(line, sizeof(line), "0x%012llx  ", (unsigned long long)(addr + (size_t)i));
     std::string s(line, n); std::string asc;
-    for (size_t j = 0; j < 16; j++) {
-      if (i + j < got) { char hx[4]; snprintf(hx, sizeof(hx), "%02x ", buf[i+j]); s += hx; uint8_t c = buf[i+j]; asc += (c>=0x20&&c<0x7f) ? (char)c : '.'; }
-      else s += "   ";
+    for (int j = 0; j < 16; j++) {
+      if (i + j < bytes) {
+        if (ok[i+j]) { char hx[4]; snprintf(hx, sizeof(hx), "%02x ", buf[i+j]); s += hx; uint8_t c = buf[i+j]; asc += (c>=0x20&&c<0x7f) ? (char)c : '.'; }
+        else { s += "** "; asc += '?'; }  // 読めなかったバイト
+      } else s += "   ";
       if (j == 7) s += " ";
     }
     g_output.push_back(s + " |" + asc + "|");
   }
-  g_xNextAddr = addr + got; // 継続先
+  g_xNextAddr = addr + (size_t)bytes; // 継続先
   g_xCurAddr = addr; g_xRowBytes = 16; g_xPageBytes = std::max(16, bytes); g_xNavByAddr = true; // アドレスナビ有効
 }
 
