@@ -35,11 +35,17 @@ public:
   void setMouse(bool on);
   bool mouseOn() const { return mouseOn_; }
 
+  // マウス選択コピー用: 描画した素テキスト（ANSI 除去）から行 r0..r1 の範囲を取り出す。
+  // r0==r1 は c0..c1、複数行は先頭行 c0..末尾／中間行全体／末尾行 0..c1。末尾空白は除く。
+  std::string copyRegion(int r0, int c0, int r1, int c1) const;
+
 private:
   bool entered_ = false;
   bool mouseOn_ = false;
   int rows_ = 24, cols_ = 80;
   std::string buf_;
+  std::vector<std::vector<std::string>> cells_; // [row][col]=1 セルの UTF-8（全角は次セル ""）。コピー用
+  void ensureCells();
   // 元 termios をバイト列で控える（.cpp で struct termios に復元）。macOS の termios は 72 バイト。
   unsigned char saved_[128] = {0};
   bool savedValid_ = false;

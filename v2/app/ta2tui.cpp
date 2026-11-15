@@ -4,6 +4,7 @@
 // 同じ poll で拾う。描画は Terminal（代替画面・raw）＋ TextReport。コマンド解釈は CommandInterpreter(Tui)。
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -96,10 +97,13 @@ private:
         if (c == 'C') { key(KeyRight); i += 3; continue; }
         if (c == 'D') { key(KeyLeft); i += 3; continue; }
         if (c == '<') { // SGR マウス: \x1b[<b;x;y(M|m)
-          size_t j = i + 3; int b = 0, mx = 0, my = 0, f = 0; auto num = [&](int& v){ v = 0; while (j < in.size() && in[j] >= '0' && in[j] <= '9') v = v*10 + (in[j++]-'0'); };
+          size_t j = i + 3; int b = 0, mx = 0, my = 0; auto num = [&](int& v){ v = 0; while (j < in.size() && in[j] >= '0' && in[j] <= '9') v = v*10 + (in[j++]-'0'); };
           num(b); if (j < in.size() && in[j]==';') j++; num(mx); if (j < in.size() && in[j]==';') j++; num(my);
-          char tail = (j < in.size()) ? in[j] : 'M'; f = (tail == 'M'); j++;
-          if (f && (b & 3) == 0) mouseClick(mx - 1, my - 1); // 左ボタン押下
+          char tail = (j < in.size()) ? in[j] : 'M'; j++;
+          int mcol = mx - 1, mrow = my - 1;
+          if (tail == 'M' && (b & 0x3) == 0 && !(b & 0x20)) mouseDown(mcol, mrow); // 左押下
+          else if (tail == 'M' && (b & 0x20)) mouseDrag(mcol, mrow);              // ドラッグ（移動）
+          else if (tail == 'm') mouseUp(mcol, mrow);                              // 離す
           i = j; continue;
         }
       }
@@ -110,16 +114,25 @@ private:
 
   enum { KeyUp = 0x1000, KeyDown, KeyLeft, KeyRight, KeyEsc = 0x1b };
 
-  // マウス左クリック: 逆アセンブル行ならその命令へカーソルを移す（通常モードのみ）。
-  void mouseClick(int /*col*/, int row) {
-    if (mode_ != Mode::Normal || !overlay_.empty() || cmdMode_) return;
-    auto it = rowAddr_.find(row);
-    if (it != rowAddr_.end()) cursor_ = it->second;
+  // マウス左押下: 選択開始を記録（離すときにドラッグなら範囲コピー、無ければ行フォーカス）。
+  void mouseDown(int col, int row) { selecting_ = true; selMoved_ = false; selR0_ = selR1_ = row; selC0_ = selC1_ = col; }
+  void mouseDrag(int col, int row) { if (!selecting_) return; selR1_ = row; selC1_ = col; selMoved_ = true; }
+  void mouseUp(int col, int row) {
+    if (!selecting_) return; selecting_ = false;
+    if (!selMoved_) { // ドラッグしていない＝クリック: 逆アセンブル行ならその命令へ
+      if (mode_ == Mode::Normal && overlay_.empty() && !cmdMode_) { auto it = rowAddr_.find(row); if (it != rowAddr_.end()) cursor_ = it->second; }
+      return;
+    }
+    selR1_ = row; selC1_ = col;
+    std::string sel = term_.copyRegion(selR0_, selC0_, selR1_, selC1_);
+    if (!sel.empty()) { if (FILE* pb = popen("/usr/bin/pbcopy", "w")) { fwrite(sel.data(), 1, sel.size(), pb); pclose(pb);
+      status_ = tr_.tr(Msg::of(MsgId::UiCopied).num("n", (int64_t)sel.size())); } }
   }
 
   void key(int c) {
     if (mode_ == Mode::Picker) { pickerKey(c); return; }
     if (mode_ == Mode::BpEdit) { bpEditKey(c); return; }
+    if (mode_ == Mode::Syms) { symsKey(c); return; }
     if (!overlay_.empty()) { overlayKey(c); return; }
     if (cmdMode_) { cmdKey(c); return; }
     switch (c) {
@@ -132,9 +145,19 @@ private:
       case 'r': runLine("reg"); break;
       case 'l': layout_ = (layout_ + 1) % 4; status_ = tr_.tr(Msg::of(MsgId::UiLayoutChanged).num("n", layout_ + 1)); break;
       case 'b': { uint64_t a = cursor_ ? cursor_ : dbg_.stopInfo().pc; if (a) dbg_.post(cmd::ToggleBreakpointAt{a}); break; } // カーソル/PC にブレイク
+      case '\t': { auto th = dbg_.threads(); if (th.size() > 1) { focus_ = (focus_ == Focus::Disasm) ? Focus::Threads : Focus::Disasm;
+        if (focus_ == Focus::Threads) for (int i = 0; i < (int)th.size(); i++) // 選択を表示中スレッドへ合わせる
+          if ((viewThread_ == 0 && th[i].isStopThread) || th[i].id == viewThread_) { threadSel_ = i; break; } }
+        break; }
       case KeyEsc: if (dbg_.job().showing) { dbg_.cancel(); status_ = tr_.tr(Msg::of(MsgId::UiSearchCancelled)); } break;
-      case KeyUp:   if (cursor_) cursor_ = dbg_.insnBefore(viewTop(), cursor_); break;
-      case KeyDown: if (cursor_) cursor_ = dbg_.insnAfter(cursor_); break;
+      case KeyUp:
+        if (focus_ == Focus::Threads) threadSelMove(-1);
+        else if (cursor_) cursor_ = dbg_.insnBefore(viewTop(), cursor_);
+        break;
+      case KeyDown:
+        if (focus_ == Focus::Threads) threadSelMove(+1);
+        else if (cursor_) cursor_ = dbg_.insnAfter(cursor_);
+        break;
       default: break;
     }
   }
@@ -154,16 +177,21 @@ private:
   void pickerKey(int c) {
     auto fl = pickFiltered();
     int n = (int)fl.size();
+    int page = std::max(1, term_.rows() - 5);
     switch (c) {
       case KeyEsc: mode_ = Mode::Normal; status_.clear(); break;
       case '\r': case '\n':
         if (n > 0 && pickSel_ < n) { pid_t pid = fl[pickSel_]->pid; mode_ = Mode::Normal; pickFilter_.clear();
           dbg_.post(cmd::Attach{pid}); status_.clear(); }
         break;
-      case KeyUp: case 16 /*C-p*/: if (pickSel_ > 0) pickSel_--; break;
-      case KeyDown: case 14 /*C-n*/: if (pickSel_ < n - 1) pickSel_++; break;
-      case 127: case 8: if (!pickFilter_.empty()) { pickFilter_.pop_back(); pickSel_ = 0; } break;
-      default: if (c >= 0x20 && c < 0x7f) { pickFilter_ += (char)c; pickSel_ = 0; } break;
+      case KeyUp: case 16 /*C-p*/: if (pickSel_ > 0) pickSel_--; pickHScroll_ = 0; break;
+      case KeyDown: case 14 /*C-n*/: if (pickSel_ < n - 1) pickSel_++; pickHScroll_ = 0; break;
+      case 6 /*C-f*/: pickSel_ = std::min(n - 1, pickSel_ + page); pickHScroll_ = 0; break;
+      case 2 /*C-b*/: pickSel_ = std::max(0, pickSel_ - page); pickHScroll_ = 0; break;
+      case KeyRight: pickHScroll_ += 8; break;          // 引数を右へスクロール
+      case KeyLeft:  pickHScroll_ = std::max(0, pickHScroll_ - 8); break;
+      case 127: case 8: if (!pickFilter_.empty()) { pickFilter_.pop_back(); pickSel_ = 0; pickHScroll_ = 0; } break;
+      default: if (c >= 0x20 && c < 0x7f) { pickFilter_ += (char)c; pickSel_ = 0; pickHScroll_ = 0; } break;
     }
   }
 
@@ -177,7 +205,48 @@ private:
       case KeyDown: if (bpeSel_ < n - 1) bpeSel_++; break;
       case ' ': if (n > 0) { dbg_.post(cmd::ToggleEnabled{BpRef(bpe_[bpeSel_].id)}); } break;        // 有効⇄無効
       case 'd': case 127: if (n > 0) { dbg_.post(cmd::RemoveBreakpoint{BpRef(bpe_[bpeSel_].id)}); } break; // 削除
+      case 'h': if (n > 0) { const auto& b = bpe_[bpeSel_]; // Soft⇄HW 実行 切替（ウォッチは対象外）
+        if (b.kind == BpKind::Soft || b.kind == BpKind::HwExec) {
+          BpKind nk = (b.kind == BpKind::Soft) ? BpKind::HwExec : BpKind::Soft;
+          dbg_.post(cmd::RebuildBreakpoint{b.id, nk, b.addr, {}});
+          status_ = tr_.tr(Msg::of(MsgId::UiBpEditKindToggled).num("id", b.id).str("kind", nk == BpKind::HwExec ? "HW" : "SW"));
+        } } break;
       default: break;
+    }
+  }
+
+  // ---- 対話シンボル一覧（:syms） ----
+  static bool fuzzySubseq(const std::string& hay, const std::string& pat) {
+    if (pat.empty()) return true;
+    size_t j = 0;
+    for (size_t i = 0; i < hay.size() && j < pat.size(); i++) if (hay[i] == pat[j]) j++;
+    return j == pat.size();
+  }
+  void symsRebuild() {
+    std::string lf; for (char c : symsFilter_) lf += (char)std::tolower((unsigned char)c);
+    symsHits_.clear();
+    for (const auto& e : symsAll_) {
+      std::string ln; for (char c : e.name) ln += (char)std::tolower((unsigned char)c);
+      // 空白区切りの各語が名前の部分列であれば一致（AND）
+      bool ok = true; size_t i = 0, n = lf.size();
+      while (i < n) { while (i < n && lf[i] == ' ') i++; size_t s = i; while (i < n && lf[i] != ' ') i++;
+        if (s < i && !fuzzySubseq(ln, lf.substr(s, i - s))) { ok = false; break; } }
+      if (ok) symsHits_.push_back(&e);
+    }
+    if (symsSortAddr_) std::sort(symsHits_.begin(), symsHits_.end(), [](const SymbolEntry* a, const SymbolEntry* b){ return a->addr < b->addr; });
+    else std::sort(symsHits_.begin(), symsHits_.end(), [](const SymbolEntry* a, const SymbolEntry* b){ return a->name < b->name; });
+    if (symsSel_ >= (int)symsHits_.size()) symsSel_ = std::max(0, (int)symsHits_.size() - 1);
+  }
+  void symsKey(int c) {
+    int n = (int)symsHits_.size();
+    switch (c) {
+      case KeyEsc: mode_ = Mode::Normal; status_.clear(); break;
+      case '\r': case '\n': if (n > 0 && symsSel_ < n) dbg_.post(cmd::ToggleBreakpointAt{symsHits_[symsSel_]->addr}); break;
+      case '\t': symsSortAddr_ = !symsSortAddr_; symsRebuild(); break;
+      case KeyUp:   if (symsSel_ > 0) symsSel_--; break;
+      case KeyDown: if (symsSel_ < n - 1) symsSel_++; break;
+      case 127: case 8: if (!symsFilter_.empty()) { symsFilter_.pop_back(); symsRebuild(); } break;
+      default: if (c >= 0x20 && c < 0x7f) { symsFilter_ += (char)c; symsRebuild(); } break;
     }
   }
   void cmdKey(int c) {
@@ -224,7 +293,7 @@ private:
     std::vector<Msg> notices; bool stopped = false;
     { std::lock_guard<std::mutex> lk(sink_.mu); fin.swap(sink_.finished); notices.swap(sink_.notices);
       stopped = sink_.justStopped; sink_.justStopped = false; }
-    if (stopped) { cursor_ = 0; status_.clear(); } // 新しい停止は PC 追従・前の結果行を消す
+    if (stopped) { cursor_ = 0; status_.clear(); viewThread_ = 0; threadSel_ = 0; focus_ = Focus::Disasm; } // 新しい停止は停止スレッドへ・PC 追従
     for (auto& m : notices) { std::string s = tr_.tr(m); if (!s.empty()) status_ = s; }
     for (auto& [req, res] : fin) {
       // 結果メッセージを状態行へ（＋アドレス記述）
@@ -278,7 +347,11 @@ private:
       case UiAction::ShowBreakpoints: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleBreakpoints)), report_.breakpoints(dbg_.breakpoints())); break;
       case UiAction::ShowImages: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleImages)), report_.images(dbg_.images())); break;
       case UiAction::ShowSegments: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSegments)), report_.segments(dbg_.segments(a.text))); break;
-      case UiAction::ShowSymbols: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSymbols)), report_.symbols(dbg_.symbols(a.text, a.text2, 0))); break;
+      case UiAction::ShowSymbols: { // 対話シンボル一覧（絞込・並び替え・Enter でブレイク）
+        SymbolPage sp = dbg_.symbols(a.text, "", 0); // 全件取得（絞込は TUI 側で）
+        symsAll_ = sp.entries; symsImage_ = sp.image; symsFilter_ = a.text2; symsSortAddr_ = true; symsSel_ = symsTop_ = 0;
+        symsRebuild(); mode_ = Mode::Syms; break;
+      }
       case UiAction::ShowAnnotations: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleAnnotations)), report_.annotations(dbg_.annotations(a.text))); break;
       case UiAction::ShowHelp: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleHelp)), report_.help()); break;
       case UiAction::ShowDefaultLib: { std::string d = dbg_.defaultLib(); status_ = d.empty() ? tr_.tr(Msg::of(MsgId::UiDefaultLibAutoShort)) : tr_.tr(Msg::of(MsgId::UiDefaultLib).str("name", d)); break; }
@@ -322,14 +395,30 @@ private:
     openOverlay("x", report_.examine(ex));
   }
 
+  // 表示中スレッドの PC。停止スレッドは stopInfo、別スレッドは rip/pc レジスタから。
+  uint64_t threadPc(ThreadId t) {
+    if (t == 0) return dbg_.stopInfo().pc;
+    auto rs = dbg_.registers(t);
+    for (const auto& r : rs.regs) if (r.name == "rip" || r.name == "pc") return r.value;
+    return 0;
+  }
   // 表示スレッドの PC（停止中）。cursor_=0 は「PC 追従」。
-  uint64_t viewTop() { uint64_t pc = 0; auto si = dbg_.stopInfo(); pc = si.pc; return cursor_ ? cursor_ : pc; }
+  uint64_t viewTop() { return cursor_ ? cursor_ : threadPc(viewThread_); }
+
+  // スレッド選択を dir 方向へ動かし、表示中スレッドを更新（逆アセ/reg/bt が追従）。
+  void threadSelMove(int dir) {
+    auto th = dbg_.threads(); int n = (int)th.size(); if (n == 0) return;
+    threadSel_ = std::max(0, std::min(n - 1, threadSel_ + dir));
+    viewThread_ = th[threadSel_].isStopThread ? 0 : th[threadSel_].id;
+    cursor_ = 0; // 新スレッドは PC 追従
+  }
 
   // ---- 描画 ----
   void render() {
     int rows = term_.rows(), cols = term_.cols();
     if (mode_ == Mode::Picker) { renderPicker(rows, cols); return; }
     if (mode_ == Mode::BpEdit) { renderBpEdit(rows, cols); return; }
+    if (mode_ == Mode::Syms) { renderSyms(rows, cols); return; }
     if (!overlay_.empty()) { renderOverlay(rows, cols); return; }
     // ヘッダ
     std::string state = dbg_.state() == RunState::Stopped ? "stopped" : dbg_.state() == RunState::Running ? "running" : "idle";
@@ -360,19 +449,43 @@ private:
       case 3: R = 12; B = 3; break;
       default: break;
     }
-    int D = rows - 1 - R - B - 1; if (D < 3) { D = std::max(3, rows - 2); R = 0; B = 0; }
+    // マルチスレッドのときだけスレッド枠 T（見出し＋最大 4 行）を確保。
+    auto th = dbg_.threads();
+    int T = (th.size() > 1 && layout_ != 2) ? std::min(5, 1 + (int)th.size()) : 0;
+    int D = rows - 1 - R - B - T - 1; if (D < 3) { D = std::max(3, rows - 2); R = B = T = 0; }
     int row = 1;
     row = renderDisasm(row, D, cols);
     if (R > 0) row = renderRegs(row, R, cols);
+    if (T > 0) row = renderThreads(row, T, cols, th);
     if (B > 0) row = renderBacktrace(row, B, cols);
     renderBottom(rows, cols);
     term_.flush();
   }
 
+  // スレッド枠（★=停止スレッド / 👁=表示中。Tab でフォーカスし ↑↓ で表示切替）。
+  int renderThreads(int top, int h, int cols, const std::vector<ThreadInfo>& th) {
+    bool focus = (focus_ == Focus::Threads);
+    ThreadId viewT = viewThread_;
+    std::string title = std::string(focus ? "▶" : "") + "threads " + std::to_string(th.size());
+    term_.putAt(0, top, "\x1b[2m" + title + "\x1b[0m");
+    int y = 1;
+    for (int i = 0; i < (int)th.size() && y < h; i++, y++) {
+      const auto& t = th[i];
+      bool isView = (viewT == 0 && t.isStopThread) || (viewT != 0 && t.id == viewT);
+      char tb[64]; snprintf(tb, sizeof(tb), "%s%s tid 0x%x", t.isStopThread ? "★" : "  ", isView ? "👁" : "  ", (unsigned)t.id);
+      std::string s = tb;
+      if (focus && i == threadSel_) s = "\x1b[7m" + ui::fitWidth(s, cols) + "\x1b[0m";
+      else s = ui::fitWidth(s, cols);
+      term_.putAt(0, top + y, s);
+    }
+    for (; y < h; y++) term_.clearLine(top + y);
+    return top + h;
+  }
+
   int renderDisasm(int top, int h, int cols) {
     // 関数見出し・ソース行も 1 行と数えて枠の高さ h で打ち切る（withSource + maxRows）。
     DisasmOptions o; o.withSource = true; o.maxRows = h;
-    DisasmResult dr = dbg_.disassemble(viewTop(), h, o);
+    DisasmResult dr = dbg_.disassemble(viewTop(), h, o, viewThread_);
     rowAddr_.clear();
     int y = 0;
     std::string lastSrc; // 直前に出したソース行（重複抑制）
@@ -418,6 +531,7 @@ private:
       std::string na = p->attachable ? "" : ("  \x1b[2m" + tr_.tr(Msg::of(MsgId::UiPickerNotAttachable)) + "\x1b[0m");
       std::string body = std::string(pb) + p->name + (p->args.empty() ? "" : (" " + p->args)) + na;
       bool sel = (i == pickSel_);
+      if (sel && pickHScroll_ > 0 && pickHScroll_ < (int)body.size()) body = "…" + body.substr(pickHScroll_); // 選択行だけ横スクロール
       term_.putAt(0, listTop + y, (sel ? "\x1b[7m" : "") + ui::fitWidth((sel ? "▸ " : "  ") + body, cols) + (sel ? "\x1b[0m" : ""));
     }
     for (; y < avail; y++) term_.clearLine(listTop + y);
@@ -447,8 +561,36 @@ private:
     term_.flush();
   }
 
+  // 対話シンボル一覧（:syms）: 絞込・並び替え・Enter でブレイク設定/解除。
+  void renderSyms(int rows, int cols) {
+    std::string sort = tr_.tr(Msg::of(symsSortAddr_ ? MsgId::UiSymsSortAddr : MsgId::UiSymsSortName));
+    std::string title = tr_.tr(Msg::of(MsgId::UiSymsTitle).str("image", symsImage_).num("hits", (int64_t)symsHits_.size())
+                                 .num("total", (int64_t)symsAll_.size()).str("sort", sort));
+    term_.putAt(0, 0, "\x1b[7m" + ui::fitWidth(title, cols) + "\x1b[0m");
+    term_.putAt(0, 1, ui::fitWidth(tr_.tr(Msg::of(MsgId::UiSymsFilter)) + symsFilter_ + "\x1b[7m \x1b[0m", cols));
+    term_.clearLine(2);
+    // いまブレイクがあるアドレス集合（● 印用）
+    std::unordered_map<uint64_t, bool> bpAddr; for (const auto& b : dbg_.breakpoints()) bpAddr[b.addr] = true;
+    int listTop = 3, avail = rows - listTop - 1;
+    if (symsSel_ < symsTop_) symsTop_ = symsSel_;
+    if (symsSel_ >= symsTop_ + avail) symsTop_ = symsSel_ - avail + 1;
+    if (symsHits_.empty()) term_.putAt(0, listTop, ui::fitWidth("  " + tr_.tr(Msg::of(MsgId::UiSymsEmpty)), cols));
+    int y = 0;
+    for (int i = symsTop_; i < (int)symsHits_.size() && y < avail; i++, y++) {
+      const SymbolEntry* e = symsHits_[i];
+      std::string mark = bpAddr.count(e->addr) ? "\x1b[31m●\x1b[0m" : " ";
+      char ab[24]; snprintf(ab, sizeof(ab), "0x%012llx", (unsigned long long)e->addr);
+      std::string body = mark + " " + ab + "  " + e->name;
+      bool sel = (i == symsSel_);
+      term_.putAt(0, listTop + y, (sel ? "\x1b[7m" : "") + ui::fitWidth((sel ? "▸" : " ") + body, cols) + (sel ? "\x1b[0m" : ""));
+    }
+    for (; y < avail; y++) term_.clearLine(listTop + y);
+    term_.putAt(0, rows - 1, "\x1b[2m" + ui::fitWidth(tr_.tr(Msg::of(MsgId::UiSymsHint)), cols) + "\x1b[0m");
+    term_.flush();
+  }
+
   int renderRegs(int top, int h, int cols) {
-    auto rs = dbg_.registers();
+    auto rs = dbg_.registers(viewThread_);
     std::vector<std::string> cells;
     for (auto& r : rs.regs) { char b[48]; snprintf(b, sizeof(b), "%-6s=0x%016llx", r.name.c_str(), (unsigned long long)r.value); cells.push_back(b); }
     int colW = 26, ncol = std::max(1, cols / colW), y = 0;
@@ -463,7 +605,7 @@ private:
 
   int renderBacktrace(int top, int h, int cols) {
     term_.putAt(0, top, "\x1b[2mbacktrace\x1b[0m");
-    auto frames = dbg_.backtrace();
+    auto frames = dbg_.backtrace(viewThread_, viewThread_ != 0); // 別スレッドは軽量走査
     int y = 1;
     for (auto& f : frames) { if (y >= h) break; term_.putAt(0, top + y, ui::fitWidth("  " + report_.frame(f), cols)); y++; }
     for (; y < h; y++) term_.clearLine(top + y);
@@ -499,8 +641,12 @@ private:
   ui::Terminal term_;
   SubscriptionId sub_ = 0;
 
-  enum class Mode { Normal, Picker, BpEdit }; // 全画面の対話モード（プロセスピッカ／ブレイク編集）
+  enum class Mode { Normal, Picker, BpEdit, Syms }; // 全画面の対話モード
   Mode mode_ = Mode::Normal;
+  enum class Focus { Disasm, Threads };       // ↑↓ の対象（Tab で切替）
+  Focus focus_ = Focus::Disasm;
+  ThreadId viewThread_ = 0;  // 表示中スレッド（0=停止スレッド）。他スレッドの reg/逆アセ/bt を覗く
+  int threadSel_ = 0;        // スレッド一覧の選択位置
 
   bool quit_ = false, cmdMode_ = false;
   std::string cmdline_, status_;
@@ -513,11 +659,15 @@ private:
   // :x（式なし）の継続位置。継続を持つのは L3（CommandInterpreter.cpp hExamine 参照）。
   std::string lastExSpec_; uint64_t lastExAddr_ = 0; bool haveLastEx_ = false;
   // プロセスピッカ（:attach 無引数）
-  std::vector<ProcessInfo> pick_; std::string pickFilter_; int pickSel_ = 0, pickTop_ = 0;
+  std::vector<ProcessInfo> pick_; std::string pickFilter_; int pickSel_ = 0, pickTop_ = 0, pickHScroll_ = 0;
   // ブレイク編集（:be）
   std::vector<BreakpointInfo> bpe_; int bpeSel_ = 0, bpeTop_ = 0;
+  // 対話シンボル一覧（:syms）
+  std::vector<SymbolEntry> symsAll_; std::vector<const SymbolEntry*> symsHits_;
+  std::string symsImage_, symsFilter_; bool symsSortAddr_ = true; int symsSel_ = 0, symsTop_ = 0;
   // マウス: 逆アセンブル画面の各行→命令アドレス（クリックでカーソル移動）
   std::unordered_map<int, uint64_t> rowAddr_;
+  bool selecting_ = false, selMoved_ = false; int selR0_ = 0, selC0_ = 0, selR1_ = 0, selC1_ = 0; // ドラッグ選択
 };
 
 } // namespace

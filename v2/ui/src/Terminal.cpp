@@ -1,5 +1,6 @@
 #include "ui/Terminal.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -7,9 +8,28 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 
+#if defined(__APPLE__)
+#include <Carbon/Carbon.h> // TIS 入力ソース（システムフレームワーク。依存は増やさない）
+#endif
+
 namespace ta2 {
 namespace ui {
 
+namespace {
+#if defined(__APPLE__)
+// TUI 起動時に一度だけ IME を半角（ASCII 可能なキーボードレイアウト）へ切り替える。日本語入力の
+// まま起動してもコマンドが全角で弾かれないように。以後は固定しない（メモ入力等で全角に戻せる）。
+// best-effort で、失敗・GUI セッション無しでも無視する。
+void switchToAsciiInputSourceOnce() {
+  TISInputSourceRef ascii = TISCopyCurrentASCIICapableKeyboardInputSource();
+  if (!ascii) return;
+  TISSelectInputSource(ascii);
+  CFRelease(ascii);
+}
+#else
+void switchToAsciiInputSourceOnce() {}
+#endif
+} // namespace
 namespace {
 // UTF-8 の 1 文字を取り出し、コードポイントとバイト数を返す。壊れていれば 1 バイトとして進める。
 uint32_t decodeUtf8(const std::string& s, size_t i, int& len) {
@@ -86,6 +106,8 @@ void Terminal::enter() {
     tcsetattr(STDIN_FILENO, TCSANOW, &raw);
   }
   refreshSize();
+  ensureCells();
+  switchToAsciiInputSourceOnce(); // 起動時だけ IME を半角へ（固定はしない）
   buf_ = "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H"; // 代替画面・カーソル非表示・全消去・原点
   flush();
   entered_ = true;
@@ -113,12 +135,47 @@ void Terminal::refreshSize() {
   }
 }
 
-void Terminal::clear() { buf_ += "\x1b[2J\x1b[H"; }
-void Terminal::clearLine(int row) { char b[32]; snprintf(b, sizeof(b), "\x1b[%d;1H\x1b[2K", row + 1); buf_ += b; }
+void Terminal::ensureCells() {
+  if ((int)cells_.size() != rows_) cells_.assign(rows_, std::vector<std::string>(cols_, " "));
+  for (auto& r : cells_) if ((int)r.size() != cols_) r.assign(cols_, " ");
+}
+
+void Terminal::clear() { buf_ += "\x1b[2J\x1b[H"; ensureCells(); for (auto& r : cells_) std::fill(r.begin(), r.end(), std::string(" ")); }
+void Terminal::clearLine(int row) {
+  char b[32]; snprintf(b, sizeof(b), "\x1b[%d;1H\x1b[2K", row + 1); buf_ += b;
+  ensureCells(); if (row >= 0 && row < rows_) std::fill(cells_[row].begin(), cells_[row].end(), std::string(" "));
+}
 
 void Terminal::putAt(int col, int row, const std::string& s) {
   char b[32]; snprintf(b, sizeof(b), "\x1b[%d;%dH", row + 1, col + 1);
   buf_ += b; buf_ += s; buf_ += "\x1b[K"; // 行末までクリア（残骸消し）
+  // コピー用セルモデルも更新（ANSI 除去・全角 2 セル）。行末までクリア相当に残りも空白化。
+  ensureCells();
+  if (row < 0 || row >= rows_) return;
+  int c = col;
+  for (size_t i = 0; i < s.size();) {
+    if (size_t a = ansiLen(s, i)) { i += a; continue; }
+    int len = 1; uint32_t cp = decodeUtf8(s, i, len); int w = cpWidth(cp);
+    if (c >= 0 && c < cols_) cells_[row][c] = s.substr(i, len);
+    if (w == 2 && c + 1 >= 0 && c + 1 < cols_) cells_[row][c + 1] = "";
+    c += (w > 0 ? w : 1); i += len;
+  }
+  for (; c < cols_; c++) if (c >= 0) cells_[row][c] = " "; // 行末までクリア
+}
+
+std::string Terminal::copyRegion(int r0, int c0, int r1, int c1) const {
+  if (r0 > r1 || (r0 == r1 && c0 > c1)) { std::swap(r0, r1); std::swap(c0, c1); }
+  std::string out;
+  for (int r = r0; r <= r1 && r < (int)cells_.size(); r++) {
+    if (r < 0) continue;
+    int a = (r == r0) ? c0 : 0;
+    int b = (r == r1) ? c1 : cols_ - 1;
+    std::string line;
+    for (int c = std::max(0, a); c <= b && c < cols_; c++) line += cells_[r][c];
+    while (!line.empty() && line.back() == ' ') line.pop_back(); // 末尾空白を除く
+    out += line; if (r < r1) out += "\n";
+  }
+  return out;
 }
 
 void Terminal::flush() {

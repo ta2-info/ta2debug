@@ -142,7 +142,9 @@ set(TA2TUI_SOURCES
   app/ta2tui.cpp
 )
 add_executable(ta2tui ${TA2TUI_SOURCES})
-target_link_libraries(ta2tui PRIVATE ta2ui ta2i18n ta2engine ta2v2opts)
+# Carbon: 起動時に IME を半角へ切り替える TIS 入力ソース API 用（システムフレームワーク。依存は増やさない）。
+find_library(CARBON_LIBRARY Carbon)
+target_link_libraries(ta2tui PRIVATE ta2ui ta2i18n ta2engine ta2v2opts ${CARBON_LIBRARY})
 
 # ---- 非ホストアーキのコンパイル検査（リンクなし。設計書 §9.3） ----
 # x86_64 ホストでは -arch arm64、arm64 ホストでは -arch x86_64 で ta2base / ta2platform / ta2core の
