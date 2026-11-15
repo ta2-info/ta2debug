@@ -195,17 +195,17 @@ private:
   void handleUi(const UiAction& a) {
     switch (a.kind) {
       case UiAction::Quit: quit_ = true; break;
-      case UiAction::ShowRegisters: openOverlay("レジスタ", report_.registers(dbg_.registers())); break;
-      case UiAction::ShowRegister: { uint64_t v = 0; if (dbg_.readRegister(a.text, v)) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v); status_ = a.text + " = " + b; } else status_ = "不明なレジスタ: " + a.text; break; }
-      case UiAction::ShowBreakpoints: openOverlay("ブレイク", report_.breakpoints(dbg_.breakpoints())); break;
-      case UiAction::ShowImages: openOverlay("イメージ", report_.images(dbg_.images())); break;
-      case UiAction::ShowSegments: openOverlay("セグメント", report_.segments(dbg_.segments(a.text))); break;
-      case UiAction::ShowSymbols: openOverlay("シンボル", report_.symbols(dbg_.symbols(a.text, a.text2, 0))); break;
-      case UiAction::ShowAnnotations: openOverlay("注釈", report_.annotations(dbg_.annotations(a.text))); break;
-      case UiAction::ShowHelp: openOverlay("ヘルプ", report_.help()); break;
-      case UiAction::ShowDefaultLib: { std::string d = dbg_.defaultLib(); status_ = d.empty() ? "既定ライブラリ: (自動)" : ("既定ライブラリ: " + d); break; }
+      case UiAction::ShowRegisters: openOverlay(tr_.tr(Msg::of(MsgId::UiRegsTitle)), report_.registers(dbg_.registers())); break;
+      case UiAction::ShowRegister: { uint64_t v = 0; if (dbg_.readRegister(a.text, v)) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v); status_ = a.text + " = " + b; } else status_ = tr_.tr(Msg::of(MsgId::UiUnknownRegister).str("name", a.text)); break; }
+      case UiAction::ShowBreakpoints: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleBreakpoints)), report_.breakpoints(dbg_.breakpoints())); break;
+      case UiAction::ShowImages: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleImages)), report_.images(dbg_.images())); break;
+      case UiAction::ShowSegments: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSegments)), report_.segments(dbg_.segments(a.text))); break;
+      case UiAction::ShowSymbols: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleSymbols)), report_.symbols(dbg_.symbols(a.text, a.text2, 0))); break;
+      case UiAction::ShowAnnotations: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleAnnotations)), report_.annotations(dbg_.annotations(a.text))); break;
+      case UiAction::ShowHelp: openOverlay(tr_.tr(Msg::of(MsgId::UiTitleHelp)), report_.help()); break;
+      case UiAction::ShowDefaultLib: { std::string d = dbg_.defaultLib(); status_ = d.empty() ? tr_.tr(Msg::of(MsgId::UiDefaultLibAutoShort)) : tr_.tr(Msg::of(MsgId::UiDefaultLib).str("name", d)); break; }
       case UiAction::FollowPc: cursor_ = 0; break; // PC へ追従
-      default: status_ = "（この正面では未対応のコマンドです）"; break;
+      default: status_ = tr_.tr(Msg::of(MsgId::UiCmdUnsupported)); break;
     }
   }
 
@@ -233,8 +233,8 @@ private:
     term_.putAt(0, 0, "\x1b[7m" + ui::fitWidth(hdr, cols) + "\x1b[0m");
 
     if (dbg_.state() != RunState::Stopped) {
-      term_.putAt(0, 2, dbg_.state() == RunState::Running ? "(実行中。ブレイクに当たると停止します)"
-                                                          : ":run <パス> / :attach <pid> で開始   :help   :q で終了");
+      term_.putAt(0, 2, dbg_.state() == RunState::Running ? tr_.tr(Msg::of(MsgId::UiRunningHint))
+                                                          : tr_.tr(Msg::of(MsgId::UiIdleHint)));
       renderBottom(rows, cols);
       term_.flush();
       return;
@@ -297,7 +297,7 @@ private:
 
   void renderOverlay(int rows, int cols) {
     std::string title = overlay_.empty() ? "" : overlay_[0];
-    term_.putAt(0, 0, "\x1b[33m" + ui::fitWidth(title + "   \x1b[2m(↑↓ Space/b ページ  g/G 端  ESC/q 閉じる)", cols) + "\x1b[0m");
+    term_.putAt(0, 0, "\x1b[33m" + ui::fitWidth(title + "   \x1b[2m" + tr_.tr(Msg::of(MsgId::UiPagerHint)), cols) + "\x1b[0m");
     int avail = rows - 2, y = 0;
     for (; y < avail; y++) {
       int idx = 1 + overlayTop_ + y;

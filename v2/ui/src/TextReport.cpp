@@ -31,22 +31,22 @@ std::string TextReport::stopReason(const StopInfo& si) const {
   // 例外は強調＋通常終了ヒント、syscall キャッチ・auto はそれぞれの Msg。notes は「  ／ 」連結。
   std::string s;
   if (!si.reason.empty()) {
-    std::string r = tr_.tr(si.reason);
     if (si.kind == StopKind::Exception)
-      s = "⚠ " + r + "  — c で対象を通常終了（シグナルを本来のハンドラへ通す）";
+      s = tr_.tr(Msg::of(MsgId::UiCrashHint).sub("reason", si.reason));
     else
-      s = r;
+      s = tr_.tr(si.reason);
   } else if (si.autoStop == AutoStop::Limit) {
-    s = "auto → 上限 で停止（" + std::to_string(si.autoSteps) + " 命令）";
+    s = tr_.tr(Msg::of(MsgId::UiAutoLimit).num("n", si.autoSteps));
   } else if (si.autoStop == AutoStop::Interrupted) {
-    s = "auto → 割り込みで停止（" + std::to_string(si.autoSteps) + " 命令）";
+    s = tr_.tr(Msg::of(MsgId::UiAutoInterrupted).num("n", si.autoSteps));
   } else if (si.autoStop != AutoStop::None) {
     const char* k = si.autoStop == AutoStop::Call ? "call" : si.autoStop == AutoStop::Syscall ? "syscall" : "ret";
-    s = std::string("auto → ") + k + " で停止（" + std::to_string(si.autoSteps) + " 命令）";
+    s = tr_.tr(Msg::of(MsgId::UiAutoKind).str("kind", k).num("n", si.autoSteps));
   }
+  std::string sep = tr_.tr(Msg::of(MsgId::UiNoteSep));
   for (const auto& n : si.notes) {
     std::string t = tr_.tr(n);
-    if (!t.empty()) s += (s.empty() ? "" : "  ／ ") + t;
+    if (!t.empty()) s += (s.empty() ? "" : sep) + t;
   }
   return s;
 }
@@ -87,8 +87,8 @@ std::vector<std::string> TextReport::stopReport(const StopInfo& si,
 
 std::vector<std::string> TextReport::registers(const RegistersSnapshot& rs) const {
   std::vector<std::string> out;
-  if (!rs.valid) { out.push_back("（停止していません）"); return out; }
-  out.push_back("レジスタ");
+  if (!rs.valid) { out.push_back(tr_.tr(Msg::of(MsgId::UiNotStopped))); return out; }
+  out.push_back(tr_.tr(Msg::of(MsgId::UiRegsTitle)));
   for (const auto& r : rs.regs) {
     char b[80]; snprintf(b, sizeof(b), "%-7s = 0x%016llx", r.name.c_str(), (unsigned long long)r.value);
     out.push_back(b);
@@ -98,26 +98,28 @@ std::vector<std::string> TextReport::registers(const RegistersSnapshot& rs) cons
 
 std::vector<std::string> TextReport::breakpoints(const std::vector<BreakpointInfo>& bps) const {
   std::vector<std::string> out;
-  out.push_back("ブレイク " + std::to_string(bps.size()) + " 件");
+  out.push_back(tr_.tr(Msg::of(MsgId::UiBpCount).num("n", (int64_t)bps.size())));
+  std::string en = tr_.tr(Msg::of(MsgId::UiEnabled)), dis = tr_.tr(Msg::of(MsgId::UiDisabled));
   for (const auto& b : bps) {
     const char* k = b.kind == BpKind::Soft ? "SW" : b.kind == BpKind::HwExec ? "HW" : "WATCH";
+    const char* on = b.enabled ? en.c_str() : dis.c_str();
     char line[256];
     if (b.kind == BpKind::Watch)
       snprintf(line, sizeof(line), "#%d  %-5s %s  %s  size=%d %s%s  hits=%llu  %s", b.id, k, hx12(b.addr).c_str(),
-               b.enabled ? "有効" : "無効", b.watchSize, b.onRead ? "r" : "", b.onWrite ? "w" : "",
+               on, b.watchSize, b.onRead ? "r" : "", b.onWrite ? "w" : "",
                (unsigned long long)b.hits, b.symbol.c_str());
     else
       snprintf(line, sizeof(line), "#%d  %-5s %s  %s  hits=%llu  %s", b.id, k, hx12(b.addr).c_str(),
-               b.enabled ? "有効" : "無効", (unsigned long long)b.hits, b.symbol.c_str());
+               on, (unsigned long long)b.hits, b.symbol.c_str());
     out.push_back(line);
   }
-  if (bps.empty()) out.push_back("(ブレイクなし)");
+  if (bps.empty()) out.push_back(tr_.tr(Msg::of(MsgId::UiBpNone)));
   return out;
 }
 
 std::vector<std::string> TextReport::images(const std::vector<ImageInfo>& imgs) const {
   std::vector<std::string> out;
-  out.push_back("イメージ " + std::to_string(imgs.size()) + " 個");
+  out.push_back(tr_.tr(Msg::of(MsgId::UiImgCount).num("n", (int64_t)imgs.size())));
   for (const auto& im : imgs) {
     char b[400]; snprintf(b, sizeof(b), "0x%012llx  +0x%08llx  %s%s", (unsigned long long)im.loadAddr,
                           (unsigned long long)im.textSize, im.name.c_str(), im.isMain ? "  [main]" : "");
@@ -128,37 +130,42 @@ std::vector<std::string> TextReport::images(const std::vector<ImageInfo>& imgs) 
 
 std::vector<std::string> TextReport::segments(const SegmentList& sl) const {
   std::vector<std::string> out;
-  if (!sl.found) { out.push_back("イメージが見つからない"); return out; }
-  out.push_back("セグメント " + sl.image + "（slide " + hx(sl.slide) + "）");
+  if (!sl.found) { out.push_back(tr_.tr(Msg::of(MsgId::UiImageNotFound))); return out; }
+  out.push_back(tr_.tr(Msg::of(MsgId::UiSegTitle).str("image", sl.image).str("slide", hx(sl.slide))));
   for (const auto& s : sl.segments) {
     char b[256]; snprintf(b, sizeof(b), "%-16s 0x%012llx  size 0x%llx", s.name.c_str(),
                           (unsigned long long)(s.vmaddr + sl.slide), (unsigned long long)s.vmsize);
     out.push_back(b);
   }
-  if (sl.segments.empty()) out.push_back("(セグメント情報なし)");
+  if (sl.segments.empty()) out.push_back(tr_.tr(Msg::of(MsgId::UiSegNone)));
   return out;
 }
 
 std::vector<std::string> TextReport::symbols(const SymbolPage& sp) const {
   std::vector<std::string> out;
-  if (!sp.found) { out.push_back("対象イメージが不明"); return out; }
-  out.push_back(sp.image + " のシンボル " + std::to_string(sp.total) + " 個" + (sp.truncated ? "（先頭のみ）" : ""));
+  if (!sp.found) { out.push_back(tr_.tr(Msg::of(MsgId::UiImageUnknown))); return out; }
+  std::string head = tr_.tr(Msg::of(MsgId::UiSymCount).str("image", sp.image).num("n", (int64_t)sp.total));
+  if (sp.truncated) head += tr_.tr(Msg::of(MsgId::UiSymTruncated));
+  out.push_back(head);
   for (const auto& e : sp.entries) out.push_back(hx12(e.addr) + "  " + e.name);
-  if (sp.entries.empty()) out.push_back("(該当なし)");
+  if (sp.entries.empty()) out.push_back(tr_.tr(Msg::of(MsgId::UiSymNone)));
   return out;
 }
 
 std::vector<std::string> TextReport::annotations(const AnnotationList& al) const {
   std::vector<std::string> out;
-  if (!al.found) { out.push_back("イメージが見つからない"); return out; }
-  out.push_back(al.image + " の注釈 " + std::to_string(al.annots.size()) + " 個" + (al.path.empty() ? "（UUID 無し＝保存不可）" : ("  [" + al.path + "]")));
+  if (!al.found) { out.push_back(tr_.tr(Msg::of(MsgId::UiImageNotFound))); return out; }
+  std::string head = tr_.tr(Msg::of(MsgId::UiAnnCount).str("image", al.image).num("n", (int64_t)al.annots.size()));
+  head += al.path.empty() ? tr_.tr(Msg::of(MsgId::UiAnnNoUuidSuffix)) : ("  [" + al.path + "]");
+  out.push_back(head);
+  std::string noname = tr_.tr(Msg::of(MsgId::UiAnnNoName));
   for (const auto& a : al.annots) {
     char b[512]; snprintf(b, sizeof(b), "0x%012llx  (unslid 0x%llx)  %s%s%s", (unsigned long long)(a.unslid + al.slide),
-                          (unsigned long long)a.unslid, a.name.empty() ? "(名前なし)" : a.name.c_str(),
+                          (unsigned long long)a.unslid, a.name.empty() ? noname.c_str() : a.name.c_str(),
                           a.memo.empty() ? "" : "   ; ", a.memo.c_str());
     out.push_back(b);
   }
-  if (al.annots.empty()) out.push_back("(注釈なし)");
+  if (al.annots.empty()) out.push_back(tr_.tr(Msg::of(MsgId::UiAnnNone)));
   return out;
 }
 
@@ -197,13 +204,13 @@ std::vector<std::string> TextReport::examine(const ExamineResult& ex) const {
       }
       break;
   }
-  if (out.empty()) out.push_back("(表示なし)");
+  if (out.empty()) out.push_back(tr_.tr(Msg::of(MsgId::UiExamineNone)));
   return out;
 }
 
 std::vector<std::string> TextReport::help() const {
   std::vector<std::string> out;
-  out.push_back("ta2debug コマンド一覧");
+  out.push_back(tr_.tr(Msg::of(MsgId::UiHelpTitle)));
   for (const auto& sp : CommandInterpreter::table()) {
     std::string line = std::string("  ") + sp.name;
     if (sp.args && sp.args[0]) line += std::string(" ") + sp.args;

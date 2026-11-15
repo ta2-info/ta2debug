@@ -95,7 +95,7 @@ private:
       if (!dbg_.pumpWait(-1)) break;
     }
     drainNotices();
-    if (sink_.sawExit) { emit1("対象プロセスが終了しました"); return; }
+    if (sink_.sawExit) { emit1(tr_.tr(Msg::of(MsgId::UiTargetExited))); return; }
     if (sink_.sawStop) emit(report_.stopReport(sink_.stop, dbg_.backtrace()));
   }
 
@@ -138,7 +138,7 @@ private:
       case UiAction::ShowRegister: {
         uint64_t v = 0;
         if (dbg_.readRegister(a.text, v)) { char b[32]; snprintf(b, sizeof(b), "0x%llx", (unsigned long long)v); emit1(a.text + " = " + b); }
-        else emit1("不明なレジスタ: " + a.text);
+        else emit1(tr_.tr(Msg::of(MsgId::UiUnknownRegister).str("name", a.text)));
         break;
       }
       case UiAction::ShowBreakpoints: emit(report_.breakpoints(dbg_.breakpoints())); break;
@@ -147,24 +147,25 @@ private:
       case UiAction::ShowSymbols: emit(report_.symbols(dbg_.symbols(a.text, a.text2, 0))); break;
       case UiAction::ShowAnnotations: emit(report_.annotations(dbg_.annotations(a.text))); break;
       case UiAction::ShowHelp: emit(report_.help()); break;
-      case UiAction::ShowDefaultLib: { std::string d = dbg_.defaultLib(); emit1(d.empty() ? "既定ライブラリ: (自動＝主実行ファイル)" : ("既定ライブラリ: " + d)); break; }
+      case UiAction::ShowDefaultLib: { std::string d = dbg_.defaultLib();
+        emit1(d.empty() ? tr_.tr(Msg::of(MsgId::UiDefaultLibAuto)) : tr_.tr(Msg::of(MsgId::UiDefaultLib).str("name", d))); break; }
       case UiAction::PrintBacktrace:
         if (dbg_.state() == RunState::Stopped) emit(report_.backtrace(dbg_.backtrace()));
-        else emit1("（停止していません）");
+        else emit1(tr_.tr(Msg::of(MsgId::UiNotStopped)));
         break;
       case UiAction::WaitForStop:
         if (dbg_.state() == RunState::Running) waitAndReport();
-        else emit1("（実行中ではありません）");
+        else emit1(tr_.tr(Msg::of(MsgId::UiNotRunning)));
         break;
       case UiAction::FollowPc: {
-        if (dbg_.state() != RunState::Stopped) { emit1("（停止していません）"); break; }
+        if (dbg_.state() != RunState::Stopped) { emit1(tr_.tr(Msg::of(MsgId::UiNotStopped))); break; }
         DisasmResult dr = dbg_.disassemble(0, 20);
         ExamineResult ex; Msg err;
         if (dbg_.examine(std::to_string(20) + "i", dr.pc, ex, err)) emit(report_.examine(ex));
         break;
       }
       default:
-        emit1("（この正面では未対応のコマンドです）");
+        emit1(tr_.tr(Msg::of(MsgId::UiCmdUnsupported)));
         break;
     }
     return true;

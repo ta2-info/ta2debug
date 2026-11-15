@@ -297,3 +297,57 @@ TA2_MSG(HelpBaseoff,              "help.cmd.baseoff",              "逆アセン
 TA2_MSG(HelpBaseon,               "help.cmd.baseon",               "逆アセンブルのアドレスを 実アドレス(既定) で表示")
 TA2_MSG(HelpMouse,                "help.cmd.mouse",                "マウス操作の ON/OFF（省略でトグル）。ON=クリック/ドラッグ選択コピー、OFF=端末側の選択に戻す")
 TA2_MSG(HelpHelp,                 "help.cmd.help",                 "このヘルプ")
+
+// ===== L3 Presentation（ta2ui / ta2tui / ta2ai）の固定文言 =====
+// 画面の見出し・フッタ・ヒント・区切り。設計書 §8.2 の ui.* 領域（生成元は L3）。i18n 工程 i-2。
+// v2 の TextReport.cpp / ta2ai.cpp / ta2tui.cpp に直書きしていた日本語をここへ集約（バイト単位で一致）。
+// 記号（● ◆ ▸ ⚠ ／ 等）と固定トークン（stopped @ / backtrace: / src: / [bp #N, ...]）は翻訳対象外。
+
+// --- 共通（停止状態・レジスタ名エラー・既定ライブラリ・未対応） ---
+TA2_MSG(UiNotStopped,             "ui.not_stopped",                "（停止していません）")
+TA2_MSG(UiNotRunning,             "ui.not_running",                "（実行中ではありません）")
+TA2_MSG(UiTargetExited,           "ui.target_exited",              "対象プロセスが終了しました")
+TA2_MSG(UiUnknownRegister,        "ui.unknown_register",           "不明なレジスタ: {name}")
+TA2_MSG(UiCmdUnsupported,         "ui.cmd_unsupported",            "（この正面では未対応のコマンドです）")
+TA2_MSG(UiDefaultLib,             "ui.defaultlib",                 "既定ライブラリ: {name}")
+TA2_MSG(UiDefaultLibAuto,         "ui.defaultlib.auto",            "既定ライブラリ: (自動＝主実行ファイル)")
+TA2_MSG(UiDefaultLibAutoShort,    "ui.defaultlib.auto_short",      "既定ライブラリ: (自動)")
+
+// --- 停止理由の整形（TextReport::stopReason。例外ヒント・auto 停止・注記区切り） ---
+TA2_MSG(UiCrashHint,              "ui.crash_hint",                 "⚠ {reason}  — c で対象を通常終了（シグナルを本来のハンドラへ通す）")
+TA2_MSG(UiAutoLimit,              "ui.auto.limit",                 "auto → 上限 で停止（{n} 命令）")
+TA2_MSG(UiAutoInterrupted,        "ui.auto.interrupted",           "auto → 割り込みで停止（{n} 命令）")
+TA2_MSG(UiAutoKind,               "ui.auto.kind",                  "auto → {kind} で停止（{n} 命令）")
+TA2_MSG(UiNoteSep,                "ui.note_sep",                   "  ／ ")
+
+// --- 一覧の見出し・空表示（TextReport） ---
+TA2_MSG(UiRegsTitle,              "ui.regs.title",                 "レジスタ")
+TA2_MSG(UiEnabled,                "ui.enabled",                    "有効")
+TA2_MSG(UiDisabled,               "ui.disabled",                   "無効")
+TA2_MSG(UiBpCount,                "ui.bp.count",                   "ブレイク {n} 件")
+TA2_MSG(UiBpNone,                 "ui.bp.none",                    "(ブレイクなし)")
+TA2_MSG(UiImgCount,               "ui.img.count",                  "イメージ {n} 個")
+TA2_MSG(UiImageNotFound,          "ui.image_not_found",            "イメージが見つからない")
+TA2_MSG(UiImageUnknown,           "ui.image_unknown",              "対象イメージが不明")
+TA2_MSG(UiSegTitle,               "ui.seg.title",                  "セグメント {image}（slide {slide}）")
+TA2_MSG(UiSegNone,                "ui.seg.none",                   "(セグメント情報なし)")
+TA2_MSG(UiSymCount,               "ui.sym.count",                  "{image} のシンボル {n} 個")
+TA2_MSG(UiSymTruncated,           "ui.sym.truncated",              "（先頭のみ）")
+TA2_MSG(UiSymNone,                "ui.sym.none",                   "(該当なし)")
+TA2_MSG(UiAnnCount,               "ui.ann.count",                  "{image} の注釈 {n} 個")
+TA2_MSG(UiAnnNoUuidSuffix,        "ui.ann.no_uuid_suffix",         "（UUID 無し＝保存不可）")
+TA2_MSG(UiAnnNoName,              "ui.ann.no_name",                "(名前なし)")
+TA2_MSG(UiAnnNone,                "ui.ann.none",                   "(注釈なし)")
+TA2_MSG(UiExamineNone,            "ui.examine.none",               "(表示なし)")
+TA2_MSG(UiHelpTitle,              "ui.help.title",                 "ta2debug コマンド一覧")
+
+// --- TUI 専用（オーバレイ見出し・ヒント） ---
+TA2_MSG(UiTitleBreakpoints,       "ui.title.breakpoints",          "ブレイク")
+TA2_MSG(UiTitleImages,            "ui.title.images",               "イメージ")
+TA2_MSG(UiTitleSegments,          "ui.title.segments",             "セグメント")
+TA2_MSG(UiTitleSymbols,           "ui.title.symbols",              "シンボル")
+TA2_MSG(UiTitleAnnotations,       "ui.title.annotations",          "注釈")
+TA2_MSG(UiTitleHelp,              "ui.title.help",                 "ヘルプ")
+TA2_MSG(UiRunningHint,            "ui.running_hint",               "(実行中。ブレイクに当たると停止します)")
+TA2_MSG(UiIdleHint,               "ui.idle_hint",                  ":run <パス> / :attach <pid> で開始   :help   :q で終了")
+TA2_MSG(UiPagerHint,              "ui.pager_hint",                 "(↑↓ Space/b ページ  g/G 端  ESC/q 閉じる)")
