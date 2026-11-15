@@ -38,4 +38,10 @@ private:
 // 例: "ja_JP.UTF-8" → "ja"、"en_US.UTF-8" → "en"、"C"/"POSIX"/未設定 → "ja"。
 std::string detectLocaleLang();
 
+// 言語 lang 用のカタログを組み立てる（§8.3 の解決順）。既定日本語 → 埋め込み（lang）→
+// ユーザ上書き（`$TA2DEBUG_I18N_DIR`、無ければ `~/Library/Application Support/ta2debug/i18n`）の
+// `<lang>.msg`。rep に最後に適用した overlay の結果（未知キー・プレースホルダ不一致）を返す。
+// lang=="ja" や対応カタログが無い言語は既定日本語のまま（表示は欠けない）。
+Catalog loadCatalog(const std::string& lang, Catalog::Report* rep = nullptr);
+
 } // namespace ta2

@@ -57,7 +57,7 @@ struct TuiSink : IEventSink {
 
 class TuiApp {
 public:
-  TuiApp() : dbg_(EngineOptions::interactive()), tr_(Catalog(), detectLocaleLang()),
+  TuiApp() : dbg_(EngineOptions::interactive()), tr_(loadCatalog(detectLocaleLang()), detectLocaleLang()),
              interp_(dbg_), report_(tr_, dbg_) {
     sub_ = dbg_.subscribe(&sink_);
   }

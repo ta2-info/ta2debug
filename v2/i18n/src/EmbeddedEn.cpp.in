@@ -1,0 +1,6 @@
+// 自動生成（CMake configure_file）。元は res/i18n/en.msg。手で編集しない。
+// 生テキストをそのまま文字列リテラルに埋め込む（実行時にファイルを探さない。§8.3）。
+namespace ta2 {
+extern const char kEnMsg[];
+const char kEnMsg[] = R"TA2I18N(@TA2_EN_MSG@)TA2I18N";
+} // namespace ta2

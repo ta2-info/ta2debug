@@ -105,11 +105,20 @@ target_link_libraries(ta2engine PUBLIC ta2core ta2platform ta2base PRIVATE ta2v2
 # ---- ta2i18n（横断。L3 Presentation だけがリンクする） ----
 # Catalog / Translator。Msg（ta2base）をカタログで翻訳して文字列にする。core/engine には依存しない
 # （翻訳は Presentation 層の仕事なので下位から見えない）。設計書 §8。
+# 追加言語カタログ（res/i18n/<lang>.msg）は configure_file で文字列リテラル化してバイナリへ埋め込む
+# （sudo で動く単体バイナリなので実行時にリソースを探さない。§8.3 i-6）。en.msg が変わると再生成される。
+# en.msg を変えたら手で再 configure する（cmake -B build）。ビルド時 file(READ) で埋め込む。
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/res/i18n/en.msg TA2_EN_MSG)
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/i18n/src/EmbeddedEn.cpp.in
+               ${CMAKE_CURRENT_BINARY_DIR}/EmbeddedEn.cpp @ONLY)
+# 手書きソース（相対パス）。arm64 クロス検査はこの集合を回すので生成ファイルは入れない。
 set(TA2I18N_SOURCES
   i18n/src/Catalog.cpp
   i18n/src/Translator.cpp
+  i18n/src/CatalogLoader.cpp
 )
-add_library(ta2i18n STATIC ${TA2I18N_SOURCES})
+# 生成した埋め込みカタログ（絶対パス）はライブラリにだけ足す（クロス検査からは除外）。
+add_library(ta2i18n STATIC ${TA2I18N_SOURCES} ${CMAKE_CURRENT_BINARY_DIR}/EmbeddedEn.cpp)
 target_include_directories(ta2i18n PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/i18n/include)
 target_link_libraries(ta2i18n PUBLIC ta2base PRIVATE ta2v2opts)
 

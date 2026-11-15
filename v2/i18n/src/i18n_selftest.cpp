@@ -84,6 +84,31 @@ int main() {
     check(mism, "overlay: プレースホルダ不一致 bp.set を検出");
   }
 
+  // 4.5) 埋め込み英語カタログ（i-6）: loadCatalog("en") で全キーが英訳され、未知キー・
+  //      プレースホルダ不一致がゼロ（＝「未訳キーゼロ」の完了条件）。日本語とも別物であること。
+  {
+    setenv("TA2DEBUG_I18N_DIR", "/nonexistent-ta2debug-i18n", 1); // ユーザ上書きを拾わない
+    Catalog::Report rep;
+    Catalog en = loadCatalog("en", &rep);
+    unsetenv("TA2DEBUG_I18N_DIR");
+    check(rep.applied == (int)MsgId::Count_ - 1, "en.msg: 全 MsgId を適用（未訳キーゼロ）",
+          std::to_string(rep.applied), std::to_string((int)MsgId::Count_ - 1));
+    check(rep.unknownKeys.empty(), "en.msg: 未知キーなし");
+    check(rep.placeholderMismatch.empty(), "en.msg: プレースホルダ一致");
+    int sameAsJa = 0;
+    for (uint16_t i = 1; i < (uint16_t)MsgId::Count_; i++) {
+      MsgId id = (MsgId)i;
+      if (en.templateFor(id).empty()) { check(false, std::string("en 空テンプレート: ") + msgKey(id)); break; }
+      if (en.templateFor(id) == def.templateFor(id)) sameAsJa++;
+    }
+    // 記号・固定トークンのみの少数キー（note_sep 等）は英日同一になり得るので緩め（< 10）に。
+    check(sameAsJa < 10, "en.msg: ほぼ全キーが日本語と別文", std::to_string(sameAsJa));
+    Translator ten(en, "en");
+    eq(ten.tr(Msg::of(MsgId::ErrExprDivZero)), "division by zero", "en: err.expr.div_zero");
+    eq(ten.tr(Msg::of(MsgId::BpSet).num("id", 1).hex("addr", 0x100003f46ULL)),
+       "#1 breakpoint set 0x100003f46", "en: bp.set の差し込み");
+  }
+
   // 5) ロケール判定（環境変数）
   {
     unsetenv("LC_ALL"); unsetenv("LC_MESSAGES"); unsetenv("LANG");

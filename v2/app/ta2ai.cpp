@@ -47,7 +47,7 @@ void emit1(const std::string& l) { fwrite(l.data(), 1, l.size(), stdout); fputc(
 class BatchApp {
 public:
   BatchApp()
-    : dbg_(EngineOptions::batch()), tr_(Catalog(), detectLocaleLang()), interp_(dbg_), report_(tr_, dbg_) {
+    : dbg_(EngineOptions::batch()), tr_(loadCatalog(detectLocaleLang()), detectLocaleLang()), interp_(dbg_), report_(tr_, dbg_) {
     sub_ = dbg_.subscribe(&sink_);
   }
   ~BatchApp() { dbg_.unsubscribe(sub_); }
