@@ -8,6 +8,7 @@
 /symbols_selftest
 /target_selftest
 /dtrace_selftest
+/i18n_selftest
 
 # その他
 *.dSYM/

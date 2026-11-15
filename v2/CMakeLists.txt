@@ -102,6 +102,21 @@ add_library(ta2engine STATIC ${TA2ENGINE_SOURCES})
 target_include_directories(ta2engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
 target_link_libraries(ta2engine PUBLIC ta2core ta2platform ta2base PRIVATE ta2v2opts)
 
+# ---- ta2i18n（横断。L3 Presentation だけがリンクする） ----
+# Catalog / Translator。Msg（ta2base）をカタログで翻訳して文字列にする。core/engine には依存しない
+# （翻訳は Presentation 層の仕事なので下位から見えない）。設計書 §8。
+set(TA2I18N_SOURCES
+  i18n/src/Catalog.cpp
+  i18n/src/Translator.cpp
+)
+add_library(ta2i18n STATIC ${TA2I18N_SOURCES})
+target_include_directories(ta2i18n PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/i18n/include)
+target_link_libraries(ta2i18n PUBLIC ta2base PRIVATE ta2v2opts)
+
+# i18n セルフテスト（設計書 §8.8 i-1 の完了条件）。
+add_executable(i18n_selftest i18n/src/i18n_selftest.cpp)
+target_link_libraries(i18n_selftest PRIVATE ta2i18n ta2base ta2v2opts)
+
 # ---- 非ホストアーキのコンパイル検査（リンクなし。設計書 §9.3） ----
 # x86_64 ホストでは -arch arm64、arm64 ホストでは -arch x86_64 で ta2base / ta2platform / ta2core の
 # C++ ソースをすべてコンパイルし、非ホスト側の Arch 実装が SDK ヘッダに対して壊れていない
@@ -120,9 +135,10 @@ file(GLOB_RECURSE _ta2v2_headers CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/platform/include/*
   ${CMAKE_CURRENT_SOURCE_DIR}/core/include/*
   ${CMAKE_CURRENT_SOURCE_DIR}/core/src/*.inc
-  ${CMAKE_CURRENT_SOURCE_DIR}/engine/include/*)
+  ${CMAKE_CURRENT_SOURCE_DIR}/engine/include/*
+  ${CMAKE_CURRENT_SOURCE_DIR}/i18n/include/*)
 set(_ta2v2_cross_objs "")
-foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES} ${TA2ENGINE_SOURCES})
+foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES} ${TA2ENGINE_SOURCES} ${TA2I18N_SOURCES})
   string(REPLACE "/" "_" _obj ${_src})
   set(_obj ${CMAKE_CURRENT_BINARY_DIR}/cross_${_ta2v2_cross_arch}/${_obj}.o)
   add_custom_command(
@@ -133,6 +149,7 @@ foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES} ${
             -I${CMAKE_CURRENT_SOURCE_DIR}/platform/include
             -I${CMAKE_CURRENT_SOURCE_DIR}/core/include
             -I${CMAKE_CURRENT_SOURCE_DIR}/engine/include
+            -I${CMAKE_CURRENT_SOURCE_DIR}/i18n/include
             -I${CAPSTONE_INCLUDE_DIR}
             -c ${CMAKE_CURRENT_SOURCE_DIR}/${_src} -o ${_obj}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${_src} ${_ta2v2_headers}
