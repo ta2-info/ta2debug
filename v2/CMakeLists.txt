@@ -122,6 +122,7 @@ target_link_libraries(i18n_selftest PRIVATE ta2i18n ta2base ta2v2opts)
 # engine（Types.h 経由で core の公開型も）と i18n（Translator）に依存する。
 set(TA2UI_SOURCES
   ui/src/TextReport.cpp
+  ui/src/Terminal.cpp
 )
 add_library(ta2ui STATIC ${TA2UI_SOURCES})
 target_include_directories(ta2ui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ui/include)
@@ -134,6 +135,14 @@ set(TA2AI_SOURCES
 )
 add_executable(ta2ai ${TA2AI_SOURCES})
 target_link_libraries(ta2ai PRIVATE ta2ui ta2i18n ta2engine ta2v2opts)
+
+# ---- ta2tui（L3: 対話 TUI 正面の実行ファイル）----
+# threaded=true のヘッドレス Debugger を IEventSink で購読し、Terminal＋TextReport で描画する。
+set(TA2TUI_SOURCES
+  app/ta2tui.cpp
+)
+add_executable(ta2tui ${TA2TUI_SOURCES})
+target_link_libraries(ta2tui PRIVATE ta2ui ta2i18n ta2engine ta2v2opts)
 
 # ---- 非ホストアーキのコンパイル検査（リンクなし。設計書 §9.3） ----
 # x86_64 ホストでは -arch arm64、arm64 ホストでは -arch x86_64 で ta2base / ta2platform / ta2core の
@@ -157,7 +166,7 @@ file(GLOB_RECURSE _ta2v2_headers CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/i18n/include/*
   ${CMAKE_CURRENT_SOURCE_DIR}/ui/include/*)
 set(_ta2v2_cross_objs "")
-foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES} ${TA2ENGINE_SOURCES} ${TA2I18N_SOURCES} ${TA2UI_SOURCES} ${TA2AI_SOURCES})
+foreach(_src ${TA2BASE_SOURCES} ${TA2PLATFORM_CXX_SOURCES} ${TA2CORE_SOURCES} ${TA2ENGINE_SOURCES} ${TA2I18N_SOURCES} ${TA2UI_SOURCES} ${TA2AI_SOURCES} ${TA2TUI_SOURCES})
   string(REPLACE "/" "_" _obj ${_src})
   set(_obj ${CMAKE_CURRENT_BINARY_DIR}/cross_${_ta2v2_cross_arch}/${_obj}.o)
   add_custom_command(

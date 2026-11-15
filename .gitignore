@@ -10,6 +10,7 @@
 /dtrace_selftest
 /i18n_selftest
 /ta2ai
+/ta2tui
 
 # その他
 *.dSYM/
