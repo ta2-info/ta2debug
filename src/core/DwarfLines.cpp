@@ -15,11 +15,7 @@
 
 namespace ta2 {
 
-// __debug セクション群（必要なものだけ）。line_str は DWARF5 の行テーブル用。
-// dSYM（__DWARF セグメント）と .o（無名セグメント内の __DWARF セクション）の両方から読む。
-struct DwarfSections {
-  std::vector<uint8_t> line, info, abbrev, str, lineStr;
-};
+// DwarfSections は core/DwarfTypes.h で定義（型モジュールと共有）。
 
 namespace {
 
@@ -553,6 +549,7 @@ bool DwarfLines::loadViaDebugMap(const std::string& imagePath, const uint8_t uui
       return true;
     };
     parseLineSections(s, xlate);
+    types_.addSections(s); // .o ごとの型も取り込む（名前先勝ち・レイアウトはアドレス非依存）
     any = true;
   }
   return any;
@@ -569,6 +566,7 @@ bool DwarfLines::loadForImage(const std::string& imagePath, const uint8_t uuid[1
   if (loadDwarfSections(dsym, uuid, s)) {
     // dSYM: アドレスはリンク済み（unslid）なので恒等変換でそのまま取り込む。
     parseLineSections(s, [](uint64_t a, bool, uint64_t& o) { o = a; return true; });
+    types_.addSections(s); // 型情報も同じセクションから取り込む（レイアウトはアドレス非依存）
   } else {
     // dSYM 無し: -g ビルド本体の debug map から各 .o の DWARF を取り込む。
     loadViaDebugMap(imagePath, uuid);
