@@ -1315,6 +1315,7 @@ void examineMemory(const std::string& spec, uint64_t addr) {
   if (!g_session.target().readMemory(addr, buf.data(), total, &got) || got == 0) {
     char m[64]; snprintf(m, sizeof(m), "0x%llx は読めません", (unsigned long long)addr); g_message = m; return;
   }
+  g_session.maskBreakpoints(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（x/i と同じ）
   int avail = (int)(got / (size_t)size); if (avail < count) count = avail;
   snprintf(th, sizeof(th), "メモリ 0x%llx  /%d%c%c", (unsigned long long)addr, count, fmt,
            size==1?'b':size==2?'h':size==4?'w':'g'); g_outputTitle = th;
@@ -1331,6 +1332,14 @@ void examineMemory(const std::string& spec, uint64_t addr) {
   g_xNextAddr = addr + (size_t)count * size; // 継続先
 }
 
+// サイズ無指定の :x で使う既定バイト数。対話(TUI)では出力オーバレイの可視行数ぶん
+// （1 行 16 バイト）＝画面いっぱい。バッチ(-b)は出力安定のため従来どおり 64（スキル/スクリプト互換）。
+int defaultDumpBytes() {
+  if (!g_interactive) return 64;
+  int lines = std::max(1, g_term.rows() - 3); // オーバレイ: title 1 行＋フッタ 1 行を除いた可視行数
+  return std::max(64, lines * 16);
+}
+
 // 従来の 16 進＋ASCII ダンプ。bytes バイト表示し、継続先アドレスを覚える。
 void classicDump(uint64_t addr, int bytes) {
   if (bytes < 1) bytes = 1; if (bytes > 4096) bytes = 4096;
@@ -1338,6 +1347,7 @@ void classicDump(uint64_t addr, int bytes) {
   if (!g_session.target().readMemory(addr, buf.data(), bytes, &got) || got == 0) {
     char m[64]; snprintf(m, sizeof(m), "0x%llx は読めません", (unsigned long long)addr); g_message = m; return;
   }
+  g_session.maskBreakpoints(addr, buf.data(), got); // ソフトブレイクの INT3/BRK を元バイトへ戻す（x/i と同じ）
   g_output.clear(); char th[64]; snprintf(th, sizeof(th), "メモリ 0x%llx (%zu バイト)", (unsigned long long)addr, got); g_outputTitle = th;
   for (size_t i = 0; i < got; i += 16) {
     char line[160]; int n = snprintf(line, sizeof(line), "0x%012llx  ", (unsigned long long)(addr + i));
@@ -1700,9 +1710,8 @@ void runCommand(const std::string& line) {
     evalAsync(toks[0], [spec, toks](bool ok, uint64_t addr, const std::string& eerr) {
       if (!ok) { g_message = "式エラー: " + eerr; return; }
       g_xSpec = spec;
-      if (spec.empty()) { // 従来の 16 進ダンプ（バイト数指定可）
-        g_xClassicBytes = 64;
-        if (toks.size() > 1) { g_xClassicBytes = (int)parseNum(toks[1]); }
+      if (spec.empty()) { // 従来の 16 進ダンプ（バイト数指定可。無指定は画面いっぱい＝defaultDumpBytes）
+        g_xClassicBytes = (toks.size() > 1) ? (int)parseNum(toks[1]) : defaultDumpBytes();
         classicDump(addr, g_xClassicBytes);
       } else {
         examineMemory(spec, addr);
