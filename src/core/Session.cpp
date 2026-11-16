@@ -384,9 +384,83 @@ std::vector<std::pair<std::string, uint64_t>> Session::syscallWatchCounts() {
   return std::vector<std::pair<std::string, uint64_t>>(scCounts_.begin(), scCounts_.end());
 }
 
+namespace {
+// VM リージョンの user_tag が malloc 系（ヒープ）か。VM_MEMORY_MALLOC〜NANO の連番を広めに拾う。
+bool isMallocTag(unsigned t) {
+  return t >= VM_MEMORY_MALLOC && t <= VM_MEMORY_MALLOC_NANO; // 1〜11（malloc 各ゾーン/realloc 等）
+}
+// user_tag を日本語の用途名に。代表的なものだけ名指し、残りは "tag N"。
+std::string userTagName(unsigned t) {
+  switch (t) {
+    case 0:                              return "";
+    case VM_MEMORY_STACK:                return "スタック";
+    case VM_MEMORY_MALLOC:               return "malloc";
+    case VM_MEMORY_MALLOC_TINY:          return "malloc(tiny)";
+    case VM_MEMORY_MALLOC_SMALL:         return "malloc(small)";
+    case VM_MEMORY_MALLOC_LARGE:         return "malloc(large)";
+    case VM_MEMORY_MALLOC_HUGE:          return "malloc(huge)";
+    case VM_MEMORY_MALLOC_NANO:          return "malloc(nano)";
+    case VM_MEMORY_REALLOC:              return "realloc";
+    case VM_MEMORY_MALLOC_LARGE_REUSABLE:return "malloc(large/reusable)";
+    case VM_MEMORY_GUARD:                return "ガードページ";
+    case VM_MEMORY_SHARED_PMAP:          return "共有";
+    case VM_MEMORY_DYLIB:                return "dylib";
+    case VM_MEMORY_DYLD:                 return "dyld";
+    case VM_MEMORY_DYLD_MALLOC:          return "dyld(malloc)";
+    case VM_MEMORY_OS_ALLOC_ONCE:        return "os_alloc_once";
+    case VM_MEMORY_FOUNDATION:           return "Foundation";
+    case VM_MEMORY_COREGRAPHICS:         return "CoreGraphics";
+    case VM_MEMORY_TCMALLOC:             return "tcmalloc/pthread";
+    default: { char b[24]; snprintf(b, sizeof(b), "tag %u", t); return b; }
+  }
+}
+std::string protStr(int prot) {
+  char b[4];
+  b[0] = (prot & VM_PROT_READ)    ? 'r' : '-';
+  b[1] = (prot & VM_PROT_WRITE)   ? 'w' : '-';
+  b[2] = (prot & VM_PROT_EXECUTE) ? 'x' : '-';
+  b[3] = 0;
+  return b;
+}
+// セクション名から「区分」（人間向けの正体ラベル）を決める。
+std::string sectionCategory(const std::string& seg, const std::string& sec, uint32_t flags) {
+  const uint32_t typ = flags & SECTION_TYPE;
+  if (sec == "__text")                            return "コード（関数本体 __text）";
+  if (sec == "__stubs" || sec == "__auth_stubs")  return "シンボルスタブ（PLT 相当）";
+  if (sec == "__stub_helper")                     return "スタブヘルパ";
+  if (seg == "__TEXT" && (flags & S_ATTR_PURE_INSTRUCTIONS)) return "コード（__TEXT 実行領域）";
+  if (sec == "__cstring" || sec == "__ustring")   return "文字列定数";
+  if (sec == "__const")                           return (seg == "__TEXT") ? "読み取り専用定数" : "定数データ（const）";
+  if (sec == "__cfstring")                        return "CFString 定数";
+  if (sec == "__got" || sec == "__auth_got" || typ == S_NON_LAZY_SYMBOL_POINTERS) return "GOT（非遅延シンボルポインタ表）";
+  if (sec == "__la_symbol_ptr" || typ == S_LAZY_SYMBOL_POINTERS) return "遅延シンボルポインタ表";
+  if (sec == "__mod_init_func" || typ == S_MOD_INIT_FUNC_POINTERS) return "初期化関数ポインタ表（グローバルコンストラクタ）";
+  if (sec == "__mod_term_func" || typ == S_MOD_TERM_FUNC_POINTERS) return "終了関数ポインタ表";
+  if (sec == "__bss" || typ == S_ZEROFILL || typ == S_GB_ZEROFILL) return "可変データ（未初期化 .bss）";
+  if (sec == "__common")                          return "可変データ（common）";
+  if (sec == "__data")                            return "可変データ（グローバル/静的）";
+  if (seg == "__DATA_CONST")                      return "定数データ（__DATA_CONST）";
+  if (seg == "__DATA")                            return "データ（__DATA）";
+  if (seg == "__LINKEDIT")                        return "リンク情報（シンボル表/再配置 __LINKEDIT）";
+  if (seg == "__TEXT")                            return "読み取り専用（__TEXT）";
+  return seg + "," + sec;
+}
+} // namespace
+
 std::string Session::describe(uint64_t addr) {
   const Image* img = images_.byAddress(addr);
-  if (!img) return std::string();
+  if (!img) {
+    // イメージ外（スタック/ヒープ/無名）。短いタグだけ付ける（詳しくは :what）。
+    RegionInfo r;
+    if (regionOf(addr, r)) {
+      std::string k = (r.userTag == VM_MEMORY_STACK) ? "スタック"
+                    : isMallocTag(r.userTag)         ? "ヒープ"
+                    : (r.prot & VM_PROT_EXECUTE)     ? "無名コード"
+                    : (r.prot & VM_PROT_WRITE)       ? "無名データ" : "無名(ro)";
+      return "[" + k + "]";
+    }
+    return std::string();
+  }
   char head[64];
   snprintf(head, sizeof(head), "%s 0x%llx", img->name.c_str(),
            (unsigned long long)(addr - img->loadAddr));
@@ -405,6 +479,165 @@ std::string Session::describe(uint64_t addr) {
   if (const Annot* a = annots_.atExact(*img, addr))
     if (!a->memo.empty()) s += "  ; " + a->memo;
   return s;
+}
+
+bool Session::regionOf(uint64_t addr, RegionInfo& out) {
+  task_t task = target_.task();
+  if (!task) return false;
+  mach_vm_address_t a = addr; mach_vm_size_t sz = 0; natural_t depth = 0;
+  for (int i = 0; i < 64; i++) {
+    vm_region_submap_info_data_64_t info = {};
+    mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    kern_return_t kr = mach_vm_region_recurse(task, &a, &sz, &depth, (vm_region_recurse_info_t)&info, &cnt);
+    if (kr != KERN_SUCCESS) return false;
+    if (info.is_submap) { depth++; continue; }      // 共有キャッシュ等のサブマップは一段潜る
+    if (addr < a || addr >= a + sz) return false;    // addr は穴（未マップ）
+    out.ok = true; out.base = a; out.size = sz; out.prot = info.protection;
+    out.userTag = info.user_tag; out.shareMode = info.share_mode;
+    return true;
+  }
+  return false;
+}
+
+std::vector<std::string> Session::whatIs(uint64_t addr) {
+  std::vector<std::string> out;
+  auto push = [&](const std::string& k, const std::string& v) { out.push_back("  " + k + ": " + v); };
+  { char hdr[48]; snprintf(hdr, sizeof(hdr), "0x%llx の正体:", (unsigned long long)addr); out.push_back(hdr); }
+
+  // コード判定: イメージの __text/実行セグメント、または実行権のある無名リージョン。
+  auto isCode = [&](uint64_t a) -> bool {
+    if (const Image* im = images_.byAddress(a)) {
+      if (im->containsStub(a)) return true;
+      if (const Section* sc = im->sectionAt(a))
+        return sc->seg == "__TEXT" && ((sc->flags & S_ATTR_PURE_INSTRUCTIONS) || sc->name == "__text");
+      if (const Segment* sg = im->segmentAt(a)) return (sg->initprot & VM_PROT_EXECUTE) != 0;
+      return false;
+    }
+    RegionInfo r; return regionOf(a, r) && (r.prot & VM_PROT_EXECUTE);
+  };
+  // 対象メモリから C 文字列を maxLen まで読む（非印字は '.'。表示用）。
+  auto readCStr = [&](uint64_t a, size_t maxLen) -> std::string {
+    std::string s; char c;
+    for (size_t i = 0; i < maxLen; i++) {
+      if (!target_.readMemory(a + i, &c, 1) || c == 0) break;
+      s += ((unsigned char)c < 0x20 && c != '\t') ? '.' : c;
+    }
+    return s;
+  };
+  // addr が文字列セクション（__cstring/__ustring）なら、その中身を返す（でなければ空）。
+  auto cstrIfString = [&](uint64_t a) -> std::string {
+    const Image* im = images_.byAddress(a);
+    const Section* s = im ? im->sectionAt(a) : nullptr;
+    if (s && (s->name == "__cstring" || s->name == "__ustring")) return readCStr(a, 72);
+    return std::string();
+  };
+
+  const Image* img = images_.byAddress(addr);
+  RegionInfo reg; bool haveReg = regionOf(addr, reg);
+
+  if (img) {
+    { char off[64]; snprintf(off, sizeof(off), "%s +0x%llx", img->name.c_str(),
+                             (unsigned long long)(addr - img->loadAddr)); push("所在", off); }
+    if (img->containsStub(addr)) {
+      std::string t = symbols_.stubTarget(*img, addr);
+      push("区分", "シンボルスタブ（PLT 相当）");
+      if (!t.empty()) push("解決先", t);
+    } else {
+      const Section* sc = img->sectionAt(addr);
+      const Segment* sg = img->segmentAt(addr);
+      std::string segsec = sg ? sg->name : std::string("?");
+      if (sc) segsec += "," + sc->name;
+      push("セグメント/セクション", segsec);
+      push("区分", sc ? sectionCategory(sc->seg, sc->name, sc->flags)
+                      : (sg ? sectionCategory(sg->name, "", 0) : std::string("不明")));
+      // シンボルは「addr と同じセクションにあるもの」だけ出す。関数シンボルはサイズを持たないため
+      // byAddress は直近下方シンボルを返し、シンボルの無い __cstring/__const 等では無関係な関数名に
+      // 巻き込まれる。セクションが一致するか、シンボル先頭ちょうどのときだけ信頼して表示する。
+      const Symbol* sym = symbols_.byAddress(*img, addr);
+      const Section* symSec = sym ? img->sectionAt(sym->addr) : nullptr;
+      if (sym && (symSec == sc || sym->addr == addr)) {
+        std::string dn = symbols_.displayName(*sym);
+        char ob[32]; snprintf(ob, sizeof(ob), "+0x%llx", (unsigned long long)(addr - sym->addr));
+        push("シンボル", dn + ob);
+        if (dn.rfind("vtable for ", 0) == 0)
+          push("種別", "C++ vtable（" + dn.substr(std::string("vtable for ").size()) + "）");
+        else if (dn.rfind("typeinfo for ", 0) == 0)
+          push("種別", "C++ typeinfo（" + dn.substr(std::string("typeinfo for ").size()) + "）");
+      }
+      // 文字列定数なら中身も見せる。
+      if (sc && (sc->name == "__cstring" || sc->name == "__ustring")) {
+        std::string str = readCStr(addr, 72);
+        if (!str.empty()) push("文字列", "\"" + str + "\"");
+      }
+      if (sc && sc->seg == "__TEXT" && (sc->name == "__text" || (sc->flags & S_ATTR_PURE_INSTRUCTIONS))) {
+        SourceLoc loc;
+        if (sourceLineFor(addr, loc)) push("ソース", loc.file + ":" + std::to_string(loc.line));
+      }
+    }
+    if (const Annot* a = annots_.atExact(*img, addr))
+      if (!a->memo.empty()) push("メモ", a->memo);
+  } else if (haveReg) {
+    char rb[96]; snprintf(rb, sizeof(rb), "0x%llx–0x%llx  %s", (unsigned long long)reg.base,
+                          (unsigned long long)(reg.base + reg.size), protStr(reg.prot).c_str());
+    std::string tag = userTagName(reg.userTag);
+    std::string cat = (reg.userTag == VM_MEMORY_STACK) ? "スタック"
+                    : isMallocTag(reg.userTag)         ? "ヒープ（malloc）"
+                    : (reg.prot & VM_PROT_EXECUTE)     ? "無名実行メモリ（JIT?）"
+                    : (reg.prot & VM_PROT_WRITE)       ? "無名データ" : "無名（読み取り専用）";
+    push("区分", cat + (tag.empty() ? "" : ("  [" + tag + "]")));
+    push("リージョン", rb);
+    // スタックなら、どのスレッドの sp 近傍かを突き合わせる。
+    auto ths = target_.threads();
+    std::vector<uint8_t> stbuf(arch().threadStateCount() * sizeof(natural_t));
+    for (size_t i = 0; i < ths.size(); i++) {
+      if (!target_.getThreadState(ths[i], stbuf.data())) continue;
+      uint64_t sp = arch().sp(stbuf.data());
+      RegionInfo sr;
+      if (regionOf(sp, sr) && sr.base == reg.base) {
+        char d[96];
+        if (addr >= sp) snprintf(d, sizeof(d), "スレッド %zu のスタック（sp+0x%llx）", i + 1, (unsigned long long)(addr - sp));
+        else            snprintf(d, sizeof(d), "スレッド %zu のスタック（sp-0x%llx・未使用側）", i + 1, (unsigned long long)(sp - addr));
+        push("詳細", d);
+        break;
+      }
+    }
+  } else {
+    push("区分", "未マップ（どのリージョンにも属さない無効アドレス）");
+    return out;
+  }
+
+  // 層3: ポインタ先の推定。addr 自身がコード（命令列）や文字列定数なら、値はただの命令/文字バイト
+  // なので省く。それ以外（データ/定数/スタック/ヒープ）は *addr を 1 ワード読み、指す先を添える。
+  if (!isCode(addr) && cstrIfString(addr).empty()) {
+    uint64_t v = 0;
+    if (target_.readMemory(addr, &v, sizeof(v)) && v) {
+      char vb[32]; snprintf(vb, sizeof(vb), "0x%llx", (unsigned long long)v);
+      std::string shown;
+      std::string str = isCode(v) ? std::string() : cstrIfString(v); // 文字列を指すなら中身
+      if (!str.empty())      shown = "  文字列定数 → \"" + str + "\"";   // describe の誤シンボルを避ける
+      else {
+        std::string dv = describe(v);
+        shown = (dv.empty() ? "" : ("  " + dv)) + (isCode(v) ? "  （関数ポインタ?）" : "");
+      }
+      push("値(*addr)", std::string(vb) + shown);
+    }
+    // vtable 候補: const/data 上で先頭数ワードが連続して関数（__text）を指すか。
+    const Section* sc2 = img ? img->sectionAt(addr) : nullptr;
+    bool dataish = sc2 && (sc2->name == "__const" || sc2->seg == "__DATA" || sc2->seg == "__DATA_CONST");
+    if (dataish) {
+      int codePtrs = 0;
+      for (int i = 0; i < 4; i++) {
+        uint64_t p = 0;
+        if (!target_.readMemory(addr + (uint64_t)i * 8, &p, 8) || !p || !isCode(p)) break;
+        codePtrs++;
+      }
+      if (codePtrs >= 2) {
+        char cb[80]; snprintf(cb, sizeof(cb), "vtable 候補（先頭 %d 個以上が関数を指す）", codePtrs);
+        push("推定", cb);
+      }
+    }
+  }
+  return out;
 }
 
 std::string Session::stopReason() const {

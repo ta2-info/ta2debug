@@ -123,9 +123,11 @@ bool ImageList::parseMachO(uint64_t loadAddr, Image& out) {
       seg.name = std::string(sc->segname, strnlen(sc->segname, sizeof(sc->segname)));
       seg.vmaddr = sc->vmaddr; seg.vmsize = sc->vmsize;
       seg.fileoff = sc->fileoff; seg.filesize = sc->filesize;
+      seg.initprot = sc->initprot;
       out.segments.push_back(seg);
       if (seg.name == "__TEXT") { textVmaddr = sc->vmaddr; out.textSize = sc->vmsize; haveText = true; }
-      // セグメント内セクションを走査して __unwind_info（compact unwind）を記録（CFI 用）。
+      // セグメント内セクションを走査。__unwind_info（CFI 用）等を特別記録しつつ、全セクションを
+      // out.sections にも積む（:what の正体判定で __text/__const/__cstring/__got 等を名指しするため）。
       const uint8_t* sp = p + sizeof(struct segment_command_64);
       for (uint32_t s = 0; s < sc->nsects && sp + sizeof(struct section_64) <= p + lc->cmdsize; s++) {
         auto* sec = reinterpret_cast<const struct section_64*>(sp);
@@ -136,6 +138,10 @@ bool ImageList::parseMachO(uint64_t loadAddr, Image& out) {
           out.stubVmaddr = sec->addr; out.stubSize = sec->size;
           out.stubEntrySize = sec->reserved2; out.stubIndirectIndex = sec->reserved1;
         }
+        Section secr;
+        secr.seg = seg.name; secr.name = sname;
+        secr.vmaddr = sec->addr; secr.vmsize = sec->size; secr.flags = sec->flags;
+        out.sections.push_back(secr);
         sp += sizeof(struct section_64);
       }
     } else if (lc->cmd == LC_SYMTAB) {

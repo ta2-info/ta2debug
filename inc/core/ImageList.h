@@ -17,6 +17,15 @@ struct Segment {
   uint64_t vmsize = 0;
   uint64_t fileoff = 0;
   uint64_t filesize = 0;
+  uint32_t initprot = 0; // 初期保護（VM_PROT_*）。__TEXT=r-x, __DATA=rw- など
+};
+
+struct Section {
+  std::string seg;      // 所属セグメント名（__TEXT / __DATA / __DATA_CONST …）
+  std::string name;     // セクション名（__text / __const / __cstring / __got …）
+  uint64_t vmaddr = 0;  // ファイル上 vmaddr（実アドレス = vmaddr + slide）
+  uint64_t vmsize = 0;
+  uint32_t flags = 0;   // section_64.flags（S_* 種別＋属性。S_ATTR_PURE_INSTRUCTIONS 等）
 };
 
 struct Image {
@@ -40,6 +49,7 @@ struct Image {
   bool hasSymtab = false;
   uint32_t symoff = 0, nsyms = 0, stroff = 0, strsize = 0;
   std::vector<Segment> segments;
+  std::vector<Section> sections;  // 全セクション（正体判定 :what 用）
 
   // 実行時のアドレス範囲（__TEXT）
   bool containsText(uint64_t addr) const {
@@ -51,6 +61,21 @@ struct Image {
   // addr が __stubs（シンボルスタブ）内か。
   bool containsStub(uint64_t addr) const {
     return stubSize && addr >= stubVmaddr + slide && addr < stubVmaddr + slide + stubSize;
+  }
+  // addr（実アドレス）を含むセグメント／セクション（slide 適用済みで判定）。無ければ nullptr。
+  const Segment* segmentAt(uint64_t addr) const {
+    for (const auto& s : segments) {
+      uint64_t b = s.vmaddr + slide;
+      if (s.vmsize && addr >= b && addr < b + s.vmsize) return &s;
+    }
+    return nullptr;
+  }
+  const Section* sectionAt(uint64_t addr) const {
+    for (const auto& s : sections) {
+      uint64_t b = s.vmaddr + slide;
+      if (s.vmsize && addr >= b && addr < b + s.vmsize) return &s;
+    }
+    return nullptr;
   }
 };
 

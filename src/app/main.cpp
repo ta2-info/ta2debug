@@ -1977,6 +1977,20 @@ void runCommand(const std::string& line) {
       char buf[64]; snprintf(buf, sizeof(buf), "0x%llx", (unsigned long long)addr);
       g_message = std::string(buf) + (w.empty() ? "  (どのイメージにも入っていない)" : ("  " + w));
     });
+  } else if (cmd == "what" || cmd == "whatis" || cmd == "w?") {
+    // アドレスの「正体」を推定: コード/データ/定数/スタック/ヒープ/vtable/関数ポインタ など。
+    // 停止中にメモリ・スレッドを調べるので停止必須。式は evalAsync（中止可）で解決する。
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    if (g_state != UiState::Stopped) { g_message = "what は停止中のみ（メモリ/スレッドを調べます）"; return; }
+    if (trimStr(arg).empty()) { g_message = "使い方: what <式>   （例: what $pc / what &gvar / what 0x...）"; return; }
+    evalAsync(arg, [](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) { g_message = "式エラー: " + eerr; return; }
+      if (g_state != UiState::Stopped) { g_message = "what は停止中のみ"; return; } // 評価中に状態が変わった場合
+      auto lines = g_session.whatIs(addr);
+      if (lines.empty()) { g_message = "正体を判定できませんでした"; return; }
+      g_outputTitle = lines.front();
+      g_output.assign(lines.begin() + 1, lines.end());
+    });
   } else if (cmd == "dis" || cmd == "disas" || cmd == "disassemble") {
     // 逆アセンブル画面（ペイン）を移動する。dis <式> でそのアドレスから、dis で現在 PC へ。
     // オーバレイ（ページャ）ではなく本体の逆アセンブル表示を動かす。以降 ↑↓/Ctrl+F で移動可。
@@ -2519,6 +2533,7 @@ void runCommand(const std::string& line) {
       "  :x/<個数><書式><サイズ> <式>  書式付き（書式 x d u o t c i s f a / サイズ b h w g。個数は書式内）",
       "  :x                         前回の続き（オーバレイ表示中は Enter でも）",
       "  :sym <式>                  アドレスのシンボル    :img / :libs  読込イメージ（ライブラリ）一覧    :seg [名前]  セグメント一覧",
+      "  :what <式>                 アドレスの正体を推定（コード/データ/定数/スタック/ヒープ/vtable/関数ポインタ。セグメント・セクション・シンボルも）",
       "  :syms <ライブラリ> [絞込]   そのライブラリのシンボル一覧（省略で既定ライブラリ）。独自定義(注釈)も * 印で混在。対話は曖昧フィルタ・Tab 並び替え・Ctrl+E 独自定義の表示切替",
       "  :struct <型名>,<式>        指定アドレスのメモリを DWARF の型として展開表示（-g/dSYM 要。例: struct Point,$rsp）",
       "  :types [絞込]              DWARF の型名一覧（構造体/共用体/enum/typedef）。:struct と併用",
@@ -2568,7 +2583,7 @@ void runCommand(const std::string& line) {
 // コマンド名の TAB 補完（最初の語のみ。引数部では何もしない）。
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
-  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "be", "bedit", "bd", "bt",
+  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "what", "whatis", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "be", "bedit", "bd", "bt",
                                "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "struct", "types", "scwatch", "scstop", "mouse"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
@@ -2576,7 +2591,7 @@ void completeCommand() {
   if (cands.empty()) { g_message = "補完候補なし"; return; }
   if (cands.size() == 1) {
     g_cmdline = cands[0];
-    if (cands[0] == "attach" || cands[0] == "sym") g_cmdline += " "; // 引数を取るものは空白を足す
+    if (cands[0] == "attach" || cands[0] == "sym" || cands[0] == "what" || cands[0] == "whatis") g_cmdline += " "; // 引数を取るものは空白を足す
     g_message.clear();
     return;
   }
@@ -3263,7 +3278,7 @@ void printUsage() {
     "  （-o / -s があれば -b は省略可）\n"
     "バッチのコマンド（':' 接頭辞も可）:\n"
     "  run <パス>/attach <pid>/detach  c(継続) s(ステップイン) n(オーバ) wait(停止まで待つ)\n"
-    "  where(バックトレース)  b/bh/w(ブレイク)  bl/bd/bt  reg [名]  x[/fmt] <式>  sym/img/seg  auto  help  q\n"
+    "  where(バックトレース)  b/bh/w(ブレイク)  bl/bd/bt  reg [名]  x[/fmt] <式>  sym/what/img/seg  auto  help  q\n"
     "  停止すると位置・理由・syscall・バックトレースを自動表示。attach は走行継続なので wait で停止を待つ。\n",
     stdout);
 }
