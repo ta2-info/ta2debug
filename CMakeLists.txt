@@ -27,6 +27,11 @@ endif()
 # いまは Arch 抽象の土台のみ（arch_selftest）。モジュールを足すたびに拡張していく。
 project(ta2debug LANGUAGES C CXX)
 
+# コンパイルDB（build/compile_commands.json）を常に出す。clangd がインクルードパスを知らず
+# 「file not found / unknown type」を誤報するのを防ぐ。ルートの compile_commands.json シンボ
+# リックリンク（→ build/compile_commands.json、git 無視）経由で clangd が自動発見する。
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

@@ -17,3 +17,7 @@
 *.o
 *.ta2debug.log
 .DS_Store
+
+# clangd 用コンパイルDB（ルートは build/ へのシンボリックリンク。環境依存なので追跡しない）
+/compile_commands.json
+.cache/
