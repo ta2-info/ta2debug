@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <mach/mach.h>
@@ -27,6 +28,8 @@ public:
   bool attach(pid_t pid, std::string& err);
   // バイナリを一時停止状態で起動してアタッチ（START_SUSPENDED）。走り出す前に task を取る。
   // argv は末尾 nullptr 終端。子の stdout/stderr は <path>.ta2debug.log へ向ける。
+  // そのとき子へは PTY スレーブを渡すので、子 libc から stdout が端末に見えて行バッファになり、
+  // printf/dump が改行ごとに即ログへ出る（レギュラーファイル直結だと全バッファで停止中は見えない）。
   bool launch(const std::string& path, char* const argv[], std::string& err);
   // 手放す（自分で掛けた suspend は解除。タスクポートを deallocate。起動した子なら終了させる）。
   void detach();
@@ -65,11 +68,17 @@ public:
   bool setDebugState(thread_act_t t, const void* buf);
 
 private:
+  // 起動した子の PTY マスタを読んで <path>.ta2debug.log に書き写すポンプを止めて片付ける。
+  void teardownPty();
+
   pid_t pid_ = 0;
   task_t task_ = 0;
   std::unique_ptr<Arch> arch_;
   std::atomic<int> suspendCount_{0}; // consumer スレッドからも触る（dtrace stop 取り込み）ため atomic
   bool launched_ = false; // 自分で起動した子（detach 時に終了させる）
+  int ptyMaster_ = -1;    // 子 stdout/stderr を映す PTY マスタ（launch 時のみ。attach では -1）
+  int logFd_ = -1;        // 書き写し先 <path>.ta2debug.log の fd
+  std::thread ptyPump_;   // ptyMaster_ → logFd_ を読んでは書くポンプスレッド
 };
 
 } // namespace ta2
