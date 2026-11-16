@@ -1,9 +1,13 @@
 #include "core/Target.h"
 
+#include <cerrno>
 #include <cstring>
 #include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
+#include <termios.h>
+#include <unistd.h>
+#include <util.h>        // openpty
 #include <crt_externs.h> // _NSGetEnviron
 
 #include <mach/mach_vm.h>
@@ -50,24 +54,56 @@ bool Target::launch(const std::string& path, char* const argv[], std::string& er
   // 再実行のたびに同じアドレスにする（lldb/debugserver の既定と同じ。ブレイクやログ突合が再現可能になる）。
   posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR);
 
-  // 子の標準出力/エラーは TUI を汚さないようログファイルへ
+  // 子の標準出力/エラーは TUI を汚さないようログファイルへ。ただしレギュラーファイルへ直結すると
+  // 子 libc が「端末ではない」と判断して全バッファ（4〜8KB 単位）になり、ブレイクで止めている間は
+  // printf/dump の出力がまだ子のユーザ空間バッファに溜まったままでログに現れない。そこで子へは
+  // PTY スレーブを渡す：子からは stdout が端末に見えて行バッファになり、改行ごとに即出る。親は
+  // PTY マスタを読んで <path>.ta2debug.log に書き写す（これなら tail -f で逐次見える）。
+  std::string logpath = path + ".ta2debug.log";
+  // ガード: 生成するログ名のファイル名部分が '-' 始まり（または空）だと、後でシェルから
+  // オプションと誤認されて rm で消しにくくなる（rm -- / ./ 前置が要る）。安全な接頭辞 '_' を
+  // 挟んでハイフン始まりを避ける（例: 対象が "-" → "_-.ta2debug.log"）。ディレクトリ部は保つ。
+  {
+    size_t slash = logpath.find_last_of('/');
+    size_t base = (slash == std::string::npos) ? 0 : slash + 1;
+    if (base >= logpath.size() || logpath[base] == '-') logpath.insert(base, "_");
+  }
   posix_spawn_file_actions_t fa;
   posix_spawn_file_actions_init(&fa);
-  std::string logpath = path + ".ta2debug.log";
-  posix_spawn_file_actions_addopen(&fa, 1, logpath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-  posix_spawn_file_actions_adddup2(&fa, 1, 2);
+
+  int master = -1, slave = -1;
+  bool usePty = (openpty(&master, &slave, nullptr, nullptr, nullptr) == 0);
+  if (usePty) {
+    // 端末の出力加工（OPOST/ONLCR の \n→\r\n 変換、エコー等）を切り、子の出力バイトを無改変で記録。
+    struct termios t;
+    if (tcgetattr(slave, &t) == 0) { cfmakeraw(&t); tcsetattr(slave, TCSANOW, &t); }
+    posix_spawn_file_actions_adddup2(&fa, slave, 1);
+    posix_spawn_file_actions_adddup2(&fa, slave, 2);
+    posix_spawn_file_actions_addclose(&fa, slave);  // dup 後に子側のスレーブ原本を閉じる
+    posix_spawn_file_actions_addclose(&fa, master); // 子はマスタを持たない
+  } else {
+    // PTY を用意できないときは従来どおりログファイルへ直接（全バッファのまま）。
+    posix_spawn_file_actions_addopen(&fa, 1, logpath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    posix_spawn_file_actions_adddup2(&fa, 1, 2);
+  }
 
   pid_t pid = 0;
   char** envp = *_NSGetEnviron();
   int rc = posix_spawn(&pid, path.c_str(), &fa, &attr, argv, envp);
   posix_spawn_file_actions_destroy(&fa);
   posix_spawnattr_destroy(&attr);
-  if (rc != 0) { err = std::string("posix_spawn 失敗: ") + strerror(rc); return false; }
+  if (usePty) close(slave); // 親はスレーブ不要。閉じないと子終了時もマスタが EOF にならない
+  if (rc != 0) {
+    if (usePty) close(master);
+    err = std::string("posix_spawn 失敗: ") + strerror(rc);
+    return false;
+  }
 
   task_t task = 0;
   kern_return_t kr = task_for_pid(mach_task_self(), pid, &task); // START_SUSPENDED なので走る前に取れる
   if (kr != KERN_SUCCESS) {
     err = std::string("task_for_pid 失敗: ") + mach_error_string(kr);
+    if (usePty) close(master);
     kill(pid, SIGKILL);
     return false;
   }
@@ -76,11 +112,38 @@ bool Target::launch(const std::string& path, char* const argv[], std::string& er
   suspendCount_ = 1; // START_SUSPENDED のぶんを自分の停止として数える（resume で解除される）
   arch_ = Arch::createForHost();
   launched_ = true;
+
+  // PTY マスタ → ログファイルのポンプ。read で受けたぶんをそのまま write するので stdio バッファを
+  // 挟まず、子が改行で flush した行が即ファイルへ届く（＝ tail -f で逐次見える）。子が終了して
+  // スレーブが全て閉じるとマスタ read が EOF/EIO になり、スレッドは自然に終わる（detach で join）。
+  if (usePty) {
+    ptyMaster_ = master;
+    logFd_ = open(logpath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int rfd = master, wfd = logFd_;
+    ptyPump_ = std::thread([rfd, wfd]() {
+      char buf[4096];
+      for (;;) {
+        ssize_t n = read(rfd, buf, sizeof(buf));
+        if (n > 0) {
+          for (ssize_t off = 0; wfd >= 0 && off < n; ) {
+            ssize_t w = write(wfd, buf + off, (size_t)(n - off));
+            if (w <= 0) { if (errno == EINTR) continue; break; }
+            off += w;
+          }
+        } else if (n == 0) {
+          break;                              // EOF
+        } else {
+          if (errno == EINTR) continue;
+          break;                              // EIO 等（子が終了してスレーブが閉じた）
+        }
+      }
+    });
+  }
   return true;
 }
 
 void Target::detach() {
-  if (task_ == 0) return;
+  if (task_ == 0) { teardownPty(); return; }
   while (suspendCount_ > 0) { task_resume(task_); suspendCount_--; }
   pid_t p = pid_; bool launched = launched_;
   mach_port_deallocate(mach_task_self(), task_);
@@ -89,6 +152,16 @@ void Target::detach() {
   arch_.reset();
   launched_ = false;
   if (launched) kill(p, SIGKILL); // 自分で起動した子はデバッガ終了時に始末する
+  teardownPty();                  // 子を終わらせた後に PTY ポンプを止めて片付ける
+}
+
+// 起動した子の PTY ポンプを止めて fd を閉じる。子は既に終了/kill 済みの前提：スレーブが閉じて
+// マスタ read が EOF/EIO になりポンプスレッドが抜けるので join できる。attach のみ（pty 無し）や
+// 二重呼び出しでも安全（何も無ければ即 return）。
+void Target::teardownPty() {
+  if (ptyPump_.joinable()) ptyPump_.join();
+  if (ptyMaster_ >= 0) { close(ptyMaster_); ptyMaster_ = -1; }
+  if (logFd_ >= 0) { close(logFd_); logFd_ = -1; }
 }
 
 bool Target::suspend() {
