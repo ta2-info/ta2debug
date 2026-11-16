@@ -1414,6 +1414,20 @@ static void dwEmit(std::vector<std::string>& out, const DwarfTypes* tt, const Dw
   if (s->kind == DwType::Struct || s->kind == DwType::Union || s->kind == DwType::Class) {
     out.push_back(pad + label + " {");
     if (depth >= kDwMaxDepth) { out.push_back(pad + "  …（深さ上限）"); out.push_back(pad + "}"); return; }
+    // 基底クラス（継承）を先に展開。基底型自身も bases を持つので、親の親以上／多重継承は
+    // この再帰で自然に辿られ、オフセットは off+基底オフセットで合成される。仮想基底だけは
+    // オフセットが実行時 vtable 依存で未確定なのでラベルのみ出す（値は展開しない）。
+    for (const auto& bse : s->bases) {
+      const DwType* bt = tt->at(bse.type);
+      std::string bname = dwTypeName(tt, bt);
+      if (bse.isVirtual) {
+        out.push_back(pad + "  [仮想基底 " + bname + " @実行時vtable依存・省略]");
+        continue;
+      }
+      char hb[160]; snprintf(hb, sizeof(hb), "[基底 %s @+0x%llx]", bname.c_str(), (unsigned long long)bse.offset);
+      dwEmit(out, tt, bt, buf, ok, off + bse.offset, baseAddr, hb, indent + 2, depth + 1);
+      if ((int)out.size() >= kDwLineCap) { out.push_back(pad + "  …（出力上限）"); break; }
+    }
     for (const auto& m : s->members) {
       std::string nm = m.name.empty() ? std::string("(無名)") : m.name;
       char hb[96]; snprintf(hb, sizeof(hb), "+0x%llx %s", (unsigned long long)m.offset, dwTypeName(tt, tt->at(m.type)).c_str());
