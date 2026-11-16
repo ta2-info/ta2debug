@@ -43,6 +43,15 @@ struct DwEnumerator {
   int64_t value = 0;
 };
 
+// 基底クラス（DW_TAG_inheritance）。多重継承では派生型が複数持つ。非仮想なら offset は
+// 派生先頭からの定数バイトオフセット（単一継承の主基底は 0）。仮想基底は offset が実行時の
+// vtable 依存で DWARF では定数にならないため isVirtual を立て、offset は未確定として扱う。
+struct DwBase {
+  DwTypeRef type;          // 基底型（それ自身も bases を持ちうる＝親の親へ再帰できる）
+  uint64_t offset = 0;     // 非仮想のときの基底サブオブジェクトのオフセット
+  bool isVirtual = false;  // 仮想継承（offset は未確定）
+};
+
 // 1 つの型。kind で種別、ref で参照先（ポインタ/typedef/const/volatile/配列要素）を表す。
 struct DwType {
   enum Kind { Unknown, Base, Pointer, Struct, Union, Class, Typedef, Const, Volatile, Array, Enum };
@@ -52,6 +61,7 @@ struct DwType {
   int encoding = 0;                    // Base: DW_ATE_*（signed/unsigned/float/boolean/char…）
   DwTypeRef ref;                       // Pointer/Typedef/Const/Volatile/Array要素/Enum下地 の参照
   std::vector<DwMember> members;       // Struct/Union/Class のメンバ
+  std::vector<DwBase> bases;           // Struct/Class の基底クラス（継承。先頭＝宣言順）
   std::vector<DwEnumerator> enums;     // Enum の列挙子
   uint64_t arrayCount = 0;             // Array の要素数（0=不明/可変長）
   int section = -1;                    // この型が属するセクション索引

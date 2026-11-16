@@ -55,12 +55,13 @@ enum {
   TAG_pointer = 0x0f, TAG_compile_unit = 0x11, TAG_structure = 0x13, TAG_subroutine = 0x15,
   TAG_typedef = 0x16, TAG_union = 0x17, TAG_base = 0x24, TAG_const = 0x26,
   TAG_enumerator = 0x28, TAG_subrange = 0x21, TAG_volatile = 0x35,
+  TAG_inheritance = 0x1c,
 };
 enum {
   AT_name = 0x03, AT_byte_size = 0x0b, AT_bit_offset = 0x0c, AT_bit_size = 0x0d,
   AT_stmt_list = 0x10, AT_encoding = 0x3e, AT_type = 0x49, AT_data_member_location = 0x38,
   AT_const_value = 0x1c, AT_upper_bound = 0x2f, AT_count = 0x37, AT_declaration = 0x3c,
-  AT_data_bit_offset = 0x6b,
+  AT_data_bit_offset = 0x6b, AT_virtuality = 0x4c,
 };
 
 // 1 つの属性値。kind: 0=なし,1=文字列,2=数値,3=参照(絶対オフセット),4=block(bytes)。
@@ -164,7 +165,7 @@ void DwarfTypes::addSections(const DwarfSections& s) {
       int encoding = 0; DwTypeRef typeRef; uint64_t memberOff = 0; bool haveMemberOff = false;
       int64_t constVal = 0; bool haveConst = false; uint64_t upper = 0; bool haveUpper = false, haveCount = false;
       uint64_t countVal = 0; bool declOnly = false; int bitSize = 0; bool haveBitSize = false;
-      int dataBitOff = 0; bool haveDataBitOff = false;
+      int dataBitOff = 0; bool haveDataBitOff = false; int virtuality = 0;
       for (const auto& at : a.attrs) {
         FormVal v;
         readForm(r, at.form, addrSize, cuStart, at.implicit, s.str, s.lineStr, v);
@@ -184,6 +185,7 @@ void DwarfTypes::addSections(const DwarfSections& s) {
           case AT_declaration: if (v.kind == 2 && v.n) declOnly = true; break;
           case AT_bit_size: if (v.kind == 2) { bitSize = (int)v.n; haveBitSize = true; } break;
           case AT_data_bit_offset: if (v.kind == 2) { dataBitOff = (int)v.n; haveDataBitOff = true; } break;
+          case AT_virtuality: if (v.kind == 2) virtuality = (int)v.n; break;
           default: break;
         }
       }
@@ -200,6 +202,16 @@ void DwarfTypes::addSections(const DwarfSections& s) {
           DwMember m; m.name = name; m.offset = haveMemberOff ? memberOff : 0; m.type = typeRef;
           if (haveBitSize) { m.isBit = true; m.bitSize = bitSize; m.bitOffset = haveDataBitOff ? dataBitOff : 0; }
           pit->second.members.push_back(std::move(m));
+        }
+      } else if (a.tag == TAG_inheritance &&
+                 (curParentTag == TAG_structure || curParentTag == TAG_class || curParentTag == TAG_union)) {
+        // 基底クラス。DW_AT_type=基底型, DW_AT_data_member_location=オフセット（非仮想）,
+        // DW_AT_virtuality=virtual なら仮想基底（オフセットは vtable 依存で未確定）。
+        auto pit = tmap.find(curParentOff);
+        if (pit != tmap.end()) {
+          DwBase bse; bse.type = typeRef; bse.offset = haveMemberOff ? memberOff : 0;
+          bse.isVirtual = (virtuality == 1); // DW_VIRTUALITY_virtual
+          pit->second.bases.push_back(std::move(bse));
         }
       } else if (a.tag == TAG_enumerator && curParentTag == TAG_enumeration) {
         auto pit = tmap.find(curParentOff);
