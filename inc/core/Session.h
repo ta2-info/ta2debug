@@ -102,6 +102,10 @@ public:
   bool stopIsImageLoad() const { return stopIsImageLoad_; }
   // アドレスを "image 0x.. func+0xNN"（無ければ "image 0x.." / 空）に整形（ステータス用）
   std::string describe(uint64_t addr);
+  // アドレスの「正体」を推定して複数行で返す（:what）。イメージ内なら セグメント/セクション/
+  // シンボル/vtable、イメージ外なら VM リージョンの保護と user_tag（スタック/ヒープ）＋スレッド
+  // 突き合わせ、さらにポインタ先（関数ポインタ/vtable 候補）まで層構造で説明する。停止中に呼ぶ。
+  std::vector<std::string> whatIs(uint64_t addr);
   // 関数名だけを短く（"func" / "func+0xNN"）。無ければイメージ名。call 先注記用。
   std::string symbolName(uint64_t addr);
   // 停止位置が syscall/svc 命令なら、これから呼ぶシステムコールを解析して
@@ -160,6 +164,16 @@ public:
   bool symbolsWarming() const { return warmActive_.load(); }
   int symbolsWarmedDone() const { return warmDone_.load(); }
   int symbolsWarmedTotal() const { return warmTotal_.load(); }
+
+  // :what / describe 用の VM リージョン情報。指定アドレスを含むリージョンの範囲・保護・用途タグ。
+  struct RegionInfo {
+    bool ok = false;
+    uint64_t base = 0, size = 0;
+    int prot = 0;          // 現在保護（VM_PROT_READ|WRITE|EXECUTE）
+    unsigned userTag = 0;  // VM_MEMORY_*（STACK / MALLOC 系 など）
+    int shareMode = 0;     // SM_*（COW/PRIVATE/SHARED 等）
+  };
+  bool regionOf(uint64_t addr, RegionInfo& out); // addr を含むリージョンを取る（穴/未attach は false）
 
 private:
   // 例外スレッドから呼ばれる
