@@ -20,6 +20,7 @@ enum class BranchOp { None, Reg, Mem };
 struct Insn {
   uint64_t address = 0;
   uint8_t size = 0;
+  bool data = false;          // capstone が解釈できなかったバイト（.byte/.long 擬似行）。打ち切らず続行するための印。
   std::string mnemonic;
   std::string opStr;
   InsnKind kind = InsnKind::Other;

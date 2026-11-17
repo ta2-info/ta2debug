@@ -219,6 +219,12 @@ std::vector<uint8_t> viewRegSnapshot() {
   return std::vector<uint8_t>(p, p + n);
 }
 
+// このアーキの命令が arm64（4 バイト固定長）かどうか。逆アセンブル用バッファの見積りや
+// 上移動の最小刻み（arm64=4 / x86=1）に使う。
+static bool archIsArm64(Arch& a) { return std::strcmp(a.name(), "arm64") == 0; }
+// 1 命令の最大バイト数（x86=15 / arm64=4）。高さ p.height を賄うバッファ長の見積りに使う。
+static size_t archInsnMaxLen(Arch& a) { return archIsArm64(a) ? 4 : 15; }
+
 // top の直前の命令の先頭アドレス（x86 可変長のための後方探索）。見つからなければ top-1。
 // top の n 命令前のアドレスを返す。x86 は可変長で後方デコードが曖昧なので、
 // 手前から前方デコードして top にちょうど揃う命令列を探し、その n 個前を返す
@@ -280,12 +286,15 @@ void drawDisassembly(const PaneRect& p) {
   Arch& a = g_session.arch();
   uint64_t pc = viewPc();                                  // 表示中スレッドの現在命令（反転表示の対象）
   uint64_t start = g_disasmFollow ? pc : g_disasmTop;      // 表示の先頭（スクロール中は追従解除）
-  uint8_t code[512] = {}; size_t got = 0;
-  g_session.target().readMemory(start, code, sizeof(code), &got);
-  g_session.maskBreakpoints(start, code, got);
+  // ペイン高さぶんの命令を確実に賄えるバイト数を読む。固定 512B だと背の高いペインや長い命令で
+  // 足りず、下が空白になっていた（原因B）。arm64=4B×高さ、x86=15B×高さ ＋ 余白。
+  size_t need = (size_t)p.height * archInsnMaxLen(a) + 32;
+  std::vector<uint8_t> code(need, 0); size_t got = 0;
+  g_session.target().readMemory(start, code.data(), need, &got);
+  g_session.maskBreakpoints(start, code.data(), got);
   Disassembler dis(a);
   const Image* img = g_session.images().byAddress(start);
-  auto insns = dis.disasm(code, got, start, p.height);
+  auto insns = dis.disasm(code.data(), got, start, p.height);
   int y = 0;
   g_visInsns.clear(); g_visFirstAddr = g_visLastAddr = 0; // この描画で見えている命令行を記録し直す
   uint64_t lastFunc = 0; bool haveLast = false;
@@ -2654,12 +2663,14 @@ static uint64_t nextInsnAddr(uint64_t a) {
 // （関数名ヘッダ / ソース行の挿入条件と break 条件）と必ず歩調を合わせること。
 static uint64_t disasmLastVisible(uint64_t top, int height) {
   if (height <= 0) return 0;
-  uint8_t code[512] = {}; size_t got = 0;
-  g_session.target().readMemory(top, code, sizeof(code), &got);
-  g_session.maskBreakpoints(top, code, got);
+  // drawDisassembly と同じ長さを読む（固定 512B だと背の高いペインで測定がずれる）。
+  size_t need = (size_t)height * archInsnMaxLen(g_session.arch()) + 32;
+  std::vector<uint8_t> code(need, 0); size_t got = 0;
+  g_session.target().readMemory(top, code.data(), need, &got);
+  g_session.maskBreakpoints(top, code.data(), got);
   Disassembler dis(g_session.arch());
   const Image* img = g_session.images().byAddress(top);
-  auto insns = dis.disasm(code, got, top, height);
+  auto insns = dis.disasm(code.data(), got, top, height);
   int y = 0; uint64_t last = 0;
   uint64_t lastFunc = 0; bool haveLast = false;
   std::string lastSrcFile; int lastSrcLine = -1;
@@ -2737,8 +2748,17 @@ void moveCursor(int dir) {
   // 先頭は drawDisassembly が必ず境界として描くので、非コード領域でも ▸ は消えない。
   uint64_t beforeTop = g_disasmFollow ? viewPc() : g_disasmTop;
   moveDisasm(-1);
-  if (g_disasmTop != beforeTop) g_curAddr = g_disasmTop;  // 上へ送れた → 新先頭を選択
-  else if (!g_curAddr) g_curAddr = base;                   // これ以上上が無い → 現在位置を選択だけ
+  if (g_disasmTop != beforeTop) { g_curAddr = g_disasmTop; return; } // 上へ送れた → 新先頭を選択
+  // disasmBack が同期できなかった最後の保険: 上がまだ読めるなら最小刻み（arm64=4/x86=1）だけ
+  // 強制的に上へ送る。非コード/データ境界でも ▸ が必ず動く（先頭は .byte 行として描かれる）。
+  size_t step = archIsArm64(g_session.arch()) ? 4 : 1;
+  uint8_t probe = 0;
+  if (beforeTop >= step && g_session.target().readMemory(beforeTop - step, &probe, 1)) {
+    g_disasmTop = beforeTop - step; g_disasmFollow = false; g_disasmTrail.clear();
+    g_curAddr = g_disasmTop;
+  } else if (!g_curAddr) {
+    g_curAddr = base;                                       // これ以上上が無い → 現在位置を選択だけ
+  }
 }
 
 // Ctrl+F / Ctrl+B: カーソルを 1 ページぶん上下へ動かす。

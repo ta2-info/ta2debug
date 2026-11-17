@@ -1,5 +1,8 @@
 #include "core/Disassembler.h"
 
+#include <cstdio>
+#include <cstring>
+
 #include <capstone/capstone.h>
 
 namespace ta2 {
@@ -34,7 +37,28 @@ std::vector<Insn> Disassembler::disasm(const uint8_t* code, size_t size, uint64_
   const uint8_t* p = code;
   size_t remain = size;
   uint64_t pc = addr;
-  while (out.size() < maxInsns && cs_disasm_iter(h, &p, &remain, &pc, insn)) {
+  // arm64 は 4 バイト固定長、x86 は 1 バイト単位。capstone が不正命令で止まったら、この単位で
+  // 1 つだけ進めて擬似データ行（.long / .byte）を 1 行出し、再同期する。こうすると「不正バイトで
+  // 打ち切り → 以降が空白／後方ナビ停止」を防げる（パディング・リテラルプール・データ混在に強い）。
+  const size_t step = (arch_.csArch() == CS_ARCH_ARM64) ? 4 : 1;
+  while (out.size() < maxInsns && remain >= step) {
+    if (!cs_disasm_iter(h, &p, &remain, &pc, insn)) {
+      Insn d;
+      d.address = pc;
+      d.size = (uint8_t)step;
+      d.data = true;
+      if (step == 4) {
+        uint32_t w = 0; memcpy(&w, p, 4);
+        char b[16]; snprintf(b, sizeof(b), "0x%08x", w);
+        d.mnemonic = ".long"; d.opStr = b;
+      } else {
+        char b[8]; snprintf(b, sizeof(b), "0x%02x", (unsigned)p[0]);
+        d.mnemonic = ".byte"; d.opStr = b;
+      }
+      out.push_back(std::move(d));
+      p += step; remain -= step; pc += step;
+      continue;
+    }
     Insn ins;
     ins.address = insn->address;
     ins.size = insn->size;
