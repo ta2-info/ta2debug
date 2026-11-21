@@ -116,6 +116,9 @@ void Terminal::moveTo(int col, int row) {
   put(buf);
 }
 
+void Terminal::hideCursor() { put("\x1b[?25l"); }
+void Terminal::showCursorAt(int col, int row) { moveTo(col, row); put("\x1b[?25h"); }
+
 void Terminal::put(const std::string& s) { fwrite(s.data(), 1, s.size(), stdout); }
 void Terminal::putAt(int col, int row, const std::string& s) {
   moveTo(col, row);

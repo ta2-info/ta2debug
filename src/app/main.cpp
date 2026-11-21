@@ -1136,6 +1136,19 @@ void handleBpEditorKey(int c) {
   render();
 }
 
+// コマンド入力中はハードウェアカーソルを入力位置（最下行の ":"+入力文字列の末尾）に出し、
+// それ以外は隠す。各 flush の直前（選択オーバレイ描画の後）に呼ぶこと。
+static void updateInputCursor(int cols, int rows) {
+  if (g_cmdMode) {
+    int col = layout::displayWidth(":" + g_cmdline); // ANSI=0 / 全角=2 を考慮した表示幅
+    if (col > cols - 1) col = cols - 1;
+    if (col < 0) col = 0;
+    g_term.showCursorAt(col, rows - 1);
+  } else {
+    g_term.hideCursor();
+  }
+}
+
 // ----- 描画 -----
 void render() {
   g_term.querySize();
@@ -1241,6 +1254,7 @@ void render() {
     if (!g_message.empty()) foot += (foot.empty() ? "" : "    ") + g_message;
     if (!foot.empty()) g_term.putAt(0, rows - 1, layout::fitWidth("\x1b[2m" + foot + "\x1b[0m", cols));
     g_term.drawSelectionOverlay();
+    updateInputCursor(cols, rows); // 出力ビューはコマンド入力中でないのでカーソルは隠れる
     g_term.flush();
     return;
   }
@@ -1267,6 +1281,7 @@ void render() {
   }
   else if (!g_message.empty()) g_term.putAt(0, rows - 1, layout::fitWidth(g_message, cols));
   g_term.drawSelectionOverlay();
+  updateInputCursor(cols, rows);
   g_term.flush();
 }
 
@@ -1281,6 +1296,7 @@ void renderCmdline() {
     if (!g_message.empty()) line += "    \x1b[2m" + g_message + "\x1b[0m"; // 補完候補など
     g_term.putAt(0, rows - 1, layout::fitWidth(line, cols));
   } else if (!g_message.empty()) g_term.putAt(0, rows - 1, layout::fitWidth(g_message, cols));
+  updateInputCursor(cols, rows);
   g_term.flush();
 }
 
