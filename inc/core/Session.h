@@ -39,6 +39,9 @@ public:
   // バイナリを起動してデバッグ開始（START_SUSPENDED でエントリ手前で停止状態にする）。
   bool launch(const std::string& path, char* const argv[], std::string& err);
   void detach();
+  // launch で起動する子の降格可否。既定は降格する（子を root で走らせない）。
+  // root が必要なプログラムを起動する場合に true（root 維持）を指定する。
+  void setLaunchKeepRoot(bool on) { target_.setLaunchKeepRoot(on); }
   bool isAttached() { return target_.isAttached(); }
   pid_t pid() { return target_.pid(); }
 

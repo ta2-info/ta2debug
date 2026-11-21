@@ -3481,6 +3481,9 @@ void printUsage() {
     "  ta2debug -b [対象] -s スクリプト           非対話: ファイルの各行を実行（- で標準入力）\n"
     "  ta2debug -b [対象]                         非対話: 標準入力からコマンドを読む\n"
     "  （-o / -s があれば -b は省略可）\n"
+    "オプション:\n"
+    "  --root-child (--keep-root)                起動する子を降格せず root のまま走らせる\n"
+    "                                            （既定は sudo 実行時に呼び出しユーザへ降格）\n"
     "バッチのコマンド（':' 接頭辞も可）:\n"
     "  run <パス>/attach <pid>/detach  c(継続) s(ステップイン) n(オーバ) wait(停止まで待つ)\n"
     "  where(バックトレース)  b/bh/w(ブレイク)  bl/bd/bt  reg [名]  x[/fmt] <式>  sym/what/img/seg  auto  help  q\n"
@@ -3491,7 +3494,7 @@ void printUsage() {
 int main(int argc, char** argv) {
   // 引数解析: -b バッチ, -o <cmd>（複数可）, -s <file|->, -h ヘルプ, 残りは対象(pid / パス[+引数])
   // （-h は root 不要にしたいので geteuid チェックより前に処理する）
-  bool batch = false, haveScript = false;
+  bool batch = false, haveScript = false, keepRootChild = false;
   std::string scriptPath;
   std::vector<std::string> ocmds, target;
   for (int i = 1; i < argc; i++) {
@@ -3499,12 +3502,15 @@ int main(int argc, char** argv) {
     if (a == "-b" || a == "--batch") batch = true;
     else if (a == "-o") { if (i + 1 < argc) ocmds.push_back(argv[++i]); }
     else if (a == "-s" || a == "--source") { if (i + 1 < argc) { scriptPath = argv[++i]; haveScript = true; } }
+    else if (a == "--root-child" || a == "--keep-root") keepRootChild = true; // 子を降格しない
     else if (a == "-h" || a == "--help") { printUsage(); return 0; }
     else target.push_back(a);
   }
   if (!ocmds.empty() || haveScript) batch = true; // -o/-s があれば非対話とみなす
 
   if (geteuid() != 0) { fprintf(stderr, "root 権限で実行してください\n"); return 1; }
+  // 既定は起動する子を呼び出しユーザへ降格する。--root-child 指定時のみ root のまま走らせる。
+  g_session.setLaunchKeepRoot(keepRootChild);
   if (batch) return runBatch(ocmds, scriptPath, haveScript, target);
 
   // ----- 対話 TUI -----
