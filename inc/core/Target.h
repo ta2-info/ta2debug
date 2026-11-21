@@ -37,6 +37,7 @@ public:
   // 既定では sudo 実行時に起動する子を呼び出しユーザへ降格する（子を root で走らせない）。
   // root 権限が必要なプログラムを起動したい場合に、この降格を無効化する（子も root のまま）。
   void setLaunchKeepRoot(bool on) { launchKeepRoot_ = on; }
+  bool launchKeepRoot() const { return launchKeepRoot_; }
 
   bool launched() const { return launched_; } // 自分で起動した子か
 

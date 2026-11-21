@@ -42,6 +42,7 @@ public:
   // launch で起動する子の降格可否。既定は降格する（子を root で走らせない）。
   // root が必要なプログラムを起動する場合に true（root 維持）を指定する。
   void setLaunchKeepRoot(bool on) { target_.setLaunchKeepRoot(on); }
+  bool launchKeepRoot() const { return target_.launchKeepRoot(); }
   bool isAttached() { return target_.isAttached(); }
   pid_t pid() { return target_.pid(); }
 
