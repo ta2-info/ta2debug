@@ -38,6 +38,7 @@ void Breakpoints::removeAll() {
   orig_.clear();
   bps_.clear();
   hwTransientOff_.clear();
+  tempHwExec_.clear();
 }
 
 // HW ブレイク/ウォッチを debugState バッファへ反映（Session がスレッドごとに呼ぶ）
@@ -45,14 +46,45 @@ void Breakpoints::applyHwInto(void* ds) const {
   Arch& a = target_.arch();
   int ecap = a.hwBreakCount();
   int wcap = a.hwWatchCount();
+  bool shared = a.hwExecWatchSharePool();
   for (int i = 0; i < ecap; i++) a.clearHwExecBreak(ds, i); // いったん全消去
   for (int i = 0; i < wcap; i++) a.clearHwWatch(ds, i);     // （x86 は同じ DR なので二度消しても無害）
+  std::vector<bool> usedExec(ecap, false);
   for (const auto& b : bps_) {
     if (!b.hw || !b.enabled || b.slot < 0) continue;
     if (hwTransientOff_.count(b.id)) continue; // ステップ中の一時無効
     if (b.watch) { if (b.slot < wcap) a.setHwWatch(ds, b.slot, b.addr, b.watchSize, b.onRead, b.onWrite); }
     else         { if (b.slot < ecap) a.setHwExecBreak(ds, b.slot, b.addr); }
+    // 共有プール(x86)では watch も実行用 DR を占有するので、一時 HW の割当で避ける。
+    if (b.slot < ecap && (shared || !b.watch)) usedExec[b.slot] = true;
   }
+  // step-over の一時 HW 実行ブレイク（ユーザ一覧に出さない）。空き実行スロットへ順に割り当てる。
+  int next = 0;
+  for (uint64_t addr : tempHwExec_) {
+    while (next < ecap && usedExec[next]) next++;
+    if (next >= ecap) break; // 空き無し（addTempHw で弾いているので通常来ない）
+    a.setHwExecBreak(ds, next, addr);
+    usedExec[next] = true;
+  }
+}
+
+// step-over の一時 HW 実行ブレイクを 1 本確保（空き実行スロットが無ければ false）。
+bool Breakpoints::addTempHw(uint64_t addr) {
+  if (tempHwExec_.count(addr)) return true; // すでに一時 HW あり
+  Arch& a = target_.arch();
+  // 同アドレスに有効なユーザ HW 実行ブレイクがあれば、それで止まるので一時は不要（スロット非消費）。
+  for (const auto& b : bps_) if (b.hw && !b.watch && b.enabled && b.addr == addr) return true;
+  int ecap = a.hwBreakCount();
+  bool shared = a.hwExecWatchSharePool();
+  std::set<int> used; // ユーザ HW が占有している実行 DR
+  for (const auto& b : bps_) {
+    if (!b.hw || b.slot < 0) continue;
+    if ((shared || !b.watch) && b.slot < ecap) used.insert(b.slot);
+  }
+  int freeSlots = ecap - (int)used.size() - (int)tempHwExec_.size();
+  if (freeSlots <= 0) return false; // 空き実行スロット無し → 呼び出し側は soft へフォールバック
+  tempHwExec_.insert(addr);
+  return true;
 }
 
 // forWatch 用に空きデバッグレジスタ番号を返す（x86 は実行/ウォッチで DR 共用のため全体を見る）
