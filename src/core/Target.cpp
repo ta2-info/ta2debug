@@ -4,11 +4,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <grp.h>         // getgrouplist / setgroups（子の降格用）
+#include <pwd.h>         // getpwuid（呼び出しユーザの HOME/補助グループ解決）
 #include <signal.h>
 #include <spawn.h>
+#include <sys/wait.h>    // waitpid（降格失敗した子の後始末）
 #include <termios.h>
 #include <unistd.h>
 #include <util.h>        // openpty
+#include <vector>
 #include <crt_externs.h> // _NSGetEnviron
 
 #include <mach/mach_vm.h>
@@ -18,6 +22,12 @@
 #endif
 #ifndef _POSIX_SPAWN_DISABLE_ASLR
 #define _POSIX_SPAWN_DISABLE_ASLR 0x0100 // Apple 拡張: ASLR 無効化（dyld スライド 0 でロード）
+#endif
+#ifndef POSIX_SPAWN_SETEXEC
+#define POSIX_SPAWN_SETEXEC 0x0040 // Apple 拡張: fork せず呼び出しプロセスをその場で exec（降格後に使う）
+#endif
+#ifndef NGROUPS_MAX
+#define NGROUPS_MAX 16 // setgroups が受け付ける補助グループ数の上限（macOS）
 #endif
 
 namespace ta2 {
@@ -35,6 +45,75 @@ static void chownLogToInvoker(const std::string& path) {
   if (uid == 0) return;
   (void)chown(path.c_str(), uid, gid);
 }
+
+namespace {
+
+// launch で起動する子を「呼び出しユーザ」権限へ降格するための情報。
+// デバッガ自身（親）は task_for_pid のため root を保つが、デバッグ対象の子まで root で
+// 走らせるのは過剰で、ファイル所有や権限チェックの挙動が普段の実行と変わってしまう。
+// そこで sudo 実行時だけ、SUDO_UID/GID の一般ユーザへ子を落とす。
+struct DropInfo {
+  bool want = false;
+  uid_t uid = 0;
+  gid_t gid = 0;
+  std::vector<gid_t> groups; // 補助グループ（root のそれを引きずらないよう付け替える）
+  std::string home, name;    // 子の HOME/USER/LOGNAME を普段どおりにするため
+};
+
+// 降格情報を「親・fork 前」で全部そろえる。fork 後の子では getpwuid/getgrouplist/setenv の
+// ような async-signal-safe でない API を使えない（マルチスレッド親からの fork でデッドロックし得る）
+// ため、DB 参照やメモリ確保を伴うものはここで済ませ、子では syscall だけを呼ぶ。
+DropInfo computeInvokerDrop() {
+  DropInfo d;
+  if (geteuid() != 0) return d;                 // root でなければ降格不要（entitlement 運用など）
+  const char* su = getenv("SUDO_UID");
+  const char* sg = getenv("SUDO_GID");
+  if (!su || !*su) return d;                    // sudo 経由でなければ対象外
+  uid_t uid = (uid_t)strtoul(su, nullptr, 10);
+  if (uid == 0) return d;                        // 降格先が root では意味がない
+  gid_t gid = (sg && *sg) ? (gid_t)strtoul(sg, nullptr, 10) : (gid_t)uid;
+  d.want = true; d.uid = uid; d.gid = gid;
+  if (struct passwd* pw = getpwuid(uid)) {
+    if (pw->pw_dir)  d.home = pw->pw_dir;
+    if (pw->pw_name) d.name = pw->pw_name;
+    if (!d.name.empty()) {                        // 補助グループ一覧を getgrouplist で取得
+      int ng = 32; std::vector<int> g(ng);
+      if (getgrouplist(d.name.c_str(), (int)gid, g.data(), &ng) < 0 && ng > 0) {
+        g.assign(ng, 0);
+        getgrouplist(d.name.c_str(), (int)gid, g.data(), &ng);
+      }
+      // macOS の setgroups は NGROUPS_MAX(=16) までしか受け付けない（getgrouplist はそれ以上
+      // 返し得る）。超過分で setgroups が EINVAL になるので先頭 NGROUPS_MAX 件に丸める。
+      if (ng > NGROUPS_MAX) ng = NGROUPS_MAX;
+      for (int i = 0; i < ng; i++) d.groups.push_back((gid_t)g[i]);
+    }
+  }
+  return d;
+}
+
+// 子へ渡す環境を用意する。降格時は HOME/USER/LOGNAME を呼び出しユーザのものへ差し替え、
+// 普段ユーザが起動したときと同じ素性にする（デバッグ対象が getenv("HOME") 等を見る場合の対策）。
+// 返り値の char* は envStore 内の文字列実体を指すので、envStore を spawn 完了まで生かすこと。
+std::vector<char*> buildChildEnv(const DropInfo& d, std::vector<std::string>& envStore) {
+  auto isvar = [](const char* e, const char* k) {
+    size_t n = strlen(k); return strncmp(e, k, n) == 0 && e[n] == '=';
+  };
+  for (char** e = *_NSGetEnviron(); e && *e; ++e) {
+    if (d.want && (isvar(*e, "HOME") || isvar(*e, "USER") || isvar(*e, "LOGNAME"))) continue;
+    envStore.push_back(*e);
+  }
+  if (d.want) {
+    if (!d.home.empty()) envStore.push_back("HOME=" + d.home);
+    if (!d.name.empty()) { envStore.push_back("USER=" + d.name); envStore.push_back("LOGNAME=" + d.name); }
+  }
+  std::vector<char*> envp;
+  envp.reserve(envStore.size() + 1);
+  for (auto& s : envStore) envp.push_back(s.data()); // 全 push_back 後に取得（再確保後なので安全）
+  envp.push_back(nullptr);
+  return envp;
+}
+
+} // namespace
 
 Target::~Target() {
   detach();
@@ -63,11 +142,17 @@ bool Target::attach(pid_t pid, std::string& err) {
 bool Target::launch(const std::string& path, char* const argv[], std::string& err) {
   if (task_ != 0) { err = "すでにアタッチしている"; return false; }
 
+  // sudo 実行時は子を呼び出しユーザへ降格する（情報は fork 前にそろえる）。
+  DropInfo drop = computeInvokerDrop();
+
   posix_spawnattr_t attr;
   posix_spawnattr_init(&attr);
   // START_SUSPENDED: 走り出す前に止めて生成。DISABLE_ASLR: スライドを 0 に固定し、
   // 再実行のたびに同じアドレスにする（lldb/debugserver の既定と同じ。ブレイクやログ突合が再現可能になる）。
-  posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR);
+  // 降格時は fork 済みの子でその場 exec するため SETEXEC も立てる。
+  short spawnFlags = POSIX_SPAWN_START_SUSPENDED | _POSIX_SPAWN_DISABLE_ASLR;
+  if (drop.want) spawnFlags |= POSIX_SPAWN_SETEXEC;
+  posix_spawnattr_setflags(&attr, spawnFlags);
 
   // 子の標準出力/エラーは TUI を汚さないようログファイルへ。ただしレギュラーファイルへ直結すると
   // 子 libc が「端末ではない」と判断して全バッファ（4〜8KB 単位）になり、ブレイクで止めている間は
@@ -102,15 +187,54 @@ bool Target::launch(const std::string& path, char* const argv[], std::string& er
     posix_spawn_file_actions_adddup2(&fa, 1, 2);
   }
 
+  // 子へ渡す環境（降格時は HOME/USER/LOGNAME を呼び出しユーザへ）。envStore を spawn まで生かす。
+  std::vector<std::string> envStore;
+  std::vector<char*> envp = buildChildEnv(drop, envStore);
+
   pid_t pid = 0;
-  char** envp = *_NSGetEnviron();
-  int rc = posix_spawn(&pid, path.c_str(), &fa, &attr, argv, envp);
+  int rc = 0, childStage = 0; // childStage: 1=setgroups 2=setgid 3=setuid 4=exec（降格経路の失敗箇所）
+  if (drop.want) {
+    // fork → 子で一般ユーザへ降格 → SETEXEC でその場に対象を exec。親は root を保ち task_for_pid できる。
+    // 子の降格/exec 失敗は self-pipe（CLOEXEC）で親へ通知: 成功 exec なら write 端が閉じて親は EOF を受ける。
+    int efd[2] = {-1, -1};
+    if (pipe(efd) == 0) { fcntl(efd[1], F_SETFD, FD_CLOEXEC); fcntl(efd[0], F_SETFD, FD_CLOEXEC); }
+    pid = fork();
+    if (pid == 0) {                              // ---- 子（fork 後は syscall のみ）----
+      if (efd[0] >= 0) close(efd[0]);
+      auto fail = [&](int stage) {
+        int e = errno;
+        if (efd[1] >= 0) { (void)!write(efd[1], &stage, sizeof(stage)); (void)!write(efd[1], &e, sizeof(e)); }
+        _exit(127);
+      };
+      if (!drop.groups.empty() && setgroups((int)drop.groups.size(), drop.groups.data()) != 0) fail(1);
+      if (setgid(drop.gid) != 0) fail(2);
+      if (setuid(drop.uid) != 0) fail(3);
+      posix_spawn(nullptr, path.c_str(), &fa, &attr, argv, envp.data()); // SETEXEC: 失敗時のみ戻る
+      fail(4);
+    }
+    // ---- 親 ----
+    if (efd[1] >= 0) close(efd[1]);
+    if (pid < 0) {
+      rc = errno;                                // fork 失敗
+      if (efd[0] >= 0) close(efd[0]);
+    } else if (efd[0] >= 0) {
+      int stage = 0, cerr = 0;
+      ssize_t r1 = read(efd[0], &stage, sizeof(stage)); // 成功 exec なら CLOEXEC で write 端が閉じ EOF(=0)
+      if (r1 == (ssize_t)sizeof(stage)) { (void)!read(efd[0], &cerr, sizeof(cerr)); rc = cerr ? cerr : EPERM; childStage = stage; }
+      close(efd[0]);
+    }
+  } else {
+    rc = posix_spawn(&pid, path.c_str(), &fa, &attr, argv, envp.data());
+  }
   posix_spawn_file_actions_destroy(&fa);
   posix_spawnattr_destroy(&attr);
   if (usePty) close(slave); // 親はスレーブ不要。閉じないと子終了時もマスタが EOF にならない
-  if (rc != 0) {
+  if (rc != 0 || pid <= 0) {
     if (usePty) close(master);
-    err = std::string("posix_spawn 失敗: ") + strerror(rc);
+    if (pid > 0) { kill(pid, SIGKILL); int st; waitpid(pid, &st, 0); } // 降格失敗の子を始末
+    const char* st = childStage == 1 ? "setgroups" : childStage == 2 ? "setgid"
+                   : childStage == 3 ? "setuid"    : childStage == 4 ? "exec" : "spawn";
+    err = std::string("子プロセス起動に失敗 (") + st + "): " + strerror(rc ? rc : ECHILD);
     return false;
   }
 
@@ -154,8 +278,8 @@ bool Target::launch(const std::string& path, char* const argv[], std::string& er
       }
     });
   }
-  // sudo 実行だとログは root 所有で生成される（PTY 版は親の open、非 PTY 版は子の addopen）。
-  // どちらの経路でもここまでにファイルは出来ているので、呼び出しユーザ所有へ戻す。
+  // PTY 版のログは親（root）が open するので root 所有のまま。呼び出しユーザ所有へ戻す。
+  // （非 PTY＋降格経路では子＝ユーザが addopen するので元からユーザ所有。chown は冪等で無害。）
   chownLogToInvoker(logpath);
   return true;
 }
