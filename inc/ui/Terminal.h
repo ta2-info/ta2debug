@@ -39,6 +39,8 @@ public:
   void home();          // 原点復帰のみ（\x1b[H）。消さずに上書き描画してチラつきを避ける
   void clearLine(int row);
   void moveTo(int col, int row);        // 0 始まり
+  void hideCursor();                    // ハードウェアカーソルを隠す（\x1b[?25l）
+  void showCursorAt(int col, int row);  // (col,row) へ置いてカーソルを表示（コマンド入力中に出す）。0 始まり
   void put(const std::string& s);
   void putAt(int col, int row, const std::string& s); // 可視文字はセル格子にも控える
   void flush();
