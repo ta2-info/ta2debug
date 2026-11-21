@@ -151,14 +151,14 @@ void Terminal::gridPut(int col, int row, const std::string& s) {
 }
 
 // ---- マウス選択 ----
-void Terminal::selStart(int col, int row) {
-  selActive_ = true; selAr_ = row; selAc_ = col; selCr_ = row; selCc_ = col;
+void Terminal::selStart(int col, int row, bool rect) {
+  selActive_ = true; selRect_ = rect; selAr_ = row; selAc_ = col; selCr_ = row; selCc_ = col;
 }
 void Terminal::selUpdate(int col, int row) {
   if (!selActive_) { selStart(col, row); return; }
   selCr_ = row; selCc_ = col;
 }
-void Terminal::clearSelection() { selActive_ = false; }
+void Terminal::clearSelection() { selActive_ = false; selRect_ = false; }
 
 // 読み順で (begin<=end) を返す
 void selOrdered(int ar, int ac, int cr, int cc, int& br, int& bc, int& er, int& ec) {
@@ -166,14 +166,27 @@ void selOrdered(int ar, int ac, int cr, int cc, int& br, int& bc, int& er, int& 
   else { br = cr; bc = cc; er = ar; ec = ac; }
 }
 
+// 選択範囲の境界を求める。矩形(selRect_)なら列範囲を各行へ適用、通常は読み順[begin..end]。
+// 通常選択では「終端がちょうど行頭(列0)なら直前の行末まで」の補正も行う
+// （一番左からドラッグして行全体を選ぶとき、次行の先頭まで選ばれてしまうのを防ぐ）。
+void Terminal::selBounds(int& br, int& bc, int& er, int& ec) const {
+  if (selRect_) {
+    br = std::min(selAr_, selCr_); er = std::max(selAr_, selCr_);
+    bc = std::min(selAc_, selCc_); ec = std::max(selAc_, selCc_);
+    return;
+  }
+  selOrdered(selAr_, selAc_, selCr_, selCc_, br, bc, er, ec);
+  if (er > br && ec == 0) { er--; ec = gridCols_ - 1; }
+}
+
 void Terminal::drawSelectionOverlay() {
   if (!selActive_ || cells_.empty()) return;
-  int br, bc, er, ec; selOrdered(selAr_, selAc_, selCr_, selCc_, br, bc, er, ec);
+  int br, bc, er, ec; selBounds(br, bc, er, ec);
   br = std::max(0, std::min(br, gridRows_ - 1));
   er = std::max(0, std::min(er, gridRows_ - 1));
   for (int r = br; r <= er; r++) {
-    int cs = (r == br) ? bc : 0;
-    int ce = (r == er) ? ec : gridCols_ - 1;
+    int cs = selRect_ ? bc : ((r == br) ? bc : 0);
+    int ce = selRect_ ? ec : ((r == er) ? ec : gridCols_ - 1);
     cs = std::max(0, std::min(cs, gridCols_ - 1));
     ce = std::max(0, std::min(ce, gridCols_ - 1));
     if (cs > ce) continue;
@@ -190,13 +203,13 @@ void Terminal::drawSelectionOverlay() {
 
 std::string Terminal::selectedText() const {
   if (!selActive_ || cells_.empty()) return "";
-  int br, bc, er, ec; selOrdered(selAr_, selAc_, selCr_, selCc_, br, bc, er, ec);
+  int br, bc, er, ec; selBounds(br, bc, er, ec); // 描画側と同じ境界（矩形/終端補正を含む）
   br = std::max(0, std::min(br, gridRows_ - 1));
   er = std::max(0, std::min(er, gridRows_ - 1));
   std::string out;
   for (int r = br; r <= er; r++) {
-    int cs = (r == br) ? bc : 0;
-    int ce = (r == er) ? ec : gridCols_ - 1;
+    int cs = selRect_ ? bc : ((r == br) ? bc : 0);
+    int ce = selRect_ ? ec : ((r == er) ? ec : gridCols_ - 1);
     cs = std::max(0, std::min(cs, gridCols_ - 1));
     ce = std::max(0, std::min(ce, gridCols_ - 1));
     std::string line;
