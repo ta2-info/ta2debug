@@ -26,6 +26,7 @@ struct Breakpoint {
   int slot = -1;      // hw の場合に割り当てたデバッグレジスタ番号（バンク内 0..）
   int watchSize = 0;  // watch の監視バイト数（1/2/4/8）
   bool onRead = false, onWrite = false; // watch の監視アクセス種別
+  bool oneshot = false; // 一度きり（tb/tbh）。命中して停止を見せたら自動削除する。永続化しない。
 };
 
 class Breakpoints {
@@ -34,10 +35,11 @@ public:
 
   // ---- ユーザ操作 ----
   // 追加（同アドレスが既にあれば既存を返す）。有効なら物理的に INT3 を置く。失敗で nullptr。
-  const Breakpoint* add(uint64_t addr);
+  // oneshot=true で一度きりブレイク（tb）。命中後に UI 側が削除する。
+  const Breakpoint* add(uint64_t addr, bool oneshot = false);
   // ハードウェアブレイク追加。空きデバッグレジスタが無ければ nullptr。
-  // メモリは書き換えず、実際のレジスタ反映は Session::syncHwBreaks() が担う。
-  const Breakpoint* addHw(uint64_t addr);
+  // メモリは書き換えず、実際のレジスタ反映は Session::syncHwBreaks() が担う。oneshot=true で一度きり（tbh）。
+  const Breakpoint* addHw(uint64_t addr, bool oneshot = false);
   // ハードウェアウォッチポイント追加（データアクセス監視）。size は 1/2/4/8。空き無しで nullptr。
   const Breakpoint* addWatch(uint64_t addr, int size, bool onRead, bool onWrite);
   int hwCapacity() const { return target_.arch().hwBreakCount(); }  // 実行ブレイク用レジスタ本数

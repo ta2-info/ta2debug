@@ -611,6 +611,7 @@ struct PendingNameBp {
   int kind = 0;       // 0=ソフト / 1=HW 実行 / 2=ウォッチ
   int watchSize = 8;  // kind==2
   bool onR = false, onW = false; // kind==2
+  bool oneshot = false; // 一度きり（tb/tbh）
 };
 std::vector<PendingNameBp> g_pendingName;
 int g_pendingNameSeq = 0;
@@ -710,6 +711,7 @@ void saveBreakpoints() {
   if (mainUuid.empty()) { g_message = "主実行ファイルに UUID が無く保存できません"; render(); return; }
   std::vector<BpRecord> recs; int skipped = 0;
   for (const auto& b : g_session.breaks().list()) {
+    if (b.oneshot) continue; // 一度きりは永続化しない
     const Image* im = g_session.images().byAddress(b.addr);
     std::string u = im ? uuidHexOf(*im) : "";
     if (u.empty()) { skipped++; continue; } // イメージ外（JIT/ヒープ等）は復元不能なので保存しない
@@ -772,6 +774,7 @@ void doRestart() {
   // ブレイクを同一アドレスへ張り直す（種別と有効状態を保つ）。
   int reapplied = 0; bool anyHw = false;
   for (const auto& b : saved) {
+    if (b.oneshot) continue; // 一度きりは再起動で引き継がない（使い捨て）
     const Breakpoint* nb;
     if (b.hw && b.watch) { nb = g_session.breaks().addWatch(b.addr, b.watchSize, b.onRead, b.onWrite); anyHw = true; }
     else if (b.hw)       { nb = g_session.breaks().addHw(b.addr); anyHw = true; }
@@ -1849,11 +1852,11 @@ static bool isUnresolvedSymError(const std::string& err) {
 }
 
 // b/bh/w の式が未ロードで解決できなかったとき予約する。表示用の予約番号(P<n>)を返す。
-static int reserveNameBp(const std::string& expr, int kind, int watchSize, bool onR, bool onW) {
+static int reserveNameBp(const std::string& expr, int kind, int watchSize, bool onR, bool onW, bool oneshot) {
   PendingNameBp p;
   p.pid = ++g_pendingNameSeq;
   p.expr = trimStr(expr);
-  p.kind = kind; p.watchSize = watchSize; p.onR = onR; p.onW = onW;
+  p.kind = kind; p.watchSize = watchSize; p.onR = onR; p.onW = onW; p.oneshot = oneshot;
   g_pendingName.push_back(p);
   g_pendingImgCount = g_session.images().images().size(); // 次に dlopen が起きるまで再評価しない
   return p.pid;
@@ -1874,8 +1877,8 @@ int applyPendingNameBreakpoints() {
     if (!ex.eval(p.expr, addr, eerr)) { still.push_back(p); continue; } // まだ解決できない
     const Breakpoint* nb = nullptr;
     if (p.kind == 2)      { nb = g_session.breaks().addWatch(addr, p.watchSize, p.onR, p.onW); anyHw = true; }
-    else if (p.kind == 1) { nb = g_session.breaks().addHw(addr); anyHw = true; }
-    else                  { nb = g_session.breaks().add(addr); }
+    else if (p.kind == 1) { nb = g_session.breaks().addHw(addr, p.oneshot); anyHw = true; }
+    else                  { nb = g_session.breaks().add(addr, p.oneshot); }
     if (nb) applied++;
     else    still.push_back(p); // 空き DR 無し等 → 次回再挑戦
   }
@@ -1954,7 +1957,7 @@ void runCommand(const std::string& line) {
     evalAsync(arg, [arg](bool ok, uint64_t addr, const std::string& eerr) {
       if (!ok) {
         if (isUnresolvedSymError(eerr)) { // 未ロードのライブラリのシンボル → 予約（dlopen 後に自動設定）
-          int pid = reserveNameBp(arg, 0, 0, false, false);
+          int pid = reserveNameBp(arg, 0, 0, false, false, false);
           g_message = "予約 P" + std::to_string(pid) + ": " + trimStr(arg) + " は未ロード。ロードされ次第ソフトブレイクを張ります（bl で確認 / bd P" + std::to_string(pid) + " で取消）";
         } else g_message = "式エラー: " + eerr;
         return;
@@ -1973,7 +1976,7 @@ void runCommand(const std::string& line) {
     evalAsync(arg, [arg](bool ok, uint64_t addr, const std::string& eerr) {
       if (!ok) {
         if (isUnresolvedSymError(eerr)) { // 未ロードのライブラリのシンボル → 予約（dlopen 後に HW ブレイク）
-          int pid = reserveNameBp(arg, 1, 0, false, false);
+          int pid = reserveNameBp(arg, 1, 0, false, false, false);
           g_message = "予約 P" + std::to_string(pid) + ": " + trimStr(arg) + " は未ロード。ロードされ次第 HW ブレイクを張ります（bl で確認 / bd P" + std::to_string(pid) + " で取消）";
         } else g_message = "式エラー: " + eerr;
         return;
@@ -1987,6 +1990,28 @@ void runCommand(const std::string& line) {
       } else {
         char buf[80]; snprintf(buf, sizeof(buf), "HW ブレイク空きなし（最大 %d 本）", g_session.breaks().hwCapacity());
         g_message = buf;
+      }
+    });
+  } else if (cmd == "tb" || cmd == "tbh") {
+    // 一度きり（one-shot）ブレイク: 命中して停止を見せたら自動削除する。tb=ソフト / tbh=HW。
+    if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
+    bool hw = (cmd == "tbh");
+    evalAsync(arg, [arg, hw](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) {
+        if (isUnresolvedSymError(eerr)) { // 未ロード → 一度きりで予約
+          int pid = reserveNameBp(arg, hw ? 1 : 0, 0, false, false, true);
+          g_message = "予約 P" + std::to_string(pid) + ": " + trimStr(arg) + " は未ロード。ロードされ次第" + (hw ? " HW " : "ソフト") + "一度きりブレイクを張ります（bd P" + std::to_string(pid) + " で取消）";
+        } else g_message = "式エラー: " + eerr;
+        return;
+      }
+      const Breakpoint* bp = hw ? g_session.breaks().addHw(addr, true) : g_session.breaks().add(addr, true);
+      if (bp) {
+        if (hw) g_session.syncHwBreaks();
+        std::string w = g_session.describe(addr);
+        char buf[96]; snprintf(buf, sizeof(buf), "#%d %s一度きりブレイク設定 0x%llx", bp->id, hw ? "HW " : "", (unsigned long long)addr);
+        g_message = std::string(buf) + (w.empty() ? "" : ("  " + w));
+      } else {
+        g_message = hw ? "HW ブレイク空きなし" : "ブレイク設定失敗（メモリに書けない？）";
       }
     });
   } else if (cmd == "w") {
@@ -2005,7 +2030,7 @@ void runCommand(const std::string& line) {
     evalAsync(expr, [expr, size, onR, onW](bool ok, uint64_t addr, const std::string& eerr) {
       if (!ok) {
         if (isUnresolvedSymError(eerr)) { // 未ロードのライブラリのシンボル → 予約（dlopen 後にウォッチ）
-          int pid = reserveNameBp(expr, 2, size, onR, onW);
+          int pid = reserveNameBp(expr, 2, size, onR, onW, false);
           g_message = "予約 P" + std::to_string(pid) + ": " + trimStr(expr) + " は未ロード。ロードされ次第ウォッチを張ります（bl で確認 / bd P" + std::to_string(pid) + " で取消）";
         } else g_message = "式エラー: " + eerr;
         return;
@@ -2034,6 +2059,7 @@ void runCommand(const std::string& line) {
       if (!w.empty()) one += " " + w;
       if (b.watch) { char t[32]; snprintf(t, sizeof(t), " [W %s%dB]", (b.onRead&&b.onWrite)?"rw":b.onRead?"r":"w", b.watchSize); one += t; }
       else if (b.hw) one += " [HW]";
+      if (b.oneshot) one += " [1回]";
       if (!b.enabled) one += " [無効]";
       if (b.hits) { char h[24]; snprintf(h, sizeof(h), " (%lluhit)", (unsigned long long)b.hits); one += h; }
       if (!s.empty()) s += "   ";
@@ -2591,6 +2617,7 @@ void runCommand(const std::string& line) {
       "",
       "  \x1b[2m[ブレイク・シンボル]\x1b[0m",
       "    b        カーソル行（未選択なら現在位置）のブレイクをトグル（有れば解除／無ければ設定）",
+      "    t        カーソル行に一度きり（one-shot）ブレイク（命中したら自動削除）。既にあれば解除",
       "    e        ブレイク編集オーバレイ（= :be。一覧→削除 / 有効無効 / Soft⇄Hard / 条件編集）",
       "    m        カーソル行にユーザシンボルを登録／編集（func<0詰16進>。= :ann 即実行）",
       "    w        今のブレイクを永続化（次回 :run で自動復元。無操作の終了では維持＝勝手に消さない）",
@@ -2621,6 +2648,7 @@ void runCommand(const std::string& line) {
       "\x1b[36m― ブレイクポイント ―\x1b[0m",
       "  :b  <式>                   ソフトブレイク（INT3/BRK）。未ロードのライブラリのシンボルは予約し、ロード後に自動設定",
       "  :bh <式>                   ハードウェア実行ブレイク（デバッグレジスタ）。未ロードなら同様に予約",
+      "  :tb <式> / :tbh <式>        一度きりブレイク（命中したら自動削除）。tb=ソフト / tbh=HW。未ロードなら予約",
       "  :w  <式> [1/2/4/8] [r|w|rw] ウォッチポイント（データ監視・既定 8 バイト書込）。未ロードなら同様に予約",
       "  :bl                        一覧（● SW / ◆ HW / [W] ウォッチ, [無効] / (Nhit)、P番号=予約（未ロード））",
       "  :be / :bedit（e キー）      ブレイク編集オーバレイ: 一覧→選択→d 削除 / e 有効無効 / h Soft⇄Hard / a アドレス / s サイズ / r アクセス",
@@ -2688,7 +2716,7 @@ void runCommand(const std::string& line) {
 // コマンド名の TAB 補完（最初の語のみ。引数部では何もしない）。
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
-  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "what", "whatis", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "bl", "be", "bedit", "bd", "bt",
+  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "what", "whatis", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "tb", "tbh", "bl", "be", "bedit", "bd", "bt",
                                "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "struct", "types", "scwatch", "scstop", "mouse"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
@@ -2890,6 +2918,26 @@ void toggleBreakAt(uint64_t a) {
 void toggleBreakAtCursor() {
   uint64_t a = g_curAddr ? g_curAddr : viewPc();
   toggleBreakAt(a);
+  render();
+}
+
+// t キー: カーソル行（未選択なら PC）に一度きり（one-shot）ソフトブレイクを張る。
+// 既にブレイクがあれば解除（b キーと同じトグル感）。命中して停止を見せたら自動削除される。
+void toggleOneshotAtCursor() {
+  uint64_t a = g_curAddr ? g_curAddr : viewPc();
+  const Breakpoint* ex = g_session.breaks().userAt(a);
+  if (ex) {
+    int id = ex->id; bool hw = ex->hw;
+    if (g_session.breaks().removeId(id)) { if (hw) g_session.syncHwBreaks();
+      char m[80]; snprintf(m, sizeof(m), "#%d ブレイク解除 0x%llx", id, (unsigned long long)a); g_message = m; }
+    else g_message = "解除に失敗";
+  } else {
+    const Breakpoint* bp = g_session.breaks().add(a, /*oneshot=*/true);
+    if (bp) { std::string w = g_session.describe(a);
+      char m[96]; snprintf(m, sizeof(m), "#%d 一度きりブレイク設定 0x%llx", bp->id, (unsigned long long)a);
+      g_message = std::string(m) + (w.empty() ? "" : ("  " + w)); }
+    else g_message = "ブレイク設定失敗（メモリに書けない？）";
+  }
   render();
 }
 
@@ -3144,6 +3192,7 @@ void onKey(int c) {
     case 'N': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.stepOverHw(); g_state = UiState::Running; render(); } break; // Shift+N: HW ブレイクで step-over
     case 'c': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.cont(); g_state = UiState::Running; g_message.clear(); render(); } break;
     case 'b': if (g_state == UiState::Stopped && g_session.isAttached()) toggleBreakAtCursor(); break; // カーソル行のブレイクをトグル
+    case 't': if (g_state == UiState::Stopped && g_session.isAttached()) toggleOneshotAtCursor(); break; // カーソル行に一度きりブレイク
     case 'm': if (g_state == UiState::Stopped && g_session.isAttached()) annotateAtCursor(); break;   // カーソル行に func<16進> シンボルを登録／編集
     case 'R': if (!g_launchArgs.empty()) doRestart(); break; // 対象を同じアドレスで起動し直す（ブレイク復元）
     case 'a': if (g_state == UiState::Stopped && g_session.isAttached()) { runCommand("auto"); render(); } break; // auto（既定=call/syscall/ret すべて）
@@ -3202,6 +3251,18 @@ bool onStoppedEvent() {
     if (!reason.empty() && !sc.empty()) g_message = reason + "  → " + sc;
     else if (!reason.empty())           g_message = reason;
     else if (!sc.empty())               g_message = "→ syscall: " + sc;
+  }
+  // 一度きり（tb/tbh）ブレイク命中なら、この停止を見せた上でその場で削除する（次の継続では止まらない）。
+  if (g_session.stopException() == 0) {
+    uint64_t pc = g_session.stopPc();
+    const Breakpoint* ub = g_session.breaks().userAt(pc);
+    if (ub && ub->oneshot && ub->enabled) {
+      int id = ub->id; bool hw = ub->hw;
+      if (g_session.breaks().removeId(id)) {
+        if (hw) g_session.syncHwBreaks();
+        g_message += std::string(g_message.empty() ? "" : "  ／ ") + "#" + std::to_string(id) + " は一度きり: 自動削除";
+      }
+    }
   }
   // 起動直後の確定停止（エントリ）で、保存ブレイクを一度だけ復元する（images が揃ったこの時点で）。
   if (g_restorePending) {

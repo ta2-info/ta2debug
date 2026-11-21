@@ -104,7 +104,7 @@ int Breakpoints::allocHwSlot(bool forWatch) const {
 
 // ---- ユーザ層 ----
 
-const Breakpoint* Breakpoints::add(uint64_t addr) {
+const Breakpoint* Breakpoints::add(uint64_t addr, bool oneshot) {
   for (auto& b : bps_) if (b.addr == addr) return &b; // 既存
   if (!addSoft(addr)) return nullptr;                 // 物理設置に失敗
   Breakpoint b;
@@ -112,11 +112,12 @@ const Breakpoint* Breakpoints::add(uint64_t addr) {
   b.addr = addr;
   b.enabled = true;
   b.hits = 0;
+  b.oneshot = oneshot;
   bps_.push_back(b);
   return &bps_.back();
 }
 
-const Breakpoint* Breakpoints::addHw(uint64_t addr) {
+const Breakpoint* Breakpoints::addHw(uint64_t addr, bool oneshot) {
   for (auto& b : bps_) if (!b.watch && b.addr == addr) return &b; // 同アドレスの実行ブレイクは 1 つ
   int slot = allocHwSlot(false);
   if (slot < 0) return nullptr; // 空きデバッグレジスタなし
@@ -127,6 +128,7 @@ const Breakpoint* Breakpoints::addHw(uint64_t addr) {
   b.hits = 0;
   b.hw = true;
   b.slot = slot;
+  b.oneshot = oneshot;
   bps_.push_back(b);
   return &bps_.back();
 }
