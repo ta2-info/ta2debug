@@ -34,6 +34,10 @@ public:
   // 手放す（自分で掛けた suspend は解除。タスクポートを deallocate。起動した子なら終了させる）。
   void detach();
 
+  // 既定では sudo 実行時に起動する子を呼び出しユーザへ降格する（子を root で走らせない）。
+  // root 権限が必要なプログラムを起動したい場合に、この降格を無効化する（子も root のまま）。
+  void setLaunchKeepRoot(bool on) { launchKeepRoot_ = on; }
+
   bool launched() const { return launched_; } // 自分で起動した子か
 
   bool isAttached() const { return task_ != 0; }
@@ -75,7 +79,8 @@ private:
   task_t task_ = 0;
   std::unique_ptr<Arch> arch_;
   std::atomic<int> suspendCount_{0}; // consumer スレッドからも触る（dtrace stop 取り込み）ため atomic
-  bool launched_ = false; // 自分で起動した子（detach 時に終了させる）
+  bool launched_ = false;       // 自分で起動した子（detach 時に終了させる）
+  bool launchKeepRoot_ = false; // true なら launch 時に子を降格しない（root のまま走らせる）
   int ptyMaster_ = -1;    // 子 stdout/stderr を映す PTY マスタ（launch 時のみ。attach では -1）
   int logFd_ = -1;        // 書き写し先 <path>.ta2debug.log の fd
   std::thread ptyPump_;   // ptyMaster_ → logFd_ を読んでは書くポンプスレッド

@@ -143,7 +143,8 @@ bool Target::launch(const std::string& path, char* const argv[], std::string& er
   if (task_ != 0) { err = "すでにアタッチしている"; return false; }
 
   // sudo 実行時は子を呼び出しユーザへ降格する（情報は fork 前にそろえる）。
-  DropInfo drop = computeInvokerDrop();
+  // ただし setLaunchKeepRoot(true) が指定されていれば降格しない（root が必要なプログラム向け）。
+  DropInfo drop = launchKeepRoot_ ? DropInfo{} : computeInvokerDrop();
 
   posix_spawnattr_t attr;
   posix_spawnattr_init(&attr);
