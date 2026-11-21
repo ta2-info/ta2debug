@@ -176,6 +176,19 @@ const Image* Session::defaultLibImage() {
   return images_.mainExecutable();
 }
 
+std::vector<const Image*> Session::preferredImages(uint64_t contextPc) {
+  std::vector<const Image*> out;
+  auto add = [&](const Image* im) {
+    if (!im) return;
+    for (const Image* e : out) if (e == im) return; // 重複除去
+    out.push_back(im);
+  };
+  if (!defaultLib_.empty()) add(images_.byName(defaultLib_)); // 1. uselib 明示
+  if (contextPc) add(images_.byAddress(contextPc));           // 2. 実行文脈（PC のイメージ）
+  add(images_.mainExecutable());                              // 3. 主実行ファイル
+  return out;
+}
+
 DwarfLines* Session::linesForImage(const Image& img) {
   std::string key;
   if (img.hasUuid) { char h[33]; for (int i = 0; i < 16; i++) snprintf(h + i*2, 3, "%02x", img.uuid[i]); key.assign(h, 32); }
@@ -199,9 +212,11 @@ bool Session::sourceLineFor(uint64_t addr, SourceLoc& out) {
   return true;
 }
 
-const DwType* Session::findType(const std::string& name, const DwarfTypes*& owner, uint64_t addrHint) {
+const DwType* Session::findType(const std::string& name, const DwarfTypes*& owner, uint64_t addrHint,
+                                uint64_t contextPc) {
   owner = nullptr;
-  // 探す順: 既定ライブラリ（未設定なら主実行ファイル）→ addrHint のイメージ → 全イメージ。
+  // 探す順: preferredImages（uselib→実行文脈→主実行ファイル）→ addrHint のイメージ → 全イメージ横断。
+  // 名前→アドレス（Expression）と同じ優先順にそろえ、実行中のライブラリの型を主実行ファイルより優先する。
   auto tryImg = [&](const Image* im) -> const DwType* {
     if (!im) return nullptr;
     DwarfLines* dl = linesForImage(*im);
@@ -210,9 +225,7 @@ const DwType* Session::findType(const std::string& name, const DwarfTypes*& owne
     if (t) { owner = &dl->types(); return t; }
     return nullptr;
   };
-  const Image* defImg = defaultLibImage();
-  const Image* mainImg = images_.mainExecutable();
-  if (const DwType* t = tryImg(defImg ? defImg : mainImg)) return t;
+  for (const Image* im : preferredImages(contextPc)) if (const DwType* t = tryImg(im)) return t;
   if (addrHint) if (const DwType* t = tryImg(images_.byAddress(addrHint))) return t;
   for (const auto& im : images_.images()) if (const DwType* t = tryImg(&im)) return t;
   return nullptr;

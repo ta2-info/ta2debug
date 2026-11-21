@@ -91,6 +91,13 @@ public:
   const std::string& defaultLib() const { return defaultLib_; }
   // 既定ライブラリの Image（未設定／見つからなければ主実行ファイル）。
   const Image* defaultLibImage();
+  // ライブラリ名省略時のシンボル／型解決で「先に探すイメージ」の優先順。上から:
+  //   1. uselib で明示指定した既定ライブラリ（ユーザの明示選択）
+  //   2. contextPc が指すイメージ（実行文脈。停止中のライブラリを優先。0 なら飛ばす）
+  //   3. 主実行ファイル
+  // 重複・nullptr は除く。これ以降は呼び出し側が全イメージ横断でフォールバックする。
+  // 名前→アドレス（Expression）と型（findType）で同じ優先順を使うための共通ヘルパ。
+  std::vector<const Image*> preferredImages(uint64_t contextPc);
   // 停止時などに一覧が変わっていれば読み直す（dlopen 追従）
   void refreshImages() { images_.refreshIfChanged(); }
 
@@ -116,9 +123,11 @@ public:
   bool sourceLineFor(uint64_t addr, SourceLoc& out);
 
   // ---- DWARF 型情報（構造体レイアウト等。-g ビルド／dSYM が要る） ----
-  // 型名から型を引く。既定=主実行ファイル、無ければ addrHint を含むイメージ、さらに全イメージを横断。
-  // 見つかれば型を返し、owner に参照解決用の DwarfTypes を入れる。見つからなければ nullptr。
-  const DwType* findType(const std::string& name, const DwarfTypes*& owner, uint64_t addrHint = 0);
+  // 型名から型を引く。優先順は preferredImages(contextPc)（uselib→実行文脈→主実行ファイル）→
+  // addrHint を含むイメージ→全イメージ横断。見つかれば型を返し owner に DwarfTypes を入れる。無ければ nullptr。
+  // contextPc は実行文脈（表示中/停止スレッドの PC）。省略時は実行文脈を使わない。
+  const DwType* findType(const std::string& name, const DwarfTypes*& owner, uint64_t addrHint = 0,
+                         uint64_t contextPc = 0);
   // 型名の一覧（集約型/enum/typedef）。img 省略時は主実行ファイル。filter で部分一致（小文字化）。
   std::vector<std::string> typeNames(const Image* img, const std::string& filter);
 

@@ -2176,7 +2176,7 @@ void runCommand(const std::string& line) {
     evalAsync(expr, [tname](bool ok, uint64_t addr, const std::string& eerr) {
       if (!ok) { g_message = "式エラー: " + eerr; return; }
       const DwarfTypes* tt = nullptr;
-      const DwType* root = g_session.findType(tname, tt, addr);
+      const DwType* root = g_session.findType(tname, tt, addr, viewPc());
       if (!root || !tt) { g_message = "型が見つからない: " + tname + "（-g/dSYM 付きビルド？ :types で一覧）"; return; }
       uint64_t sz = dwSizeOf(tt, root);
       if (sz == 0) sz = 8;
