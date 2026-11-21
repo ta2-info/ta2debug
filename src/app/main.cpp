@@ -3427,7 +3427,10 @@ bool batchExec(const std::string& raw) {
   } else {
     runCommand(line);                 // attach/run/auto/detach/b/bh/w/bl/bd/bt/sym/reg/x/img/seg/help は共通
     batchPrintResults();
-    bool isRun = (cmd == "run" || cmd == "launch" || cmd == "runroot" || cmd == "runasroot");
+    // run/runroot と restart はエントリで、auto は指定イベントで止まる。バッチでは次コマンドの前に
+    // その停止を同期的に待つ（restart も run と同様に扱い、直後の c 等が「停止していません」にならないように）。
+    bool isRun = (cmd == "run" || cmd == "launch" || cmd == "runroot" || cmd == "runasroot"
+                  || cmd == "restart" || cmd == "rerun");
     bool execCmd = (isRun || cmd == "auto");
     if (execCmd && g_state == UiState::Running) willStop = true;          // エントリ停止 / auto 停止を待つ
     else if (isRun && g_state == UiState::Stopped) { g_message.clear(); batchStopReport(); } // 同期的に停止済み
