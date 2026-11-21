@@ -23,7 +23,7 @@ public:
   bool mouseOn() const { return mouse_; }
 
   // ---- マウスによる自前テキスト選択 ----
-  void selStart(int col, int row);       // ドラッグ開始（アンカー固定）。0 始まり
+  void selStart(int col, int row, bool rect = false); // ドラッグ開始（アンカー固定）。0 始まり。rect=true で矩形選択
   void selUpdate(int col, int row);      // ドラッグ中/終了（現在位置を更新）
   void clearSelection();                 // 選択解除
   bool hasSelection() const { return selActive_; }
@@ -48,6 +48,7 @@ public:
 private:
   void ensureGrid();                     // rows_×cols_ に合わせて格子を確保/クリア
   void gridPut(int col, int row, const std::string& s); // putAt の控え（可視文字をセルへ）
+  void selBounds(int& br, int& bc, int& er, int& ec) const; // 選択境界（矩形/終端補正込み）。描画とコピーで共用
 
   bool active_ = false;
   bool mouse_ = false;
@@ -61,6 +62,8 @@ private:
 
   // 選択範囲（画面セル, 0 始まり, 読み順で [anchor..cursor]）。
   bool selActive_ = false;
+  bool selRect_ = false;        // true なら矩形選択（列範囲を各行に適用）。false は通常の行順選択
+
   int selAr_ = 0, selAc_ = 0;   // アンカー
   int selCr_ = 0, selCc_ = 0;   // 現在位置
 };

@@ -2647,6 +2647,7 @@ void runCommand(const std::string& line) {
       "    Shift+クリック     そこにブレイクを設定／解除",
       "    ホイール           逆アセンブル枠をスクロール",
       "    ドラッグ           範囲選択→離すとコピー（pbcopy / OSC52。:mouse off で端末側の選択へ）",
+      "    Option+ドラッグ    矩形（ブロック）選択→離すとコピー",
       "",
       "  \x1b[2m[その他]\x1b[0m",
       "    :        コマンド入力",
@@ -3100,7 +3101,11 @@ void onMouse(int button, int mx, int my, bool press) {
   if (press && motion && btn == 0) {                   // 左ドラッグ（移動）→ 選択
     if (x == g_lastDragX && y == g_lastDragY) return;  // 同一セル内の移動は無視（再描画を間引く）
     g_lastDragX = x; g_lastDragY = y;
-    if (!g_mouseDragging) { g_term.selStart(g_mouseDownX, g_mouseDownY); g_mouseDragging = true; }
+    // 押下時に Option(⌥) を押していれば矩形選択。モードはドラッグ開始時に固定（途中で離してもよい）。
+    if (!g_mouseDragging) {
+      g_term.selStart(g_mouseDownX, g_mouseDownY, (g_mouseDownMods & MOD_ALT) != 0);
+      g_mouseDragging = true;
+    }
     g_term.selUpdate(x, y);
     render();                                           // base ＋ ハイライト重ね
     return;
