@@ -160,6 +160,14 @@ bool Expression::parseRegister(uint64_t& v) {
   return fail("不明なレジスタ '" + name + "'");
 }
 
+const Image* Expression::currentPcImage() const {
+  if (!session_.stopped()) return nullptr;
+  const std::vector<uint8_t>& rsv = regState_.empty() ? session_.stopState() : regState_;
+  if (rsv.empty()) return nullptr;
+  uint64_t pc = session_.arch().pc(rsv.data());
+  return session_.images().byAddress(pc);
+}
+
 bool Expression::parseName(uint64_t& v) {
   size_t start = pos_;
 
@@ -202,20 +210,35 @@ bool Expression::parseName(uint64_t& v) {
 
   if (name.empty()) return fail("名前がない");
 
-  // ライブラリ名省略時: 既定ライブラリ（uselib、未設定なら主実行ファイル）→ 主実行ファイル の順に探す。
-  const Image* defImg = session_.defaultLibImage();
+  // ライブラリ名省略時の優先順位（上から順に探し、見つかった所で確定）:
+  //   1. uselib で明示指定した既定ライブラリ（ユーザの明示選択を最優先）
+  //   2. いま PC が居るイメージ（停止中の実行文脈。ライブラリ内で停止中なら、そのライブラリを優先）
+  //   3. 主実行ファイル
+  // これ以降（上記で見つからないとき）は全イメージを横断（同一扱い）。
+  // 「main だけ優先・他は同一」だと、ライブラリ内で停止していてもそのライブラリが優先されず
+  // 不便だったため、PC 文脈のイメージを主実行ファイルより前に差し込む。
   const Image* mainImg = session_.images().mainExecutable();
-  if (name == "lib") {
-    const Image* base = defImg ? defImg : mainImg;
+  const Image* uselibImg = session_.defaultLib().empty() ? nullptr : session_.defaultLibImage();
+  const Image* pcImg = currentPcImage();
+  if (name == "lib") { // 'lib' は従来どおり「既定ライブラリ（uselib、無ければ主実行ファイル）」の基底
+    const Image* base = uselibImg ? uselibImg : mainImg;
     if (!base) { pos_ = start; return fail("既定ライブラリ／主実行ファイルが不明"); }
     v = base->loadAddr;
     return true;
   }
-  if (!defImg && !mainImg) { pos_ = start; return fail("'" + name + "': 探すイメージが無い（アタッチ済み？）"); }
-  std::vector<const Symbol*> hits;
-  if (defImg) hits = session_.symbols().byName(*defImg, name);
-  if (hits.empty() && mainImg && mainImg != defImg) hits = session_.symbols().byName(*mainImg, name);
-  if (!hits.empty()) {
+  if (!mainImg && !pcImg && !uselibImg) { pos_ = start; return fail("'" + name + "': 探すイメージが無い（アタッチ済み？）"); }
+  // 優先イメージを順に（重複は除く）。各イメージで見つかればそこで確定する。
+  const Image* tiers[] = {uselibImg, pcImg, mainImg};
+  const Image* searched[3] = {nullptr, nullptr, nullptr};
+  int ns = 0;
+  for (const Image* im : tiers) {
+    if (!im) continue;
+    bool dup = false;
+    for (int i = 0; i < ns; i++) if (searched[i] == im) { dup = true; break; }
+    if (dup) continue;
+    searched[ns++] = im;
+    auto hits = session_.symbols().byName(*im, name);
+    if (hits.empty()) continue;
     for (auto* s : hits) if (s->addr != hits[0]->addr) { pos_ = start; return fail(ambiguousMsg(hits)); }
     v = hits[0]->addr; return true;
   }
@@ -247,9 +270,11 @@ bool Expression::parseName(uint64_t& v) {
     pos_ = start; return fail("シンボル '" + name + "' は複数ライブラリにあります（" + libs + "）。『ライブラリ名!" + name + "』で指定してください");
   }
 
-  std::string where = defImg ? defImg->name : std::string("?");
-  if (mainImg && mainImg != defImg) where += " / " + mainImg->name;
-  pos_ = start; return fail("シンボル '" + name + "' が見つからない（" + where + " ほか全イメージを探した。ライブラリ名!" + name + " も試せます）");
+  pos_ = start; return fail("シンボル '" + name + "' が見つからない（優先イメージ"
+                            + (uselibImg ? " " + uselibImg->name : "")
+                            + (pcImg ? " " + pcImg->name : "")
+                            + (mainImg ? " " + mainImg->name : "")
+                            + " ほか全イメージを探した。ライブラリ名!" + name + " も試せます）");
 }
 
 } // namespace ta2

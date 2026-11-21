@@ -18,6 +18,7 @@
 namespace ta2 {
 
 class Session;
+struct Image;
 
 class Expression {
 public:
@@ -46,6 +47,9 @@ private:
   bool parseNumber(uint64_t& v);
   bool parseRegister(uint64_t& v);
   bool parseName(uint64_t& v);
+  // 現在の実行文脈（表示中スレッド、無ければ停止スレッド）の PC があるイメージ。
+  // ライブラリ名省略時のシンボル探索で「いま居るライブラリ」を優先するのに使う。停止中でなければ nullptr。
+  const Image* currentPcImage() const;
   void skipSpaces();
   bool fail(const std::string& msg);
 
