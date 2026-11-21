@@ -600,11 +600,28 @@ void drawThreads(const PaneRect& p) {
 }
 
 // ----- プロセス選択 -----
+// ---- 名前ベースの予約ブレイク（未ロードのライブラリのシンボルを指定されたとき）----
+// ユーザが対話で b/bh/w に、まだロードされていないライブラリのシンボル（例 libfoo!bar や、
+// どのイメージにもまだ無い bar）を渡したとき、失敗で終えずに「予約」しておき、dlopen でそのシンボルが
+// 解決できるようになった停止で改めて張る（lldb の pending breakpoint 相当）。保存ブレイク
+// （UUID+unslid でロード後に復元）とは別経路で、こちらは式（名前）を保持し、再評価で解決する。
+struct PendingNameBp {
+  int pid = 0;        // 表示・削除用の予約番号（P1, P2…）
+  std::string expr;   // ユーザが打った式（例 "libfoo!bar" / "bar"）。再評価に使う
+  int kind = 0;       // 0=ソフト / 1=HW 実行 / 2=ウォッチ
+  int watchSize = 8;  // kind==2
+  bool onR = false, onW = false; // kind==2
+};
+std::vector<PendingNameBp> g_pendingName;
+int g_pendingNameSeq = 0;
+size_t g_pendingImgCount = 0; // 直近に解決を試みたときのイメージ数（増えた時だけ再評価＝全走査の無駄打ち回避）
+
 void doAttach(pid_t pid) {
   std::string err;
   if (g_session.attach(pid, err)) {
     g_state = UiState::Running;
     g_message = "attached pid " + std::to_string(pid);
+    g_pendingName.clear(); g_pendingImgCount = 0; // 新しいセッション: 前の対象の予約は持ち越さない
   } else {
     g_message = "attach 失敗: " + err;
   }
@@ -663,6 +680,7 @@ int applyPendingBreakpoints() {
 // エントリ時点で未ロードのイメージ（dlopen で後から読む分）は g_pendingBp へ回し、以降の停止で張り直す。
 int restoreBreakpoints() {
   g_pendingBp.clear();
+  g_pendingName.clear(); g_pendingImgCount = 0; // fresh :run: 前セッションの予約は持ち越さない
   g_session.refreshImages();
   const Image* mainImg = g_session.images().mainExecutable();
   if (!mainImg) return -1;
@@ -719,6 +737,7 @@ void doLaunch(const std::vector<std::string>& args, bool restoreSaved = true) {
   for (const auto& s : args) cargv.push_back(const_cast<char*>(s.c_str()));
   cargv.push_back(nullptr);
   std::string err;
+  g_pendingImgCount = 0; // 新プロセスのイメージロードで予約を再評価できるように
   if (g_session.launch(args[0], cargv.data(), err)) {
     g_launchArgs = args; // 再起動（:restart）で同じ引数・同じアドレスで起動し直せるよう控える
     g_state = g_session.stopped() ? UiState::Stopped : UiState::Running; // エントリへ走行中→Running、停止済み→Stopped
@@ -1823,6 +1842,48 @@ void evalAsync(const std::string& expr,
   });
 }
 
+// エラー文が「未ロードゆえ解決できない」系か（ライブラリ未ロード or どのイメージにもまだ無い）。
+// 「<img> に無い」（ロード済みなのに不在）や構文エラーは予約対象にしない。
+static bool isUnresolvedSymError(const std::string& err) {
+  return err.find("見つからない") != std::string::npos;
+}
+
+// b/bh/w の式が未ロードで解決できなかったとき予約する。表示用の予約番号(P<n>)を返す。
+static int reserveNameBp(const std::string& expr, int kind, int watchSize, bool onR, bool onW) {
+  PendingNameBp p;
+  p.pid = ++g_pendingNameSeq;
+  p.expr = trimStr(expr);
+  p.kind = kind; p.watchSize = watchSize; p.onR = onR; p.onW = onW;
+  g_pendingName.push_back(p);
+  g_pendingImgCount = g_session.images().images().size(); // 次に dlopen が起きるまで再評価しない
+  return p.pid;
+}
+
+// 予約のうち、いま式が解決できるものを張る。イメージ構成が増えた時だけ評価する（全走査の無駄打ち回避）。
+// 返り値=今回張れた件数。onStoppedEvent と dlopen 内部停止から呼ぶ。
+int applyPendingNameBreakpoints() {
+  if (g_pendingName.empty()) return 0;
+  size_t n = g_session.images().images().size();
+  if (n == g_pendingImgCount) return 0; // イメージ構成が不変＝解決状況も不変
+  g_pendingImgCount = n;
+  int applied = 0; bool anyHw = false;
+  std::vector<PendingNameBp> still;
+  for (auto& p : g_pendingName) {
+    Expression ex(g_session); // 同期評価（module!name は 1 イメージで速い。予約件数も少ない）
+    uint64_t addr = 0; std::string eerr;
+    if (!ex.eval(p.expr, addr, eerr)) { still.push_back(p); continue; } // まだ解決できない
+    const Breakpoint* nb = nullptr;
+    if (p.kind == 2)      { nb = g_session.breaks().addWatch(addr, p.watchSize, p.onR, p.onW); anyHw = true; }
+    else if (p.kind == 1) { nb = g_session.breaks().addHw(addr); anyHw = true; }
+    else                  { nb = g_session.breaks().add(addr); }
+    if (nb) applied++;
+    else    still.push_back(p); // 空き DR 無し等 → 次回再挑戦
+  }
+  g_pendingName.swap(still);
+  if (anyHw) g_session.syncHwBreaks();
+  return applied;
+}
+
 // 引数を「#番号」または式として解釈し、ブレイクの id を fn(id) に渡す（bd/bt 用）。
 // #番号 は式評価が不要なのでその場で即 fn を呼ぶ。式は evalAsync 経由で評価し（重い全画像
 // 探索でも UI を固めない）、完了後にアドレス→ブレイク id を引いて fn を呼ぶ。
@@ -1890,8 +1951,14 @@ void runCommand(const std::string& line) {
     g_message = "auto 実行中…（Ctrl+C で中断）";
   } else if (cmd == "b") {
     if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
-    evalAsync(arg, [](bool ok, uint64_t addr, const std::string& eerr) {
-      if (!ok) { g_message = "式エラー: " + eerr; return; }
+    evalAsync(arg, [arg](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) {
+        if (isUnresolvedSymError(eerr)) { // 未ロードのライブラリのシンボル → 予約（dlopen 後に自動設定）
+          int pid = reserveNameBp(arg, 0, 0, false, false);
+          g_message = "予約 P" + std::to_string(pid) + ": " + trimStr(arg) + " は未ロード。ロードされ次第ソフトブレイクを張ります（bl で確認 / bd P" + std::to_string(pid) + " で取消）";
+        } else g_message = "式エラー: " + eerr;
+        return;
+      }
       const Breakpoint* bp = g_session.breaks().add(addr);
       if (bp) {
         std::string w = g_session.describe(addr);
@@ -1903,8 +1970,14 @@ void runCommand(const std::string& line) {
     });
   } else if (cmd == "bh") {
     if (!g_session.isAttached()) { g_message = "先に attach してください"; return; }
-    evalAsync(arg, [](bool ok, uint64_t addr, const std::string& eerr) {
-      if (!ok) { g_message = "式エラー: " + eerr; return; }
+    evalAsync(arg, [arg](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) {
+        if (isUnresolvedSymError(eerr)) { // 未ロードのライブラリのシンボル → 予約（dlopen 後に HW ブレイク）
+          int pid = reserveNameBp(arg, 1, 0, false, false);
+          g_message = "予約 P" + std::to_string(pid) + ": " + trimStr(arg) + " は未ロード。ロードされ次第 HW ブレイクを張ります（bl で確認 / bd P" + std::to_string(pid) + " で取消）";
+        } else g_message = "式エラー: " + eerr;
+        return;
+      }
       const Breakpoint* bp = g_session.breaks().addHw(addr);
       if (bp) {
         g_session.syncHwBreaks(); // デバッグレジスタへ反映
@@ -1929,8 +2002,14 @@ void runCommand(const std::string& line) {
       else { g_message = "不明な指定: " + t + "（サイズは 1/2/4/8、種別は r/w/rw）"; return; }
     }
     if (!onR && !onW) onW = true; // 既定は書込監視
-    evalAsync(expr, [size, onR, onW](bool ok, uint64_t addr, const std::string& eerr) {
-      if (!ok) { g_message = "式エラー: " + eerr; return; }
+    evalAsync(expr, [expr, size, onR, onW](bool ok, uint64_t addr, const std::string& eerr) {
+      if (!ok) {
+        if (isUnresolvedSymError(eerr)) { // 未ロードのライブラリのシンボル → 予約（dlopen 後にウォッチ）
+          int pid = reserveNameBp(expr, 2, size, onR, onW);
+          g_message = "予約 P" + std::to_string(pid) + ": " + trimStr(expr) + " は未ロード。ロードされ次第ウォッチを張ります（bl で確認 / bd P" + std::to_string(pid) + " で取消）";
+        } else g_message = "式エラー: " + eerr;
+        return;
+      }
       if (addr % (uint64_t)size != 0) { char m[96]; snprintf(m, sizeof(m), "アドレス 0x%llx は %d バイト境界に未整列", (unsigned long long)addr, size); g_message = m; return; }
       const Breakpoint* wp = g_session.breaks().addWatch(addr, size, onR, onW);
       if (wp) {
@@ -1946,7 +2025,7 @@ void runCommand(const std::string& line) {
     });
   } else if (cmd == "bl") {
     const auto& bl = g_session.breaks().list();
-    if (bl.empty()) { g_message = "ブレイクポイントなし（:b <式> で設定）"; return; }
+    if (bl.empty() && g_pendingName.empty()) { g_message = "ブレイクポイントなし（:b <式> で設定）"; return; }
     std::string s;
     for (const auto& b : bl) {
       char head[96]; snprintf(head, sizeof(head), "#%d 0x%llx", b.id, (unsigned long long)b.addr);
@@ -1960,11 +2039,27 @@ void runCommand(const std::string& line) {
       if (!s.empty()) s += "   ";
       s += one;
     }
+    // 名前で予約中（未ロードのライブラリのシンボル。dlopen 後に自動設定）
+    for (const auto& p : g_pendingName) {
+      const char* k = p.kind == 2 ? "W" : p.kind == 1 ? "HW" : "soft";
+      std::string one = "P" + std::to_string(p.pid) + " 予約 " + p.expr + " [" + k + "] (未ロード)";
+      if (!s.empty()) s += "   ";
+      s += one;
+    }
     g_message = s;
   } else if (cmd == "be" || cmd == "bedit") {
     openBpEditor(); // 対話編集オーバレイ（一覧＋選択して削除/有効無効/Soft⇄Hard/条件編集）
   } else if (cmd == "bd") {
-    if (arg.empty()) { g_message = "使い方: bd <#番号 | 式>"; return; }
+    if (arg.empty()) { g_message = "使い方: bd <#番号 | P予約番号 | 式>"; return; }
+    std::string a = trimStr(arg);
+    if ((a[0] == 'P' || a[0] == 'p') && a.size() > 1 && isdigit((unsigned char)a[1])) { // P<n>: 名前予約の取消
+      int pid = atoi(a.c_str() + 1);
+      size_t before = g_pendingName.size();
+      g_pendingName.erase(std::remove_if(g_pendingName.begin(), g_pendingName.end(),
+                          [pid](const PendingNameBp& p) { return p.pid == pid; }), g_pendingName.end());
+      g_message = (g_pendingName.size() < before) ? ("予約 P" + std::to_string(pid) + " を取消") : "その予約番号は無い";
+      return;
+    }
     withBreakId(arg, [](int id) { // #番号 は即時、式は非同期評価のあと
       if (g_session.breaks().removeId(id)) { g_session.syncHwBreaks(); char m[32]; snprintf(m, sizeof(m), "#%d を削除", id); g_message = m; }
       else g_message = "そのブレイクは無い";
@@ -2524,12 +2619,12 @@ void runCommand(const std::string& line) {
       "  :restart / :rerun (R キー) :run した対象を同じ引数・同じアドレスで起動し直す（ブレイクも張り直す）",
       "  :detach                    デタッチ（attach は動き続ける／:run した子は終了させる）",
       "\x1b[36m― ブレイクポイント ―\x1b[0m",
-      "  :b  <式>                   ソフトブレイク（INT3/BRK）",
-      "  :bh <式>                   ハードウェア実行ブレイク（デバッグレジスタ）",
-      "  :w  <式> [1/2/4/8] [r|w|rw] ウォッチポイント（データ監視・既定 8 バイト書込）",
-      "  :bl                        一覧（● SW / ◆ HW / [W] ウォッチ, [無効] / (Nhit)）",
+      "  :b  <式>                   ソフトブレイク（INT3/BRK）。未ロードのライブラリのシンボルは予約し、ロード後に自動設定",
+      "  :bh <式>                   ハードウェア実行ブレイク（デバッグレジスタ）。未ロードなら同様に予約",
+      "  :w  <式> [1/2/4/8] [r|w|rw] ウォッチポイント（データ監視・既定 8 バイト書込）。未ロードなら同様に予約",
+      "  :bl                        一覧（● SW / ◆ HW / [W] ウォッチ, [無効] / (Nhit)、P番号=予約（未ロード））",
       "  :be / :bedit（e キー）      ブレイク編集オーバレイ: 一覧→選択→d 削除 / e 有効無効 / h Soft⇄Hard / a アドレス / s サイズ / r アクセス",
-      "  :bd <#番号|式>             削除       :bt <#番号|式>  ブレイクの有効⇄無効を切替",
+      "  :bd <#番号|P予約番号|式>   削除       :bt <#番号|式>  ブレイクの有効⇄無効を切替",
       "\x1b[36m― 参照 ―\x1b[0m",
       "  :reg [名前]                レジスタ一覧／1 本（停止中）",
       "  :reg xmm[N] / vN           ベクタ/浮動小数レジスタ（x86 xmm0-15 / arm64 v0-31、128bit）",
@@ -3119,6 +3214,9 @@ bool onStoppedEvent() {
   // dlopen 等で後からロードされたイメージの保留ブレイクを、イメージが揃ったこの停止で張り直す。
   int pend = applyPendingBreakpoints();
   if (pend > 0) g_message += std::string(g_message.empty() ? "" : "  ／ ") + "保存ブレイク " + std::to_string(pend) + " 件を復元（新規ロード）";
+  // 名前で予約したブレイク（未ロードのライブラリのシンボル）も、イメージが増えたこの停止で張れたら張る。
+  int pname = applyPendingNameBreakpoints();
+  if (pname > 0) g_message += std::string(g_message.empty() ? "" : "  ／ ") + "予約ブレイク " + std::to_string(pname) + " 件をロードで設定";
   return true;
 }
 
@@ -3440,6 +3538,7 @@ int main(int argc, char** argv) {
         // ロードでも見える停止は 0 回。ロード直後＝そのコードを実行する前に張るので初回呼び出しも捕まえる。
         g_session.refreshImages();
         applyPendingBreakpoints();
+        applyPendingNameBreakpoints(); // 未ロードだったライブラリのシンボル予約を、載った瞬間に張る
         g_session.cont();
       } else if (onStoppedEvent()) { resetViewOnStop(); render(); } // auto 継続中（false）は描画せず次の停止を待つ
     }
