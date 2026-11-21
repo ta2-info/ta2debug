@@ -1,6 +1,7 @@
 #include "core/Target.h"
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <signal.h>
@@ -20,6 +21,20 @@
 #endif
 
 namespace ta2 {
+
+// sudo 実行時、デバッガが作るログファイル <path>.ta2debug.log は root 所有になってしまう。
+// 呼び出しユーザ（SUDO_UID/GID）所有へ戻して、後からユーザが読める／消せるようにする（best-effort。
+// Annotations / BreakpointStore と同方針）。
+static void chownLogToInvoker(const std::string& path) {
+  if (geteuid() != 0) return;                 // root でなければ何もしない
+  const char* su = getenv("SUDO_UID");
+  const char* sg = getenv("SUDO_GID");
+  if (!su || !*su) return;                    // sudo 経由でなければ対象外
+  uid_t uid = (uid_t)strtoul(su, nullptr, 10);
+  gid_t gid = (sg && *sg) ? (gid_t)strtoul(sg, nullptr, 10) : (gid_t)-1;
+  if (uid == 0) return;
+  (void)chown(path.c_str(), uid, gid);
+}
 
 Target::~Target() {
   detach();
@@ -139,6 +154,9 @@ bool Target::launch(const std::string& path, char* const argv[], std::string& er
       }
     });
   }
+  // sudo 実行だとログは root 所有で生成される（PTY 版は親の open、非 PTY 版は子の addopen）。
+  // どちらの経路でもここまでにファイルは出来ているので、呼び出しユーザ所有へ戻す。
+  chownLogToInvoker(logpath);
   return true;
 }
 
