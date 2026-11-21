@@ -66,6 +66,14 @@ public:
   void hwTransientDisable(int id) { hwTransientOff_.insert(id); }
   void hwTransientEnable(int id) { hwTransientOff_.erase(id); }
 
+  // ---- step-over の一時 HW 実行ブレイク（ユーザ層 bps_ とは別。表示も永続化もしない）----
+  // addr に一時 HW 実行ブレイクを置く。空き実行スロットが無ければ false（呼び出し側はソフトへフォールバック）。
+  // 実際のデバッグレジスタ反映は applyHwInto（＝Session::writeHwToThreads）が行う。
+  bool addTempHw(uint64_t addr);
+  void removeTempHw(uint64_t addr) { tempHwExec_.erase(addr); }
+  bool hasTempHw(uint64_t addr) const { return tempHwExec_.count(addr) != 0; }
+  void clearTempHw() { tempHwExec_.clear(); }
+
   // デタッチ時: 物理ブレイクを全部外し、ユーザ一覧もクリア
   void removeAll();
 
@@ -78,6 +86,7 @@ private:
   std::map<uint64_t, std::vector<uint8_t>> orig_; // addr -> 元バイト列（物理層）
   std::vector<Breakpoint> bps_;                   // ユーザ層
   std::set<int> hwTransientOff_;                  // ステップ中だけ反映を外す HW ブレイク/ウォッチの id
+  std::set<uint64_t> tempHwExec_;                 // step-over の一時 HW 実行ブレイク（ユーザ層と別・非永続）
   int nextId_ = 1;
 };
 

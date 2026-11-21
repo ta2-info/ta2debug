@@ -64,8 +64,7 @@ bool Session::launch(const std::string& path, char* const argv[], std::string& e
   // エントリ点に一時ブレイクを置いて走らせ、dyld 完了後（全シンボル解決済み）にそこで止める。
   uint64_t entry = findEntryPoint();
   if (entry) {
-    bps_.addSoft(entry);
-    tempValid_ = true; tempAddr_ = entry; // 一回限り（命中で自動除去）
+    addTemp(entry, false);                // 一回限り（命中／別停止のどちらでも clearTemps で自動除去）
     target_.resume();                     // START_SUSPENDED 分を解除 → entry で onException が止める
   } else {
     // エントリ不明（LC_UNIXTHREAD のみ等）: 従来どおり現在地（dyld エントリ）で停止
@@ -357,6 +356,7 @@ void Session::onSyscallStopHit(const SyscallHit& h) {
   stopExc_ = 0;
   stopIsSyscallCatch_ = true;
   scStopCaught_ = h.name;
+  clearTemps();                // 進行中の step-over 一時ブレイクを後始末（どの停止でも外す）
   stopped_ = true;
   queue_.push({Event::Stopped, 0});
 }
@@ -1125,7 +1125,7 @@ void Session::detach() {
     bps_.removeAll();
     writeHwToThreads(); // デバッグレジスタも全消去
     setStep(stopThread_, false);
-    singleStepping_ = false; rearmValid_ = false; tempValid_ = false; hwRearmIds_.clear(); watchStepId_ = -1;
+    singleStepping_ = false; rearmValid_ = false; temps_.clear(); hwRearmIds_.clear(); watchStepId_ = -1;
     target_.resume();
     stopped_ = false; manualStop_ = false;
   } else if (stopped_) {
@@ -1212,6 +1212,7 @@ void Session::interrupt() {
   lastWatchId_ = -1;
   stopExc_ = 0;
   stopIsSyscallCatch_ = false;
+  clearTemps();                // 進行中の step-over 一時ブレイクを後始末（Ctrl+C でも外す）
   stopped_ = true;
   queue_.push({Event::Stopped, 0});
 }
@@ -1223,9 +1224,42 @@ void Session::resumeManual(Resume r) {
   applyResume(r, stopThread_);
 }
 
-void Session::cont()     { if (manualStop_) resumeManual(Resume::Cont);     else decide(Resume::Cont); }
-void Session::stepInto() { if (manualStop_) resumeManual(Resume::Step);     else decide(Resume::Step); }
-void Session::stepOver() { if (manualStop_) resumeManual(Resume::StepOver); else decide(Resume::StepOver); }
+void Session::cont()       { if (manualStop_) resumeManual(Resume::Cont);       else decide(Resume::Cont); }
+void Session::stepInto()   { if (manualStop_) resumeManual(Resume::Step);       else decide(Resume::Step); }
+void Session::stepOver()   { if (manualStop_) resumeManual(Resume::StepOver);   else decide(Resume::StepOver); }
+void Session::stepOverHw() { if (manualStop_) resumeManual(Resume::StepOverHw); else decide(Resume::StepOverHw); }
+
+// 一時ブレイクを 1 本置いて temps_ で追跡する。hw=true なら HW 実行ブレイクを試み、空き
+// デバッグレジスタが無ければソフト(INT3/BRK)へフォールバックする。呼び出し時タスクは停止/凍結済み。
+void Session::addTemp(uint64_t addr, bool hw) {
+  TempBp t; t.addr = addr;
+  if (hw && bps_.addTempHw(addr)) {
+    t.hw = true;            // HW 一時ブレイク（デバッグレジスタ）
+    writeHwToThreads();     // 全スレッドのデバッグレジスタへ反映（タスク凍結中に行う）
+  } else {
+    t.owned = !bps_.has(addr); // 既存（ユーザ bp / dyld 通知）でなければ自分が INT3 を張る
+    bps_.addSoft(addr);        // 既存ならそのまま流用（二重には張らない）
+  }
+  temps_.push_back(t);
+}
+
+// 追跡中の一時ブレイクを全部外して元へ戻す。どの停止でも呼び、孤児化や入れ子 step-over の
+// 取りこぼしを防ぐ。soft は「自分が張った分」だけ戻し、同じ番地のユーザ bp は消さない。
+void Session::clearTemps() {
+  if (temps_.empty()) return;
+  bool hwTouched = false;
+  for (const auto& t : temps_) {
+    if (t.hw) { bps_.removeTempHw(t.addr); hwTouched = true; }
+    else if (t.owned) bps_.removeSoft(t.addr);
+  }
+  temps_.clear();
+  if (hwTouched) writeHwToThreads(); // 外した HW 一時ブレイクをデバッグレジスタへ反映
+}
+
+bool Session::isTempSoftAt(uint64_t addr) const {
+  for (const auto& t : temps_) if (!t.hw && t.addr == addr) return true;
+  return false;
+}
 
 bool Session::setRegister(const std::string& name, uint64_t value) {
   if (!stopped_.load()) return false;
@@ -1327,18 +1361,22 @@ kern_return_t Session::onException(thread_act_t thread, exception_type_t exc,
     // 新規のソフトブレイク #BP。PC を命令先頭へ戻す。
     uint64_t at = pc - a.softBreakPcBackup();
     const Breakpoint* hwb = bps_.userAt(pc); // HW は PC が命令そのもの（巻き戻し不要）
-    if (bps_.has(at) || (tempValid_ && at == tempAddr_)) {
+    if (bps_.has(at)) { // ソフト(INT3/BRK)命中: ユーザ bp・一時ブレイク・dyld 通知のいずれか
       a.setPc(ts.data(), at);
       target_.setThreadState(thread, ts.data());
       stopPc_ = at;
-      if (tempValid_ && at == tempAddr_) { bps_.removeSoft(tempAddr_); tempValid_ = false; }
-      else if (dyldNotifyAddr_ && at == dyldNotifyAddr_ && !bps_.userAt(at))
+      if (isTempSoftAt(at) && !bps_.userAt(at)) {
+        // step-over の戻り先ソフト一時ブレイク着地（ユーザには数えない）。実体は後段の clearTemps で外す。
+      } else if (dyldNotifyAddr_ && at == dyldNotifyAddr_ && !bps_.userAt(at))
         stopIsImageLoad_ = true; // dyld イメージ通知フック命中＝dlopen 等。メインが静かに追従して即 cont する
       else bps_.onHit(at); // ユーザブレイク命中（一時ブレイクは数えない）
     } else if (hwb && hwb->hw && !hwb->watch && hwb->enabled) {
       stopPc_ = pc;        // HW 実行ブレイク命中
       bps_.onHit(pc);
       clearHwHitOn(thread); // DR6 の発火ビットを消す（次のウォッチ判定が古いビットに惑わされないよう）
+    } else if (bps_.hasTempHw(pc)) {
+      stopPc_ = pc;        // step-over の戻り先 HW 一時ブレイク着地（ユーザには数えない）。clearTemps で外す。
+      clearHwHitOn(thread);
     } else if (const Breakpoint* w = detectWatchHit(thread)) {
       stopPc_ = pc;        // ウォッチポイント命中（PC はアクセス命令、または直後）
       bps_.onHit(w->addr);
@@ -1349,6 +1387,10 @@ kern_return_t Session::onException(thread_act_t thread, exception_type_t exc,
       stopPc_ = pc; // 未知のトラップでも一応止める
     }
   }
+
+  // どの停止でも一時ブレイク（step-over の戻り先など）を後始末する（孤児化防止）。
+  // ただし dyld イメージ通知の内部停止は「静かに即 cont」なので、進行中の step-over を壊さないよう残す。
+  if (!stopIsImageLoad_) clearTemps();
 
   // ユーザに見せる停止
   target_.getThreadState(thread, stopState_.data()); // PC 補正後の状態
@@ -1438,8 +1480,10 @@ void Session::applyResume(Resume d, thread_act_t thread) {
       target_.resume();
       break;
 
-    case Resume::StepOver: {
-      // 現在命令を 1 つ逆アセンブルして call なら戻り先に一時 bp を置いて継続
+    case Resume::StepOver:
+    case Resume::StepOverHw: {
+      // 現在命令を 1 つ逆アセンブルして call なら戻り先に一時 bp を置いて継続。
+      // StepOverHw は戻り先を HW ブレイク（デバッグレジスタ）で張る（メモリを書き換えない）。
       uint8_t code[16] = {};
       size_t got = 0;
       target_.readMemory(stopPc_, code, sizeof(code), &got);
@@ -1447,9 +1491,7 @@ void Session::applyResume(Resume d, thread_act_t thread) {
       Disassembler dis(a);
       auto insns = dis.disasm(code, got, stopPc_, 1);
       if (!insns.empty() && insns[0].kind == InsnKind::Call) {
-        tempAddr_ = stopPc_ + insns[0].size;
-        tempValid_ = true;
-        bps_.addSoft(tempAddr_);
+        addTemp(stopPc_ + insns[0].size, d == Resume::StepOverHw); // 戻り先に一時ブレイク（HW 不可なら soft）
         stepOverBreakThenRun(false); // 継続（戻り先 bp で止まる）
       } else {
         uncoverBreakAtPc();
@@ -1464,7 +1506,7 @@ void Session::applyResume(Resume d, thread_act_t thread) {
       bps_.removeAll();
       writeHwToThreads(); // デバッグレジスタも全消去
       setStep(thread, false);
-      singleStepping_ = false; rearmValid_ = false; tempValid_ = false; hwRearmIds_.clear(); watchStepId_ = -1;
+      singleStepping_ = false; rearmValid_ = false; temps_.clear(); hwRearmIds_.clear(); watchStepId_ = -1;
       target_.resume();
       { std::lock_guard<std::mutex> lk(m_); detachAck_ = true; }
       ackCv_.notify_one();

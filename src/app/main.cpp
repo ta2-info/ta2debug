@@ -2481,7 +2481,8 @@ void runCommand(const std::string& line) {
       "  \x1b[2m[実行制御]\x1b[0m",
       "    c        継続",
       "    s        ステップイン",
-      "    n        ステップオーバ",
+      "    n        ステップオーバ（call は戻り先にソフト一時ブレイク INT3/BRK を置いて飛ばす）",
+      "    N        ステップオーバ（Shift+N。戻り先を HW ブレイク＝デバッグレジスタで張る。バッチは nh）",
       "    a        auto: 次の call / syscall / ret の手前まで自動継続（= :auto all、Ctrl+C で中断）",
       "    R        再起動（:run した対象を同じ引数・同じアドレスで起動し直す）",
       "    Ctrl+C   実行中を割り込み停止 / auto 中は停止",
@@ -3045,6 +3046,7 @@ void onKey(int c) {
     case ':': g_cmdMode = true; g_cmdline.clear(); g_message.clear(); render(); break;
     case 's': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.stepInto(); g_state = UiState::Running; render(); } break;
     case 'n': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.stepOver(); g_state = UiState::Running; render(); } break;
+    case 'N': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.stepOverHw(); g_state = UiState::Running; render(); } break; // Shift+N: HW ブレイクで step-over
     case 'c': if (g_state == UiState::Stopped) { g_curAddr = 0; g_session.cont(); g_state = UiState::Running; g_message.clear(); render(); } break;
     case 'b': if (g_state == UiState::Stopped && g_session.isAttached()) toggleBreakAtCursor(); break; // カーソル行のブレイクをトグル
     case 'm': if (g_state == UiState::Stopped && g_session.isAttached()) annotateAtCursor(); break;   // カーソル行に func<16進> シンボルを登録／編集
@@ -3225,6 +3227,9 @@ bool batchExec(const std::string& raw) {
     else batchPrint("（停止していません）");
   } else if (cmd == "n" || cmd == "next") {
     if (g_state == UiState::Stopped) { g_session.stepOver(); g_state = UiState::Running; willStop = true; }
+    else batchPrint("（停止していません）");
+  } else if (cmd == "nh") { // HW ブレイクで step-over（call は戻り先に HW 一時ブレイクを置いて飛ばす）
+    if (g_state == UiState::Stopped) { g_session.stepOverHw(); g_state = UiState::Running; willStop = true; }
     else batchPrint("（停止していません）");
   } else if (cmd == "where" || cmd == "backtrace" || cmd == "frames") {
     if (g_state == UiState::Stopped) { batchPrint("backtrace:"); for (auto& l : computeBacktrace(false)) batchPrint("  " + l); }

@@ -57,7 +57,8 @@ public:
   // 停止中にメインから呼ぶ（対象を再開する）
   void cont();
   void stepInto();
-  void stepOver();
+  void stepOver();    // call は戻り先にソフト一時ブレイク(INT3/BRK)を置いて飛ばす
+  void stepOverHw();  // call は戻り先に HW 一時ブレイク(デバッグレジスタ)を置いて飛ばす（Shift+N）
 
   // 停止中にレジスタへ書き込む（スレッド状態を更新して対象へ反映）。停止中のみ・成功で true。
   bool setRegister(const std::string& name, uint64_t value);
@@ -197,7 +198,7 @@ private:
   thread_act_t firingThreadFor(const std::string& caught);
 
   // resume 決定をセットして例外スレッドを起こす
-  enum class Resume { None, Cont, Step, StepOver, Detach };
+  enum class Resume { None, Cont, Step, StepOver, StepOverHw, Detach };
   void decide(Resume r);
   void resumeManual(Resume r); // Ctrl+C 停止からの再開（こちらのスレッドで applyResume）
 
@@ -238,8 +239,18 @@ private:
   bool stopAfterStep_ = false;  // そのステップ後に停止するか（step=真, cont のまたぎ=偽）
   bool rearmValid_ = false;     // 次のトラップ後に張り直すソフトブレイク
   uint64_t rearmAddr_ = 0;
-  bool tempValid_ = false;      // stepOver の一時ブレイク
-  uint64_t tempAddr_ = 0;
+  // stepOver 等の一時ブレイク（複数同時・命中/別停止のどちらでも後始末する）。
+  // 単一スロットだと、戻り先に着く前に別ブレイクで止まったり step-over を入れ子にすると
+  // 前の一時ブレイクが孤児化していた。一覧で持ち、どの停止でも clearTemps() で全部外す。
+  struct TempBp {
+    uint64_t addr = 0;
+    bool hw = false;    // true=HW 実行ブレイク（デバッグレジスタ） / false=ソフト(INT3/BRK)
+    bool owned = false; // soft のとき、自分がこの番地に INT3 を張ったか（既存ユーザ bp を消さないため）
+  };
+  std::vector<TempBp> temps_;
+  void addTemp(uint64_t addr, bool hw); // 一時ブレイクを 1 本置いて追跡（hw 不可なら soft へ）
+  void clearTemps();                    // 追跡中の一時ブレイクを全部外して復帰（どの停止でも呼ぶ）
+  bool isTempSoftAt(uint64_t addr) const; // addr に soft 一時ブレイクがあるか（命中判定用）
   std::set<int> hwRearmIds_;    // 次のトラップ後に反映を戻す HW ブレイク/ウォッチの id（またぎステップ中）
   int watchStepId_ = -1;        // arm64: ウォッチ命中後、再開時に 1 命令跨ぐべきウォッチの id（x86 は -1 のまま）
   int lastWatchId_ = -1;        // 直近の停止がウォッチ命中ならその id（表示用）
