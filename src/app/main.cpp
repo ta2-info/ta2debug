@@ -1942,10 +1942,13 @@ void runCommand(const std::string& line) {
     if (g_session.isAttached()) { g_message = "既に attach 済み（先に :detach）"; return; }
     if (arg.empty()) { openPicker(); return; }   // pid 無し → 一覧から選択
     doAttach((pid_t)parseNum(arg));
-  } else if (cmd == "run" || cmd == "launch") {
+  } else if (cmd == "run" || cmd == "launch" || cmd == "runroot" || cmd == "runasroot") {
     if (g_session.isAttached()) { g_message = "既に attach/起動 済み（先に :detach）"; return; }
-    if (arg.empty()) { g_message = "使い方: run <実行ファイルパス> [引数...]"; return; }
+    bool keepRoot = (cmd == "runroot" || cmd == "runasroot"); // run=降格 / runroot=root 維持
+    if (arg.empty()) { g_message = keepRoot ? "使い方: runroot <実行ファイルパス> [引数...]（root のまま起動）"
+                                            : "使い方: run <実行ファイルパス> [引数...]"; return; }
     std::vector<std::string> args; { std::string cur; for (char ch : arg) { if (ch==' ') { if(!cur.empty()){args.push_back(cur);cur.clear();} } else cur.push_back(ch); } if(!cur.empty()) args.push_back(cur); }
+    g_session.setLaunchKeepRoot(keepRoot); // 以後の :restart もこの選択を踏襲する
     doLaunch(args);
   } else if (cmd == "restart" || cmd == "rerun") {
     doRestart(); // 対象を終了して同じ引数・同じアドレスで起動し直し、ブレイクを張り直す
@@ -2659,8 +2662,9 @@ void runCommand(const std::string& line) {
       "      独自定義シンボル（注釈）も一覧に混ぜて * 印で表示。Ctrl+E でその表示／除外を切替",
       "\x1b[36m― アタッチ／起動 ―\x1b[0m",
       "  :attach [pid]              pid 省略でプロセス一覧から選択",
-      "  :run <パス> [引数...]      バイナリを起動してデバッグ（エントリ手前で停止）",
-      "  :restart / :rerun (R キー) :run した対象を同じ引数・同じアドレスで起動し直す（ブレイクも張り直す）",
+      "  :run <パス> [引数...]      バイナリを起動してデバッグ（エントリ手前で停止）。子は呼び出しユーザへ降格",
+      "  :runroot <パス> [引数...]  子を降格せず root のまま起動（root 権限が要るプログラム向け。別名 :runasroot）",
+      "  :restart / :rerun (R キー) :run した対象を同じ引数・同じアドレスで起動し直す（ブレイクも張り直す。run/runroot の選択も踏襲）",
       "  :detach                    デタッチ（attach は動き続ける／:run した子は終了させる）",
       "\x1b[36m― ブレイクポイント ―\x1b[0m",
       "  :b  <式>                   ソフトブレイク（INT3/BRK）。未ロードのライブラリのシンボルは予約し、ロード後に自動設定",
@@ -2733,7 +2737,7 @@ void runCommand(const std::string& line) {
 // コマンド名の TAB 補完（最初の語のみ。引数部では何もしない）。
 void completeCommand() {
   if (g_cmdline.find(' ') != std::string::npos) return;
-  static const char* CMDS[] = {"attach", "detach", "run", "launch", "restart", "rerun", "auto", "sym", "what", "whatis", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "tb", "tbh", "bl", "be", "bedit", "bd", "bt",
+  static const char* CMDS[] = {"attach", "detach", "run", "runroot", "runasroot", "launch", "restart", "rerun", "auto", "sym", "what", "whatis", "quit", "p", "setmem", "memset", "wf", "rf", "intel", "atandt", "baseoff", "baseon", "dr", "dis", "libs", "syms", "uselib", "b", "bh", "tb", "tbh", "bl", "be", "bedit", "bd", "bt",
                                "w", "reg", "x", "img", "seg", "help", "ann", "memo", "unann", "anns", "struct", "types", "scwatch", "scstop", "mouse"};
   std::vector<std::string> cands;
   for (const char* c : CMDS)
@@ -3423,9 +3427,10 @@ bool batchExec(const std::string& raw) {
   } else {
     runCommand(line);                 // attach/run/auto/detach/b/bh/w/bl/bd/bt/sym/reg/x/img/seg/help は共通
     batchPrintResults();
-    bool execCmd = (cmd == "run" || cmd == "launch" || cmd == "auto");
+    bool isRun = (cmd == "run" || cmd == "launch" || cmd == "runroot" || cmd == "runasroot");
+    bool execCmd = (isRun || cmd == "auto");
     if (execCmd && g_state == UiState::Running) willStop = true;          // エントリ停止 / auto 停止を待つ
-    else if ((cmd == "run" || cmd == "launch") && g_state == UiState::Stopped) { g_message.clear(); batchStopReport(); } // 同期的に停止済み
+    else if (isRun && g_state == UiState::Stopped) { g_message.clear(); batchStopReport(); } // 同期的に停止済み
   }
 
   if (willStop) {
@@ -3448,7 +3453,8 @@ int runBatch(const std::vector<std::string>& ocmds, const std::string& scriptPat
     bool isPid = !target[0].empty();
     for (char ch : target[0]) if (ch < '0' || ch > '9') isPid = false;
     if (isPid) script.push_back("attach " + target[0]);
-    else { std::string r = "run"; for (auto& t : target) r += " " + t; script.push_back(r); }
+    // CLI の --root-child を自動生成コマンドにも反映（root 維持なら runroot）。
+    else { std::string r = g_session.launchKeepRoot() ? "runroot" : "run"; for (auto& t : target) r += " " + t; script.push_back(r); }
   }
   for (auto& c : ocmds) script.push_back(c);
   if (haveScript) {
@@ -3485,7 +3491,7 @@ void printUsage() {
     "  --root-child (--keep-root)                起動する子を降格せず root のまま走らせる\n"
     "                                            （既定は sudo 実行時に呼び出しユーザへ降格）\n"
     "バッチのコマンド（':' 接頭辞も可）:\n"
-    "  run <パス>/attach <pid>/detach  c(継続) s(ステップイン) n(オーバ) wait(停止まで待つ)\n"
+    "  run <パス>（runroot で root 維持）/attach <pid>/detach  c(継続) s(ステップイン) n(オーバ) wait(停止まで待つ)\n"
     "  where(バックトレース)  b/bh/w(ブレイク)  bl/bd/bt  reg [名]  x[/fmt] <式>  sym/what/img/seg  auto  help  q\n"
     "  停止すると位置・理由・syscall・バックトレースを自動表示。attach は走行継続なので wait で停止を待つ。\n",
     stdout);
